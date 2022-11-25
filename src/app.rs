@@ -310,6 +310,8 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         let mut buffer: Vec<u8> = Vec::new();
 
         for (relative_name, change) in changes {
+            // TODO: Add proper progress reporting.
+            println!("{}...", relative_name);
             buffer.clear();
 
             match change {
