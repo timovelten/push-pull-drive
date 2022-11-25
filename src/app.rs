@@ -19,6 +19,7 @@ use std::io::Write;
 
 pub struct DefaultApp<L, R> {
     // Note how this app does not even know the "root" directory, because it does not need to!
+    
     /// This is *not* the cwd we get from the operation system. Instead, this
     /// is the cwd as a "relative name"
     cwd: String,
@@ -339,6 +340,3 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         println!("{:#?}", changes);
     }
 }
-
-#[cfg(tests)]
-mod tests {}
