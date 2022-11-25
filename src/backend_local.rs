@@ -1,14 +1,16 @@
+use crate::{
+    backend::FileRepository,
+    paths,
+    util::{datetime_to_filetime, u8_slice_to_hex_string},
+    DirectoryInfo, Error, FileInfo, PathInfo,
+};
+use anyhow::Context;
+use sha1::{Digest, Sha1};
 use std::{
     fs::{File, OpenOptions},
     path::PathBuf,
 };
-use anyhow::Context;
-use sha1::{Digest, Sha1};
 use time::OffsetDateTime;
-use crate::{
-    backend::FileRepository, paths, util::u8_slice_to_hex_string, DirectoryInfo, Error, FileInfo,
-    PathInfo,
-};
 
 #[derive(Debug)]
 pub struct LocalBackend {
@@ -154,12 +156,7 @@ impl FileRepository for LocalBackend {
         })
     }
 
-    fn write_file(
-        &self,
-        src: &mut dyn std::io::Read,
-        relative_name: &str,
-        modified: Option<OffsetDateTime>,
-    ) -> crate::Result<()> {
+    fn write_file(&self, src: &mut dyn std::io::Read, relative_name: &str) -> crate::Result<()> {
         if self.is_ignored(relative_name) {
             return Err(Error::NotAllowed(relative_name.to_owned()));
         }
@@ -182,20 +179,19 @@ impl FileRepository for LocalBackend {
         std::io::copy(src, &mut file)?;
         drop(file);
 
-        if let Some(modified) = modified {
-            let filetime = filetime::FileTime::from_unix_time(
-                modified.unix_timestamp(),
-                (modified.unix_timestamp_nanos() % 1_000_000_000) as u32,
-            );
-            filetime::set_file_mtime(local_path, filetime)?;
-        }
-
         Ok(())
     }
 
     fn delete_file(&self, relative_name: &str) -> crate::Result<()> {
         let local_path = self.get_local_path_from_relative_name(relative_name);
         std::fs::remove_file(local_path)?;
+
+        Ok(())
+    }
+
+    fn set_modified_time(&self, relative_name: &str, modtime: OffsetDateTime) -> crate::Result<()> {
+        let local_path = self.get_local_path_from_relative_name(relative_name);
+        filetime::set_file_mtime(local_path, datetime_to_filetime(modtime))?;
 
         Ok(())
     }
@@ -328,7 +324,7 @@ mod tests {
 
         // Test if we can write to ignored locations
         b.ignore("dir/we/ignore");
-        let x = b.write_file(&mut std::io::empty(), "dir/we/ignore/subdir/test", None);
+        let x = b.write_file(&mut std::io::empty(), "dir/we/ignore/subdir/test");
         assert!(matches!(x, Err(Error::NotAllowed(_))));
 
         // Now write an actual file
@@ -339,9 +335,11 @@ mod tests {
         b.write_file(
             &mut (test_bytes.as_slice()),
             "dir/that-does-not-exist/somefile",
-            Some(modtime_should_be),
         )
         .unwrap();
+        
+        b.set_modified_time("dir/that-does-not-exist/somefile", modtime_should_be)
+            .unwrap();
 
         let mut f = File::open(fpath).unwrap();
 

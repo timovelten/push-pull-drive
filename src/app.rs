@@ -317,7 +317,9 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
                     // For now, we just download the entire file into memory.
                     // There are worse things...
                     let info = from.read_file(&relative_name, &mut buffer)?;
-                    to.write_file(&mut buffer.as_slice(), &relative_name, Some(info.modified))?;
+                    to.write_file(&mut buffer.as_slice(), &relative_name)?;
+                    
+                    to.set_modified_time(&relative_name, info.modified)?;
 
                     if track {
                         self.track_current_version(&relative_name)?;

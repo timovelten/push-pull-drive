@@ -22,10 +22,12 @@ pub trait FileRepository: Debug {
     fn write_file(
         &self,
         src: &mut dyn std::io::Read,
-        relative_name: &str,
-        modified: Option<OffsetDateTime>,
+        relative_name: &str
     ) -> crate::Result<()>;
     fn delete_file(&self, relative_name: &str) -> crate::Result<()>;
+
+    /// Set the modification time of the specified file.
+    fn set_modified_time(&self, relative_name: &str, modtime: OffsetDateTime) -> crate::Result<()>;
 
     fn info(&self, relative_name: &str) -> crate::Result<PathInfo>;
 }
@@ -64,8 +66,7 @@ impl FileRepository for NoBackend {
     fn write_file(
         &self,
         _src: &mut dyn std::io::Read,
-        _relative_namee: &str,
-        _modifieded: Option<OffsetDateTime>,
+        _relative_namee: &str
     ) -> crate::Result<()> {
         Self::uninitialized()
     }
@@ -75,6 +76,10 @@ impl FileRepository for NoBackend {
     }
 
     fn info(&self, _relative_name: &str) -> crate::Result<PathInfo> {
+        Self::uninitialized()
+    }
+
+    fn set_modified_time(&self, _relative_name: &str, _modtime: OffsetDateTime) -> crate::Result<()> {
         Self::uninitialized()
     }
 }
