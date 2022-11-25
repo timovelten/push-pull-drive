@@ -282,7 +282,10 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         }
 
         // Commit these changes?
-        println!("{:?}", to_be_commited);
+        for (rel, ch) in &to_be_commited {
+            println!("{:?}: {}", ch, rel);
+        }
+
         if Self::prompter("Commit these changes?") {
             self.push(from, to, to_be_commited, true)?
         } else {

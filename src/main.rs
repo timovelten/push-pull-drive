@@ -64,13 +64,7 @@ trait App {
 // We need App to be dyn. Assert it here and let the compiler make sure.
 impl dyn App {}
 
-// TODO: Abstract away the ugliness of paths, by creating a custom walkdir function
-// that provides us with our FileInfo enum. It's always possible to turn a relative name into a
-// a path on disk. It's harder to turn an acutal path into a relative name.
-// In particular, this allows us to drop the arbitrary restrictions on the format in
-// which root_path is stroed
-// TODO: Make a debug assertion, that checks if relative names are valid. That is, we check if
-// they do not contain any dots and are slash separated.
+// TODO: When deleting a file, do not leave behind orphaned (empty) directories
 // TODO: Handle long windows filenames. Probably like this
 // https://gal.hagever.com/posts/windows-long-paths-in-rust
 fn main() -> crate::Result<()> {
