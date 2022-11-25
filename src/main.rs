@@ -51,12 +51,14 @@ enum Backends {
     Local { path: String },
 }
 
+
+
 trait App {
     fn init_cmd(&self, b: Backends) -> crate::Result<()>;
     fn status_cmd(&self) -> crate::Result<()>;
     fn remote_status_cmd(&self) -> crate::Result<()>;
-    fn pull_cmd(&self) -> crate::Result<()>;
-    fn push_cmd(&self) -> crate::Result<()>;
+    fn pull_cmd(&self, yes: bool) -> crate::Result<()>;
+    fn push_cmd(&self, yes: bool) -> crate::Result<()>;
 }
 
 // We need App to be dyn. Assert it here and let the compiler make sure.
@@ -82,8 +84,8 @@ fn handle_command(cmd: Commands) -> crate::Result<()> {
 
     match cmd {
         Commands::Init { backend } => app.init_cmd(backend)?,
-        Commands::Pull => app.pull_cmd()?,
-        Commands::Push => app.push_cmd()?,
+        Commands::Pull => app.pull_cmd(false)?,
+        Commands::Push => app.push_cmd(false)?,
         Commands::Status => app.status_cmd()?,
         Commands::RemoteStatus => app.remote_status_cmd()?,
         Commands::DeleteIndex => todo!(),
@@ -185,11 +187,11 @@ impl App for UninitializedApp {
         Err(Error::NoConfigFound)
     }
 
-    fn pull_cmd(&self) -> crate::Result<()> {
+    fn pull_cmd(&self, _yes: bool) -> crate::Result<()> {
         Err(Error::NoConfigFound)
     }
 
-    fn push_cmd(&self) -> crate::Result<()> {
+    fn push_cmd(&self, _yes: bool) -> crate::Result<()> {
         Err(Error::NoConfigFound)
     }
 }

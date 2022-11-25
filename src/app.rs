@@ -9,12 +9,13 @@
 //! abc/def/ceg
 //! i.e. a slash separated path, that does not contain dots. In particular, it does not start with a dot.
 
-use std::collections::HashMap;
-use std::collections::HashSet;
 use crate::backend::FileRepository;
 use crate::walker::DirWalker;
 use crate::{db, App, Error, PathInfo};
 use crate::{db::TrackedFile, FileChange};
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::io::Write;
 
 pub struct DefaultApp<L, R> {
     // Note how this app does not even know the "root" directory, because it does not need to!
@@ -45,31 +46,127 @@ impl<L: FileRepository, R: FileRepository> App for DefaultApp<L, R> {
     }
 
     fn status_cmd(&self) -> crate::Result<()> {
-        let status = self.status_helper(&self.local)?;
+        let status = self.status(&self.local)?;
         self.print_status(&status);
 
         Ok(())
     }
 
     fn remote_status_cmd(&self) -> crate::Result<()> {
-        let status = self.status_helper(&self.remote)?;
+        let status = self.status(&self.remote)?;
         self.print_status(&status);
 
         Ok(())
     }
 
-    fn pull_cmd(&self) -> crate::Result<()> {
-        let remote_status = self.status_helper(&self.remote)?;
-        self.push_pull_helper(&self.remote, &self.local, &remote_status, true)
+    fn pull_cmd(&self, yes: bool) -> crate::Result<()> {
+        self.push_pull_cmd_helper(&self.remote, &self.local, yes, |rel, theirs, ours| {
+            // If our file was deleted, we put there whatever remote has done ever since
+            if ours == FileChange::Deleted {
+                return true;
+            }
+            
+            let (mut all_yes_change, mut all_no_change) = (false, false);
+            let (mut all_yes_del, mut all_no_del) = (false, false);
+            match theirs {
+                FileChange::New | FileChange::Modified => {
+                    Self::prompter_yes_no_all(
+                        &format!("Remote file {} was changed, but the corresponding local file has un-pushed changes. Overwrite local file?", rel), 
+                        &mut all_yes_change, &mut all_no_change
+                    )
+                },
+                FileChange::Deleted => {
+                    Self::prompter_yes_no_all(
+                        &format!("Remote file {} was deleted, but the corresponding local file has un-pushed changes. Delete local file?", rel), 
+                        &mut all_yes_del, &mut all_no_del
+                    )
+                }
+            }
+        })
     }
 
-    fn push_cmd(&self) -> crate::Result<()> {
-        let remote_status = self.status_helper(&self.local)?;
-        self.push_pull_helper(&self.local, &self.remote, &remote_status, true)
+    fn push_cmd(&self, yes: bool) -> crate::Result<()> {
+        self.push_pull_cmd_helper(&self.local, &self.remote, yes, |rel, ours, theirs| {
+            // If the file was deleted remotely, there isn't really a conflict; we can just push our file and
+            // be done.
+            if theirs == FileChange::Deleted {
+                return true;
+            }
+
+            // The annoying part: we need to cusotmize the messages depending on whether we push or pull
+            let (mut all_yes_change, mut all_no_change) = (false, false);
+            let (mut all_yes_del, mut all_no_del) = (false, false);
+            match ours {
+                FileChange::New | FileChange::Modified => {
+                    Self::prompter_yes_no_all(
+                        &format!("Local file {} was changed, but the corresponding remote file was also changed since the last pull. Overwrite remote file?", rel), 
+                        &mut all_yes_change, &mut all_no_change
+                    )
+                },
+                FileChange::Deleted => {
+                    Self::prompter_yes_no_all(
+                        &format!("Local file {} was deleted, but the corresponding remote file was changed since the last pull. Delte remote file?", rel), 
+                        &mut all_yes_del, &mut all_no_del
+                    )
+                }
+            }
+        })
     }
 }
 
 impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
+    fn prompter_yes_no_all(q: &str, all_yes: &mut bool, all_no: &mut bool) -> bool {
+        if *all_yes {
+            return true;
+        }
+
+        if *all_no {
+            return false;
+        }
+
+        loop {
+            println!("{} [y - Yes, y! - Yes all, n - No, n! - No all]", q);
+            print!("> ");
+            std::io::stdout().flush().unwrap();
+
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).unwrap();
+            let line = line.trim();
+    
+            match line {
+                "y" => return true,
+                "n" => return false,
+                "y!" => {
+                    *all_yes = true;
+                    return true;
+                }
+                "n!" => {
+                    *all_no = true;
+                    return false;
+                }
+                _ => continue
+            };
+        }
+    }
+
+    fn prompter(q: &str) -> bool {
+        loop {
+            println!("{} [y - Yes, n - No]", q);
+            print!("> ");
+            std::io::stdout().flush().unwrap();
+
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).unwrap();
+            let line = line.trim();
+    
+            match line {
+                "y" => return true,
+                "n" => return false,
+                _ => continue
+            };
+        }
+    }
+
     fn track_current_version(&self, relative_name: &str) -> crate::Result<()> {
         let path_info = self.local.info(relative_name)?;
 
@@ -91,7 +188,7 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
     }
 
     // Determines how files have changed when comapared to another directory structure.
-    fn status_helper<RD: crate::walker::ReadDir>(
+    fn status<RD: crate::walker::ReadDir>(
         &self,
         r: &RD,
     ) -> crate::Result<HashMap<String, FileChange>> {
@@ -144,13 +241,68 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         Ok(ret)
     }
 
-    /// Given a list of fileChanges, pushes these changes from A to B.
-    /// If you think about it, both push and pull can be implemented from this.
-    fn push_pull_helper<A: FileRepository, B: FileRepository>(
+    fn push_pull_cmd_helper<
+        A: FileRepository,
+        B: FileRepository,
+        F: FnMut(&str, FileChange, FileChange) -> bool,
+    >(
         &self,
         from: &A,
         to: &B,
-        changes: &HashMap<String, FileChange>,
+        yes: bool,
+        mut resolver: F,
+    ) -> crate::Result<()> {
+        // Query the changes in from. We
+        let mut from_status = self.status(from)?.into_iter().collect::<Vec<_>>();
+        from_status.sort();
+
+        // If the user wants to not check for conflicts, we do not even need the remote status
+        let to_status = if yes {
+            HashMap::new()
+        } else {
+            self.status(to)?
+        };
+
+        // We could probably save this allocation, but realistically, what would that accomplish.
+        let mut to_be_commited = vec![];
+        for (relative_name, our_change) in from_status {
+            if let Some(&their_change) = to_status.get(&relative_name) {
+                if resolver(&relative_name, our_change, their_change) {
+                    to_be_commited.push((relative_name, our_change));
+                }
+            } else {
+                to_be_commited.push((relative_name, our_change));
+            }
+        }
+
+        if to_be_commited.len() == 0 {
+            println!("Already up to date. Nothing was changed.");
+            return Ok(());
+        }
+
+        // Commit these changes?
+        println!("{:?}", to_be_commited);
+        if Self::prompter("Commit these changes?") {
+            self.push(from, to, to_be_commited, true)?
+        } else {
+            println!("Aborting");
+        }
+        
+
+        Ok(())
+    }
+
+    /// Given a list of fileChanges, pushes these changes from A to B.
+    /// If you think about it, both push and pull can be implemented from this.
+    fn push<
+        A: FileRepository,
+        B: FileRepository,
+        I: IntoIterator<Item = (String, FileChange)>,
+    >(
+        &self,
+        from: &A,
+        to: &B,
+        changes: I,
         track: bool,
     ) -> crate::Result<()> {
         // Allocate the temporary buffer only once, so we at least minimize the number of allocations
@@ -163,11 +315,11 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
                 FileChange::New | FileChange::Modified => {
                     // For now, we just download the entire file into memory.
                     // There are worse things...
-                    let info = from.read_file(relative_name, &mut buffer)?;
-                    to.write_file(&mut buffer.as_slice(), relative_name, Some(info.modified))?;
+                    let info = from.read_file(&relative_name, &mut buffer)?;
+                    to.write_file(&mut buffer.as_slice(), &relative_name, Some(info.modified))?;
 
                     if track {
-                        self.track_current_version(relative_name)?;
+                        self.track_current_version(&relative_name)?;
                     }
                 }
                 FileChange::Deleted => {
@@ -187,3 +339,6 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         println!("{:#?}", changes);
     }
 }
+
+#[cfg(tests)]
+mod tests {}

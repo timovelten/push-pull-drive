@@ -1,4 +1,4 @@
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub enum FileChange {
     New,
     Modified,
@@ -44,10 +44,11 @@ pub struct DirectoryInfo {
 
 impl FileInfo {
     pub fn is_newer_than(&self, other: &Self) -> bool {
-        self.size != other.size
+        let ret = self.size != other.size
             || self.modified > other.modified
             // Note that we do not have to explicitly verify that other is_some()
-            || self.hash == other.hash && self.hash.is_some()
+            || self.hash == other.hash && self.hash.is_some();
+        ret
     }
 
     pub fn dir_and_name(&self) -> (&str, &str) {
