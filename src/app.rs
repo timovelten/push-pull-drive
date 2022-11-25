@@ -317,7 +317,7 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
                     // For now, we just download the entire file into memory.
                     // There are worse things...
                     let info = from.read_file(&relative_name, &mut buffer)?;
-                    to.write_file(&mut buffer.as_slice(), &relative_name)?;
+                    to.write_file( &relative_name, &mut buffer.as_slice())?;
                     
                     to.set_modified_time(&relative_name, info.modified)?;
 

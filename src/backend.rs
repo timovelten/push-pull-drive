@@ -14,16 +14,17 @@ pub trait FileRepository: Debug {
     fn read_file(
         &self,
         relative_name: &str,
-        dst: &mut dyn std::io::Write,
+        dst: &mut Vec<u8>,
     ) -> crate::Result<FileInfo>;
 
     /// Write the content from src into the file with the relative name info.relative_name.
     /// If given, also changes that files modified time.
     fn write_file(
         &self,
-        src: &mut dyn std::io::Read,
-        relative_name: &str
+        relative_name: &str,
+        src: &[u8],
     ) -> crate::Result<()>;
+
     fn delete_file(&self, relative_name: &str) -> crate::Result<()>;
 
     /// Set the modification time of the specified file.
@@ -55,22 +56,6 @@ impl FileRepository for NoBackend {
         Self::uninitialized()
     }
 
-    fn read_file(
-        &self,
-        _relative_name: &str,
-        _dstt: &mut dyn std::io::Write,
-    ) -> crate::Result<FileInfo> {
-        Self::uninitialized()
-    }
-
-    fn write_file(
-        &self,
-        _src: &mut dyn std::io::Read,
-        _relative_namee: &str
-    ) -> crate::Result<()> {
-        Self::uninitialized()
-    }
-
     fn delete_file(&self, _relative_name: &str) -> crate::Result<()> {
         Self::uninitialized()
     }
@@ -80,6 +65,22 @@ impl FileRepository for NoBackend {
     }
 
     fn set_modified_time(&self, _relative_name: &str, _modtime: OffsetDateTime) -> crate::Result<()> {
+        Self::uninitialized()
+    }
+
+    fn read_file(
+        &self,
+        _relative_name: &str,
+        _dst: &mut Vec<u8>,
+    ) -> crate::Result<FileInfo> {
+        Self::uninitialized()
+    }
+
+    fn write_file(
+        &self,
+        _relative_name: &str,
+        _src: &[u8],
+    ) -> crate::Result<()> {
         Self::uninitialized()
     }
 }

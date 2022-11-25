@@ -135,7 +135,7 @@ impl FileRepository for LocalBackend {
     fn read_file(
         &self,
         relative_name: &str,
-        dst: &mut dyn std::io::Write,
+        dst: &mut Vec<u8>,
     ) -> crate::Result<FileInfo> {
         if self.is_ignored(relative_name) {
             return Err(Error::NotFound(relative_name.to_owned()));
@@ -156,7 +156,7 @@ impl FileRepository for LocalBackend {
         })
     }
 
-    fn write_file(&self, src: &mut dyn std::io::Read, relative_name: &str) -> crate::Result<()> {
+    fn write_file(&self, relative_name: &str, mut src: &[u8]) -> crate::Result<()> {
         if self.is_ignored(relative_name) {
             return Err(Error::NotAllowed(relative_name.to_owned()));
         }
@@ -176,7 +176,7 @@ impl FileRepository for LocalBackend {
             .open(&local_path)
             .with_context(|| format!("could not open file {:?}", local_path))?;
 
-        std::io::copy(src, &mut file)?;
+        std::io::copy(&mut src, &mut file)?;
         drop(file);
 
         Ok(())
@@ -324,7 +324,7 @@ mod tests {
 
         // Test if we can write to ignored locations
         b.ignore("dir/we/ignore");
-        let x = b.write_file(&mut std::io::empty(), "dir/we/ignore/subdir/test");
+        let x = b.write_file( "dir/we/ignore/subdir/test", &vec![]);
         assert!(matches!(x, Err(Error::NotAllowed(_))));
 
         // Now write an actual file
@@ -333,11 +333,11 @@ mod tests {
 
         let modtime_should_be = OffsetDateTime::now_utc();
         b.write_file(
-            &mut (test_bytes.as_slice()),
             "dir/that-does-not-exist/somefile",
+            &mut (test_bytes.as_slice()),
         )
         .unwrap();
-        
+
         b.set_modified_time("dir/that-does-not-exist/somefile", modtime_should_be)
             .unwrap();
 
