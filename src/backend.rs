@@ -1,7 +1,6 @@
 use std::fmt::Debug;
-use anyhow::anyhow;
 use time::OffsetDateTime;
-use crate::{walker::ReadDir, Error, FileInfo, PathInfo};
+use crate::{walker::ReadDir, FileInfo, PathInfo};
 
 pub const KEY_BACKEND: &str = "backend";
 
@@ -39,48 +38,5 @@ where
 {
     fn read_dir(&self, relative_name: &str) -> crate::Result<Vec<PathInfo>> {
         self.read_dir(relative_name)
-    }
-}
-
-#[derive(Eq, PartialEq, Debug)]
-pub struct NoBackend;
-
-impl NoBackend {
-    fn uninitialized<T>() -> crate::Result<T> {
-        Err(Error::Other(anyhow!("backend is not initialized")))
-    }
-}
-
-impl FileRepository for NoBackend {
-    fn read_dir(&self, _relative_name: &str) -> crate::Result<Vec<PathInfo>> {
-        Self::uninitialized()
-    }
-
-    fn delete_file(&self, _relative_name: &str) -> crate::Result<()> {
-        Self::uninitialized()
-    }
-
-    fn info(&self, _relative_name: &str) -> crate::Result<PathInfo> {
-        Self::uninitialized()
-    }
-
-    fn set_modified_time(&self, _relative_name: &str, _modtime: OffsetDateTime) -> crate::Result<()> {
-        Self::uninitialized()
-    }
-
-    fn read_file(
-        &self,
-        _relative_name: &str,
-        _dst: &mut Vec<u8>,
-    ) -> crate::Result<FileInfo> {
-        Self::uninitialized()
-    }
-
-    fn write_file(
-        &self,
-        _relative_name: &str,
-        _src: &[u8],
-    ) -> crate::Result<()> {
-        Self::uninitialized()
     }
 }
