@@ -11,7 +11,7 @@ rusqlite = { version = "0.28.0", features = ["bundled", "time"] }
 anyhow = { features = ["backtrace"], version = "1.0.66" }
 thiserror = "1.0"
 lazy_static = "1.4.0"
-time = "0.3.17"
+time = { version = "0.3.17", features = ["serde-well-known"] }
 sha1 = "0.10.5"
 filetime = "0.2.18"
 ureq = { version = "2.5.0", features = ["json"] }

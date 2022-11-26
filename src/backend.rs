@@ -14,7 +14,7 @@ pub trait FileRepository: Debug {
         &self,
         relative_name: &str,
         dst: &mut Vec<u8>,
-    ) -> crate::Result<FileInfo>;
+    ) -> crate::Result<()>;
 
     /// Write the content from src into the file with the relative name info.relative_name.
     /// If given, also changes that files modified time.

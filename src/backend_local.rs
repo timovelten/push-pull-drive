@@ -136,7 +136,7 @@ impl FileRepository for LocalBackend {
         &self,
         relative_name: &str,
         dst: &mut Vec<u8>,
-    ) -> crate::Result<FileInfo> {
+    ) -> crate::Result<()> {
         if self.is_ignored(relative_name) {
             return Err(Error::NotFound(relative_name.to_owned()));
         }
@@ -146,14 +146,7 @@ impl FileRepository for LocalBackend {
 
         std::io::copy(&mut file, dst)?;
 
-        let metadata = file.metadata()?;
-
-        Ok(FileInfo {
-            relative_name: relative_name.to_owned(),
-            size: metadata.len(),
-            modified: metadata.modified()?.into(),
-            hash: None,
-        })
+        Ok(())
     }
 
     fn write_file(&self, relative_name: &str, mut src: &[u8]) -> crate::Result<()> {

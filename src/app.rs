@@ -321,10 +321,15 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
                 FileChange::New | FileChange::Modified => {
                     // For now, we just download the entire file into memory.
                     // There are worse things...
-                    let info = from.read_file(&relative_name, &mut buffer)?;
-                    to.write_file( &relative_name, &mut buffer.as_slice())?;
-                    
-                    to.set_modified_time(&relative_name, info.modified)?;
+                    let fileinfo = if let PathInfo::File(info) = from.info(&relative_name)? {
+                        info
+                    } else {
+                        return Err(Error::NotAFile(relative_name));
+                    };
+
+                    from.read_file(&relative_name, &mut buffer)?;
+                    to.write_file(&relative_name, &mut buffer.as_slice())?;
+                    to.set_modified_time(&relative_name, fileinfo.modified)?;
 
                     if track {
                         self.track_current_version(&relative_name)?;

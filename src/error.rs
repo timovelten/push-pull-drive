@@ -11,6 +11,8 @@ pub enum Error {
     NotFound(String),
     #[error("not allowed")]
     NotAllowed(String),
+    #[error("the object at the specified path is not a file {0}")]
+    NotAFile(String),
     #[error("encountered a path that does not consist of valid unicode characters")]
     PathContainsInvalidUnicode,
     #[error("path needs to be absolute here")]

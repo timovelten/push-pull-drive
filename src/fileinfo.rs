@@ -44,6 +44,7 @@ pub struct DirectoryInfo {
 
 impl FileInfo {
     pub fn is_newer_than(&self, other: &Self) -> bool {
+        // TODO: What if hash is lower cased hex?
         let ret = self.size != other.size
             || self.modified > other.modified
             // Note that we do not have to explicitly verify that other is_some()
