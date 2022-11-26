@@ -6,7 +6,6 @@ mod paths;
 mod util;
 mod backend_local;
 mod error;
-mod walker;
 
 use backend::KEY_BACKEND;
 use clap::{Parser, Subcommand};
@@ -67,6 +66,10 @@ impl dyn App {}
 // TODO: When deleting a file, do not leave behind orphaned (empty) directories
 // TODO: Handle long windows filenames. Probably like this
 // https://gal.hagever.com/posts/windows-long-paths-in-rust
+// TODO: Have a command like maintenance fix-duplicates that fixes "two files/folders having the same name" by
+//  - if two files have the same name and sha1 hash, just delete one of them
+//  - if one of two folders is empty, delete it.
+//  - otherwise print a link to the web interface of google drive so the user may fix it himself.
 fn main() -> crate::Result<()> {
     let cli = Cli::parse();
     handle_command(cli.command)

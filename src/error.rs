@@ -23,14 +23,13 @@ pub enum Error {
     DatabaseNotInitialized,
     #[error("a configuration was found, but it is invalid (corrupted?). delete the config folder and re-initialize it.")]
     ConfigInvalid,
-
-    #[error("app is not initialized")]
-    Uninitialized(Box<Self>),
     // Transparent errors
     #[error(transparent)]
     DatabaseError(#[from] rusqlite::Error),
     #[error(transparent)]
     IoError(std::io::Error),
+    #[error(transparent)]
+    HttpError(#[from] ureq::Error),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

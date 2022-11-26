@@ -9,12 +9,12 @@
 //! abc/def/ceg
 //! i.e. a slash separated path, that does not contain dots. In particular, it does not start with a dot.
 
-use crate::backend::FileRepository;
-use crate::walker::DirWalker;
+use crate::backend::{FileRepository, DirWalker};
 use crate::{db, App, Error, PathInfo};
 use crate::{db::TrackedFile, FileChange};
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fmt::Display;
 use std::io::Write;
 
 pub struct DefaultApp<L, R> {
@@ -189,7 +189,7 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
     }
 
     // Determines how files have changed when comapared to another directory structure.
-    fn status<RD: crate::walker::ReadDir>(
+    fn status<RD: crate::backend::ReadDir>(
         &self,
         r: &RD,
     ) -> crate::Result<HashMap<String, FileChange>> {
