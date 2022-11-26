@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 use time::OffsetDateTime;
-use crate::{FileInfo, PathInfo, DirectoryInfo};
+use crate::{PathInfo, DirectoryInfo};
 
 pub const KEY_BACKEND: &str = "backend";
 

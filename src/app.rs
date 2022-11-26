@@ -14,7 +14,6 @@ use crate::{db, App, Error, PathInfo};
 use crate::{db::TrackedFile, FileChange};
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::fmt::Display;
 use std::io::Write;
 
 pub struct DefaultApp<L, R> {
