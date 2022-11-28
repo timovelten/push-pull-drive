@@ -49,6 +49,13 @@ pub fn append_to_relative_name(relative_name: &str, filename: &str) -> String {
     }
 }
 
+pub fn split_relative_name(relative_name: &str) -> (&str, &str) {
+    match relative_name.rsplit_once('/') {
+        Some((base, last)) => (base, last),
+        None => ("", relative_name),
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

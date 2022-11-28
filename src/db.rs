@@ -1,8 +1,11 @@
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
+use crate::Error;
 use lazy_static::lazy_static;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
-use crate::Error;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackedFile {
@@ -49,13 +52,28 @@ lazy_static! {
     );
 }
 
+#[derive(Clone)]
 pub struct DbRepository {
-    db: Connection,
+    db: Arc<Mutex<Connection>>,
 }
+
+const _: () = {
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+    fn assert_clone<T: Clone>() {}
+
+    fn assert_all() {
+        assert_send::<DbRepository>();
+        assert_sync::<DbRepository>();
+        assert_clone::<DbRepository>();
+    }
+};
 
 impl DbRepository {
     pub fn new(c: Connection) -> Self {
-        return Self { db: c };
+        return Self {
+            db: Arc::new(Mutex::new(c)),
+        };
     }
 
     /// Creates a repository for the database named DATABASE_NAME in the given directory path.
@@ -78,12 +96,13 @@ impl DbRepository {
     }
 
     fn write_schema(&self) -> crate::Result<()> {
-        Ok(self.db.execute_batch(&SCHEMA)?)
+        Ok(self.db.lock().unwrap().execute_batch(&SCHEMA)?)
     }
 
     #[allow(dead_code)]
     pub fn get_tracked_file(&self, relative_name: &str) -> crate::Result<Option<TrackedFile>> {
-        let mut stmt = self.db.prepare_cached(
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.prepare_cached(
             &format!("SELECT {COL_RELATIVE_NAME}, {COL_SIZE}, {COL_MODIFIED}, {COL_HASH} FROM {TBL_TRACKED_FILES} WHERE {COL_RELATIVE_NAME} = ?")
         )?;
 
@@ -105,7 +124,8 @@ impl DbRepository {
         &self,
         relative_name_prefix: &str,
     ) -> crate::Result<Vec<TrackedFile>> {
-        let mut stmt = self.db.prepare_cached(&format!("SELECT {COL_RELATIVE_NAME}, {COL_SIZE}, {COL_MODIFIED}, {COL_HASH} FROM {TBL_TRACKED_FILES} WHERE {COL_RELATIVE_NAME} GLOB ?"))?;
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.prepare_cached(&format!("SELECT {COL_RELATIVE_NAME}, {COL_SIZE}, {COL_MODIFIED}, {COL_HASH} FROM {TBL_TRACKED_FILES} WHERE {COL_RELATIVE_NAME} GLOB ?"))?;
 
         let pattern = format!("{}*", relative_name_prefix);
 
@@ -124,7 +144,8 @@ impl DbRepository {
     }
 
     pub fn update_tracked_file(&self, t: TrackedFile) -> crate::Result<()> {
-        let mut stmt = self.db.prepare_cached(
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.prepare_cached(
             &format!("INSERT OR REPLACE INTO {TBL_TRACKED_FILES} ({COL_RELATIVE_NAME}, {COL_SIZE}, {COL_MODIFIED}, {COL_HASH}) VALUES (?, ?, ?, ?)")
         )?;
 
@@ -135,7 +156,8 @@ impl DbRepository {
 
     /// This will not return an error if the specified entry does not exist.
     pub fn delete_tracked_file(&self, relative_name: &str) -> crate::Result<()> {
-        let mut stmt = self.db.prepare_cached(&format!(
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.prepare_cached(&format!(
             "DELETE FROM {TBL_TRACKED_FILES} WHERE {COL_RELATIVE_NAME} = ?"
         ))?;
 
@@ -145,7 +167,8 @@ impl DbRepository {
     }
 
     pub fn get_value(&self, key: &str) -> crate::Result<Option<String>> {
-        let mut stmt = self.db.prepare_cached(&format!(
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.prepare_cached(&format!(
             "SELECT {COL_VALUE} FROM {TBL_CONFIG} WHERE {COL_KEY} = ?"
         ))?;
 
@@ -157,7 +180,8 @@ impl DbRepository {
     }
 
     pub fn put_value(&self, key: &str, value: &str) -> crate::Result<()> {
-        let mut stmt = self.db.prepare_cached(&format!(
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.prepare_cached(&format!(
             "INSERT OR REPLACE INTO {TBL_CONFIG} VALUES (?, ?)"
         ))?;
 
@@ -173,7 +197,7 @@ pub fn initialize_database<P: AsRef<Path>>(dir: P, filename: &str) -> crate::Res
     let path = dir.as_ref().join(filename);
 
     let db = Connection::open(&path)?;
-    let repo = DbRepository { db };
+    let repo = DbRepository::new(db);
 
     // Make sure that the database is not yet initialized
     if let Ok(Some(_)) = repo.get_value(KEY_SCHEMA_VERSION) {

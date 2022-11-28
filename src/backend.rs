@@ -7,17 +7,12 @@ pub const KEY_BACKEND: &str = "backend";
 pub trait FileRepository: Debug {
     fn read_dir(&self, relative_name: &str) -> crate::Result<Vec<PathInfo>>;
 
-    /// Read the file contents into dst. Returns some file metdata. Note that some backends
-    /// may not always return all metdata here. In particular, the LocalBackend does not compute the
-    /// hash here.
     fn read_file(
         &self,
         relative_name: &str,
         dst: &mut Vec<u8>,
     ) -> crate::Result<()>;
 
-    /// Write the content from src into the file with the relative name info.relative_name.
-    /// If given, also changes that files modified time.
     fn write_file(
         &self,
         relative_name: &str,
@@ -26,7 +21,6 @@ pub trait FileRepository: Debug {
 
     fn delete_file(&self, relative_name: &str) -> crate::Result<()>;
 
-    /// Set the modification time of the specified file.
     fn set_modified_time(&self, relative_name: &str, modtime: OffsetDateTime) -> crate::Result<()>;
 
     fn info(&self, relative_name: &str) -> crate::Result<PathInfo>;
@@ -93,7 +87,7 @@ impl<'a, R: ReadDir> Iterator for DirWalker<'a, R> {
                     }
                     Err(err) => {
                         self.state = DirWalkerState::ContinueWithNextDirectory;
-                        println!("Retrieve index of {:?} failed", relative_name);
+                        println!("Retrieve index of {:?} failed {:?}", relative_name, err);
                         Some(Err(err))
                     }
                 }

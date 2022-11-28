@@ -112,6 +112,16 @@ impl<L: FileRepository, R: FileRepository> App for DefaultApp<L, R> {
             }
         })
     }
+
+    fn remote_ls(&self, path: Option<String>) -> crate::Result<()> {
+        let path = path.as_ref().unwrap_or(&self.cwd);
+
+        for file in self.remote.read_dir(path)? {
+            println!("{}", file.relative_name());
+        }
+
+        Ok(())
+    }
 }
 
 impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {

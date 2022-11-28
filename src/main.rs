@@ -1,16 +1,23 @@
 mod app;
 mod backend;
+mod backend_local;
 mod db;
+mod error;
 mod fileinfo;
+mod gdrive;
 mod paths;
 mod util;
-mod backend_local;
-mod error;
 
+use crate::{app::DefaultApp, backend_local::LocalBackend};
 use backend::KEY_BACKEND;
 use clap::{Parser, Subcommand};
-use std::path::{Path, PathBuf};
-use crate::{app::DefaultApp, backend_local::LocalBackend};
+use gdrive::{GDriveBackend, GoogleCredential, FatAccessToken};
+use oauth2::{ClientId, ClientSecret, RefreshToken, AccessToken};
+use time::OffsetDateTime;
+use std::{
+    fs::File,
+    path::{Path, PathBuf},
+};
 
 pub use error::{Error, Result};
 pub use fileinfo::*;
@@ -18,6 +25,16 @@ pub use paths::*;
 
 const CONFIG_DIR: &str = ".ppdrive";
 const DATABASE_NAME: &str = "database.sqlite3";
+
+// Constants, that are used in the app configuration (database)
+const GDRIVE_BACKEND: &str = "gdrive";
+const KEY_GDRIVE_CLIENT_SECRET: &str = "s";
+const KEY_GDRIVE_CLIENT_ID: &str = "cid";
+const KEY_GDRIVE_LAST_TOKEN: &str = "t";
+const KEY_GDRIVE_TOKEN_EXPIRES: &str = "exp";
+
+const LOCAL_BACKEND: &str = "local";
+const KEY_LOCAL_PATH: &str = "local_path";
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -42,26 +59,26 @@ enum Commands {
     Pull,
     /// Push local modified / new files and deletions to the remote
     Push,
-    DeleteIndex,
+    RemoteLs {
+        path: Option<String>
+    }
 }
 
 #[derive(Subcommand)]
 enum Backends {
-    Local { path: String },
+    Local {
+        path: String,
+    },
+    GoogleDrive {
+        /// Path to a JSON file which contains the two keys `installed/client_id` and
+        /// `installed/client_secret` with values the OAuth Client ID and Client Secret respectively.
+        /// You can create this file yourself or download it from the Google Cloud Console using the
+        /// "Download JSON" button after creating a new Desktop OAuth Client at
+        /// https://console.cloud.google.com/apis/credentials
+        #[arg(value_name = "path")]
+        secrets_path: String,
+    },
 }
-
-
-
-trait App {
-    fn init_cmd(&self, b: Backends) -> crate::Result<()>;
-    fn status_cmd(&self) -> crate::Result<()>;
-    fn remote_status_cmd(&self) -> crate::Result<()>;
-    fn pull_cmd(&self, yes: bool) -> crate::Result<()>;
-    fn push_cmd(&self, yes: bool) -> crate::Result<()>;
-}
-
-// We need App to be dyn. Assert it here and let the compiler make sure.
-impl dyn App {}
 
 // TODO: When deleting a file, do not leave behind orphaned (empty) directories
 // TODO: Handle long windows filenames. Probably like this
@@ -75,6 +92,18 @@ fn main() -> crate::Result<()> {
     handle_command(cli.command)
 }
 
+trait App {
+    fn init_cmd(&self, b: Backends) -> crate::Result<()>;
+    fn status_cmd(&self) -> crate::Result<()>;
+    fn remote_status_cmd(&self) -> crate::Result<()>;
+    fn pull_cmd(&self, yes: bool) -> crate::Result<()>;
+    fn push_cmd(&self, yes: bool) -> crate::Result<()>;
+    fn remote_ls(&self, path: Option<String>) -> crate::Result<()>;
+}
+
+// We need App to be dyn. Assert it here and let the compiler make sure.
+impl dyn App {}
+
 fn handle_command(cmd: Commands) -> crate::Result<()> {
     let cwd = std::env::current_dir()?;
     let app = find_context(cwd)?;
@@ -85,7 +114,7 @@ fn handle_command(cmd: Commands) -> crate::Result<()> {
         Commands::Push => app.push_cmd(false)?,
         Commands::Status => app.status_cmd()?,
         Commands::RemoteStatus => app.remote_status_cmd()?,
-        Commands::DeleteIndex => todo!(),
+        Commands::RemoteLs { path } => app.remote_ls(path)?,
     };
 
     Ok(())
@@ -141,11 +170,64 @@ impl UninitializedApp {
         // Note: Changes made here will almost certainly need corresponding changes to be made
         // below in the `init_cmd` function.
         let ret: Box<dyn App> = match db.get_value(KEY_BACKEND)? {
-            Some(s) if s == LocalBackend::THIS_BACKEND => {
-                let local_path = db
-                    .get_value(LocalBackend::KEY_LOCAL_PATH)?
-                    .ok_or(Error::ConfigInvalid)?;
+            Some(s) if s == LOCAL_BACKEND => {
+                let local_path = db.get_value(KEY_LOCAL_PATH)?.ok_or(Error::ConfigInvalid)?;
+
                 let remote = LocalBackend::new(local_path.into());
+
+                Box::new(DefaultApp::new(cwd, db, local, remote))
+            }
+            Some(s) if s == GDRIVE_BACKEND => {
+                let client_id = db
+                    .get_value(KEY_GDRIVE_CLIENT_ID)?
+                    .ok_or(Error::ConfigInvalid)?;
+
+                let client_secret = db
+                    .get_value(KEY_GDRIVE_CLIENT_SECRET)?
+                    .ok_or(Error::ConfigInvalid)?;
+
+                let last_token = db
+                    .get_value(KEY_GDRIVE_LAST_TOKEN)?;
+
+                let last_token_expires = db
+                    .get_value(KEY_GDRIVE_TOKEN_EXPIRES)?;
+
+                let last_token = match (last_token, last_token_expires) {
+                    (Some(tok), Some(exp)) => {
+                        let exp_timestamp = exp.parse::<i64>()
+                            .map_err(|_| Error::ConfigInvalid)?;
+                        let expires = OffsetDateTime::from_unix_timestamp(exp_timestamp)
+                            .expect("failed to convert timestamp to Datetime");
+
+                        Some(FatAccessToken {
+                            access_token: AccessToken::new(tok),
+                            expires
+                        })
+                    }
+                    (_, _) => None
+                };
+
+                let refresh_token = RefreshToken::new("1//094Th-NDKOCr_CgYIARAAGAkSNwF-L9Irfitihg0DVDdgFPH8zSL7XQW0pN_VZxUcCgWYRjshjjmjAFmxkpRR_IFeqGUrIs-GXbU".to_string());
+
+                let cloned_db = db.clone();
+                let credential = GoogleCredential::new(
+                    ClientId::new(client_id),
+                    ClientSecret::new(client_secret),
+                    refresh_token,
+                    last_token,
+                    move |token| {
+                        println!("Got new access token {}", token.access_token.secret());
+
+                        let _ =
+                            cloned_db.put_value(KEY_GDRIVE_LAST_TOKEN, token.access_token.secret());
+                        let _ = cloned_db.put_value(
+                            KEY_GDRIVE_TOKEN_EXPIRES,
+                            &token.expires.unix_timestamp().to_string(),
+                        );
+                    },
+                );
+
+                let remote = GDriveBackend::new(credential);
 
                 Box::new(DefaultApp::new(cwd, db, local, remote))
             }
@@ -168,8 +250,30 @@ impl App for UninitializedApp {
         // made above in the `load_actual_app` function.
         match b {
             Backends::Local { path } => {
-                db.put_value(KEY_BACKEND, LocalBackend::THIS_BACKEND)?;
-                db.put_value(LocalBackend::KEY_LOCAL_PATH, &path)?;
+                db.put_value(KEY_BACKEND, LOCAL_BACKEND)?;
+                db.put_value(KEY_LOCAL_PATH, &path)?;
+            }
+            Backends::GoogleDrive { secrets_path } => {
+                let f = File::open(secrets_path)?;
+                let parsed: serde_json::Value = serde_json::from_reader(f)?;
+                let installed = parsed.get("installed").ok_or(Error::ConfigInvalid)?;
+
+                let client_id = installed
+                    .get("client_id")
+                    .ok_or(Error::ConfigInvalid)?
+                    .as_str()
+                    .ok_or(Error::ConfigInvalid)?;
+
+                let client_secret = installed
+                    .get("client_secret")
+                    .ok_or(Error::ConfigInvalid)?
+                    .as_str()
+                    .ok_or(Error::ConfigInvalid)?;
+
+                // Store them in the database and return
+                db.put_value(KEY_BACKEND, GDRIVE_BACKEND)?;
+                db.put_value(KEY_GDRIVE_CLIENT_ID, &client_id)?;
+                db.put_value(KEY_GDRIVE_CLIENT_SECRET, &client_secret)?;
             }
         }
 
@@ -189,6 +293,10 @@ impl App for UninitializedApp {
     }
 
     fn push_cmd(&self, _yes: bool) -> crate::Result<()> {
+        Err(Error::NoConfigFound)
+    }
+
+    fn remote_ls(&self, _s: Option<String>) -> crate::Result<()> {
         Err(Error::NoConfigFound)
     }
 }

@@ -27,9 +27,6 @@ pub struct LocalBackend {
 }
 
 impl LocalBackend {
-    pub const THIS_BACKEND: &str = "local";
-    pub const KEY_LOCAL_PATH: &str = "local_path";
-
     pub fn new(root_path: PathBuf) -> Self {
         Self {
             root_path: root_path,
