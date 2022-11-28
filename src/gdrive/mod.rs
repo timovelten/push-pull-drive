@@ -1,7 +1,8 @@
-mod drive_api;
 mod credential;
+mod drive_api;
+pub mod oauth;
 
-pub use credential::{GoogleCredential, FatAccessToken};
+pub use credential::{FatAccessToken, GoogleCredential};
 
 use crate::{
     append_to_relative_name, backend::FileRepository, gdrive::drive_api::DriveApi,
@@ -10,7 +11,7 @@ use crate::{
 use std::{cell::RefCell, collections::HashMap};
 use ureq::Agent;
 
-use self::{drive_api::FilesReq};
+use self::drive_api::FilesReq;
 
 #[derive(Debug)]
 pub struct GDriveBackend {
@@ -34,7 +35,7 @@ impl GDriveBackend {
         Self {
             credential: credential,
             agent: Agent::new(),
-            id_cache: Default::default()
+            id_cache: Default::default(),
         }
     }
 
@@ -45,10 +46,7 @@ impl GDriveBackend {
     }
 
     fn make_drive_api(&self) -> crate::Result<DriveApi> {
-        Ok(DriveApi::new(
-            self.agent.clone(), 
-            &self.credential
-        ))
+        Ok(DriveApi::new(self.agent.clone(), &self.credential))
     }
 
     /// Try and find the Google-Drive-ID of the given relative name (path). If use_cache is set,
@@ -75,7 +73,8 @@ impl GDriveBackend {
 
         // If not, find our parent, get its id, list its contents. We should be in that list.
         let (parent_relative_name, _) = split_relative_name(relative_name);
-        let parent_id = self.get_drive_id_advanced(parent_relative_name, use_cache, only_folders)?;
+        let parent_id =
+            self.get_drive_id_advanced(parent_relative_name, use_cache, only_folders)?;
 
         // It would be possible here to only list the folders first, and check if
         // we are looking for a folder. This would only really be worth it when one assumes that
@@ -157,25 +156,33 @@ impl GDriveBackend {
     }
 }
 
-impl <'a> FileRepository for GDriveBackend {
+impl<'a> FileRepository for GDriveBackend {
     fn read_dir(&self, relative_name: &str) -> crate::Result<Vec<crate::PathInfo>> {
         let id = self.get_drive_id(relative_name)?;
+
+        println!("Read dir {}", relative_name);
 
         let files = self
             .make_drive_api()?
             .file_list_all(&format!("'{id}' in parents and trashed=false"))?;
         let ret = files
             .into_iter()
-            .map(|x| {
+            .filter_map(|x| {
                 let rel = append_to_relative_name(relative_name, &x.name);
-                match (x.size, x.sha1_checksum) {
-                    (Some(size), Some(sha1)) => PathInfo::File(crate::FileInfo {
+                match (x.size, x.sha1_checksum, x.mime_type.as_str()) {
+                    (Some(size), Some(sha1), _) => Some(PathInfo::File(crate::FileInfo {
                         relative_name: rel,
                         size,
                         modified: x.modified_time,
                         hash: Some(sha1),
-                    }),
-                    _ => PathInfo::Dir(crate::DirectoryInfo { relative_name: rel }),
+                    })),
+                    (_, _, "application/vnd.google-apps.folder") => {
+                        Some(PathInfo::Dir(crate::DirectoryInfo { relative_name: rel }))
+                    }
+                    (_, _, _) => {
+                        // Skip types we cannot cateogorize into file / folder
+                        None
+                    }
                 }
             })
             .collect::<Vec<_>>();

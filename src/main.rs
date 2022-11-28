@@ -11,15 +11,15 @@ mod util;
 use crate::{app::DefaultApp, backend_local::LocalBackend};
 use backend::KEY_BACKEND;
 use clap::{Parser, Subcommand};
-use gdrive::{GDriveBackend, GoogleCredential, FatAccessToken};
-use oauth2::{ClientId, ClientSecret, RefreshToken, AccessToken};
-use time::OffsetDateTime;
+use gdrive::{FatAccessToken, GDriveBackend, GoogleCredential};
+use oauth2::{AccessToken, ClientId, ClientSecret, RefreshToken};
 use std::{
     fs::File,
-    path::{Path, PathBuf},
+    path::{Path, PathBuf}, io::ErrorKind
 };
+use time::OffsetDateTime;
 
-pub use error::{Error, Result};
+pub use error::{Result, Error};
 pub use fileinfo::*;
 pub use paths::*;
 
@@ -30,8 +30,9 @@ const DATABASE_NAME: &str = "database.sqlite3";
 const GDRIVE_BACKEND: &str = "gdrive";
 const KEY_GDRIVE_CLIENT_SECRET: &str = "s";
 const KEY_GDRIVE_CLIENT_ID: &str = "cid";
-const KEY_GDRIVE_LAST_TOKEN: &str = "t";
+const KEY_GDRIVE_TOKEN: &str = "t";
 const KEY_GDRIVE_TOKEN_EXPIRES: &str = "exp";
+const KEY_GDRIVE_REFRESH_TOKEN: &str = "rt";
 
 const LOCAL_BACKEND: &str = "local";
 const KEY_LOCAL_PATH: &str = "local_path";
@@ -60,8 +61,8 @@ enum Commands {
     /// Push local modified / new files and deletions to the remote
     Push,
     RemoteLs {
-        path: Option<String>
-    }
+        path: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -87,9 +88,12 @@ enum Backends {
 //  - if two files have the same name and sha1 hash, just delete one of them
 //  - if one of two folders is empty, delete it.
 //  - otherwise print a link to the web interface of google drive so the user may fix it himself.
-fn main() -> crate::Result<()> {
+fn main() {
     let cli = Cli::parse();
-    handle_command(cli.command)
+    match handle_command(cli.command) {
+        Ok(_) => {},
+        Err(err) => println!("{} [{:?}]", err, err)
+    }
 }
 
 trait App {
@@ -130,6 +134,11 @@ fn find_context<P: AsRef<Path>>(cwd: P) -> crate::Result<Box<dyn App>> {
     for path in cwd.ancestors() {
         match uninit_app.load_actual_app(path) {
             Ok(app) => return Ok(app),
+            Err(Error::ConfigInvalid) => {
+                // Return the uninitialized app to allow the user to re-run init
+                // without having to delete everything.
+                break;
+            }
             Err(Error::NoConfigFound) => continue,
             Err(err) => {
                 // There was an error, and it wasn't NoConfigFound.
@@ -178,6 +187,7 @@ impl UninitializedApp {
                 Box::new(DefaultApp::new(cwd, db, local, remote))
             }
             Some(s) if s == GDRIVE_BACKEND => {
+                // Read what we previously saved from the database
                 let client_id = db
                     .get_value(KEY_GDRIVE_CLIENT_ID)?
                     .ok_or(Error::ConfigInvalid)?;
@@ -186,40 +196,41 @@ impl UninitializedApp {
                     .get_value(KEY_GDRIVE_CLIENT_SECRET)?
                     .ok_or(Error::ConfigInvalid)?;
 
-                let last_token = db
-                    .get_value(KEY_GDRIVE_LAST_TOKEN)?;
-
-                let last_token_expires = db
-                    .get_value(KEY_GDRIVE_TOKEN_EXPIRES)?;
-
+                let last_token = db.get_value(KEY_GDRIVE_TOKEN)?;
+                let last_token_expires = db.get_value(KEY_GDRIVE_TOKEN_EXPIRES)?;
                 let last_token = match (last_token, last_token_expires) {
                     (Some(tok), Some(exp)) => {
-                        let exp_timestamp = exp.parse::<i64>()
-                            .map_err(|_| Error::ConfigInvalid)?;
+                        let exp_timestamp = exp.parse::<i64>().map_err(|_| Error::ConfigInvalid)?;
                         let expires = OffsetDateTime::from_unix_timestamp(exp_timestamp)
                             .expect("failed to convert timestamp to Datetime");
 
                         Some(FatAccessToken {
                             access_token: AccessToken::new(tok),
-                            expires
+                            expires,
                         })
                     }
-                    (_, _) => None
+                    (_, _) => None,
                 };
 
-                let refresh_token = RefreshToken::new("1//094Th-NDKOCr_CgYIARAAGAkSNwF-L9Irfitihg0DVDdgFPH8zSL7XQW0pN_VZxUcCgWYRjshjjmjAFmxkpRR_IFeqGUrIs-GXbU".to_string());
+                let refresh_token = db
+                    .get_value(KEY_GDRIVE_REFRESH_TOKEN)?
+                    .ok_or(Error::ConfigInvalid)?;
+
+                // Create some objects in a DI kind of way and initialize the backend
+
+                let google_client = gdrive::oauth::new_google_oauth_client(
+                    ClientId::new(client_id),
+                    ClientSecret::new(client_secret),
+                );
 
                 let cloned_db = db.clone();
                 let credential = GoogleCredential::new(
-                    ClientId::new(client_id),
-                    ClientSecret::new(client_secret),
-                    refresh_token,
+                    google_client,
+                    RefreshToken::new(refresh_token),
                     last_token,
                     move |token| {
-                        println!("Got new access token {}", token.access_token.secret());
-
-                        let _ =
-                            cloned_db.put_value(KEY_GDRIVE_LAST_TOKEN, token.access_token.secret());
+                        // Note how we fail silently here. Maybe we shouldn't (?), we'll see
+                        let _ = cloned_db.put_value(KEY_GDRIVE_TOKEN, token.access_token.secret());
                         let _ = cloned_db.put_value(
                             KEY_GDRIVE_TOKEN_EXPIRES,
                             &token.expires.unix_timestamp().to_string(),
@@ -241,10 +252,25 @@ impl UninitializedApp {
 impl App for UninitializedApp {
     fn init_cmd(&self, b: Backends) -> crate::Result<()> {
         let config_dir = self.cwd.join(CONFIG_DIR);
+
         // Make sure the config directory exists
-        std::fs::create_dir(&config_dir)?;
-        // create the database here
-        let db = db::initialize_database(config_dir, DATABASE_NAME)?;
+        match std::fs::create_dir(&config_dir) {
+            Ok(_) => {},
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {},
+            Err(err) => return Err(err.into())
+        };
+
+        // In an earlier version, we failed here if the database already existed. We
+        // are now a bit more lenient. If the database already exists, we just run with it.
+        // This is so that we can prompt users to to run init again in case the refresh token
+        // ever expires or something similar happens.
+        let db = match db::DbRepository::new_from_path(&config_dir, crate::DATABASE_NAME) {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Could not open database");
+                db::initialize_database(config_dir, DATABASE_NAME)?
+            }
+        };
 
         // Note: Changes made here will almost certainly need corresponding changes to be
         // made above in the `load_actual_app` function.
@@ -258,22 +284,45 @@ impl App for UninitializedApp {
                 let parsed: serde_json::Value = serde_json::from_reader(f)?;
                 let installed = parsed.get("installed").ok_or(Error::ConfigInvalid)?;
 
-                let client_id = installed
-                    .get("client_id")
-                    .ok_or(Error::ConfigInvalid)?
-                    .as_str()
-                    .ok_or(Error::ConfigInvalid)?;
+                let client_id = ClientId::new(
+                    installed
+                        .get("client_id")
+                        .ok_or(Error::ConfigInvalid)?
+                        .as_str()
+                        .ok_or(Error::ConfigInvalid)?
+                        .to_string(),
+                );
 
-                let client_secret = installed
-                    .get("client_secret")
-                    .ok_or(Error::ConfigInvalid)?
-                    .as_str()
-                    .ok_or(Error::ConfigInvalid)?;
+                let client_secret = ClientSecret::new(
+                    installed
+                        .get("client_secret")
+                        .ok_or(Error::ConfigInvalid)?
+                        .as_str()
+                        .ok_or(Error::ConfigInvalid)?
+                        .to_string(),
+                );
+
+                // Login the user using the OAuth device flow
+                let google_client = gdrive::oauth::new_google_oauth_client(
+                    client_id.clone(),
+                    client_secret.clone(),
+                );
+
+                let (fat_token, refresh_token) = gdrive::oauth::sign_in(google_client)?;
 
                 // Store them in the database and return
                 db.put_value(KEY_BACKEND, GDRIVE_BACKEND)?;
-                db.put_value(KEY_GDRIVE_CLIENT_ID, &client_id)?;
-                db.put_value(KEY_GDRIVE_CLIENT_SECRET, &client_secret)?;
+                db.put_value(KEY_GDRIVE_CLIENT_ID, client_id.as_str())?;
+                db.put_value(KEY_GDRIVE_CLIENT_SECRET, client_secret.secret())?;
+
+                db.put_value(KEY_GDRIVE_REFRESH_TOKEN, refresh_token.secret())?;
+                db.put_value(KEY_GDRIVE_TOKEN, fat_token.access_token.secret())?;
+                db.put_value(
+                    KEY_GDRIVE_TOKEN_EXPIRES,
+                    &format!("{}", fat_token.expires.unix_timestamp()),
+                )?;
+
+                println!("Success");
             }
         }
 

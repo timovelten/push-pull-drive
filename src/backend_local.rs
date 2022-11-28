@@ -4,7 +4,6 @@ use crate::{
     util::{datetime_to_filetime, u8_slice_to_hex_string},
     DirectoryInfo, Error, FileInfo, PathInfo,
 };
-use anyhow::Context;
 use sha1::{Digest, Sha1};
 use std::{
     fs::{File, OpenOptions},
@@ -120,8 +119,7 @@ impl FileRepository for LocalBackend {
             }
 
             let info = self
-                .info(&f_relative_name)
-                .with_context(|| "failed to get info")?;
+                .info(&f_relative_name)?;
 
             ret.push(info)
         }
@@ -163,8 +161,7 @@ impl FileRepository for LocalBackend {
             .create(true)
             .write(true)
             .truncate(true)
-            .open(&local_path)
-            .with_context(|| format!("could not open file {:?}", local_path))?;
+            .open(&local_path)?;
 
         std::io::copy(&mut src, &mut file)?;
         drop(file);

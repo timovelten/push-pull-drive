@@ -10,7 +10,7 @@
 //! i.e. a slash separated path, that does not contain dots. In particular, it does not start with a dot.
 
 use crate::backend::{FileRepository, DirWalker};
-use crate::{db, App, Error, PathInfo};
+use crate::{db, App, Error, PathInfo, append_to_relative_name};
 use crate::{db::TrackedFile, FileChange};
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -114,10 +114,10 @@ impl<L: FileRepository, R: FileRepository> App for DefaultApp<L, R> {
     }
 
     fn remote_ls(&self, path: Option<String>) -> crate::Result<()> {
-        let path = path.as_ref().unwrap_or(&self.cwd);
+        let path = append_to_relative_name(&self.cwd, path.as_ref().map(|x| x.as_str()).unwrap_or(""));
 
-        for file in self.remote.read_dir(path)? {
-            println!("{}", file.relative_name());
+        for file in self.remote.read_dir(&path)? {
+            println!("{} [{:?}]", file.relative_name(), file);
         }
 
         Ok(())

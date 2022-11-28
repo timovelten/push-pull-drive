@@ -1,17 +1,13 @@
 use std::cell::RefCell;
 
-use oauth2::ureq::http_client;
+use oauth2::reqwest::http_client;
 use oauth2::{
-    basic::BasicClient, AccessToken, AuthUrl, ClientId, ClientSecret, ExtraTokenFields,
-    RefreshToken, StandardTokenResponse, TokenResponse,
-    TokenType, TokenUrl,
+    basic::BasicClient, AccessToken, ClientId,
+    RefreshToken, TokenResponse
 };
 use time::OffsetDateTime;
 
 use crate::Error;
-
-const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
-const TOKEN_URL: &str = "https://www.googleapis.com/oauth2/v3/token";
 
 #[derive(Debug, Clone)]
 pub struct FatAccessToken {
@@ -28,20 +24,6 @@ impl FatAccessToken {
     fn is_expired(&self) -> bool {
         let now = OffsetDateTime::now_utc();
         self.expires <= now
-    }
-}
-
-impl<EE: TokenType, EF: ExtraTokenFields> From<StandardTokenResponse<EF, EE>> for FatAccessToken {
-    fn from(resp: StandardTokenResponse<EF, EE>) -> Self {
-        let now = OffsetDateTime::now_utc();
-        let expires_in = resp
-            .expires_in()
-            .expect("expires_in should always be present");
-
-        Self {
-            access_token: resp.access_token().clone(),
-            expires: now + expires_in,
-        }
     }
 }
 
@@ -66,21 +48,13 @@ impl std::fmt::Debug for GoogleCredential {
 
 impl GoogleCredential {
     pub fn new<F: Fn(FatAccessToken) + 'static>(
-        client_id: ClientId,
-        client_secret: ClientSecret,
+        google_client: BasicClient,
         refresh_token: RefreshToken,
         last_token: Option<FatAccessToken>,
         new_token_callback: F,
     ) -> Self {
-        let client = BasicClient::new(
-            client_id,
-            Some(client_secret),
-            AuthUrl::new(AUTH_URL.to_string()).unwrap(),
-            Some(TokenUrl::new(TOKEN_URL.to_string()).unwrap()),
-        );
-
         let ret = Self {
-            client,
+            client: google_client,
             refresh_token,
             token: RefCell::new(last_token),
             callback: Box::new(new_token_callback),
@@ -129,13 +103,18 @@ impl GoogleCredential {
     }
 
     pub fn refresh_token(&self) -> crate::Result<()> {
+        let now = OffsetDateTime::now_utc();
         let token_response = self
             .client
             .exchange_refresh_token(&self.refresh_token)
             .request(http_client)
             .map_err(|e| Error::GoogleAuthError(Box::new(e)))?;
 
-        let fat_token = FatAccessToken::from(token_response);
+        let fat_token = FatAccessToken {
+            access_token: token_response.access_token().clone(),
+            expires: now + token_response.expires_in().expect("no expires_in field")
+        };
+
         self.token.replace(Some(fat_token.clone()));
         
         (self.callback)(fat_token);

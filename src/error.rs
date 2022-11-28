@@ -8,7 +8,7 @@ pub enum Error {
     NoConfigFound,
     #[error("app is already initialized")]
     AlreadyInitialized,
-    #[error("a configuration was found, but it is invalid (corrupted?). delete the config folder and re-initialize it.")]
+    #[error("A configuration was found, but it is invalid (corrupted?). Try and re-run the init command, or delete the config folder entirely.")]
     ConfigInvalid,
 
     // File state
@@ -50,8 +50,6 @@ pub enum Error {
     HttpStatusError { status: u16, resp: String },
     #[error(transparent)]
     Json(#[from] serde_json::Error),
-    #[error(transparent)]
-    Other(#[from] anyhow::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

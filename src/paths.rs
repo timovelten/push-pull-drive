@@ -1,5 +1,4 @@
 use std::path::Path;
-use anyhow::Context;
 use crate::Error;
 
 fn strip_leading_separator(path: &Path) -> &Path {
@@ -31,7 +30,7 @@ pub fn relative_name<P: AsRef<Path>, Q: AsRef<Path>>(
 
         Ok(relative_path
             .to_str()
-            .with_context(|| "not valid unicde")?
+            .ok_or(Error::PathContainsInvalidUnicode)?
             .to_owned())
     } else {
         return Err(Error::PathIsNotSubpathOf {
@@ -42,6 +41,10 @@ pub fn relative_name<P: AsRef<Path>, Q: AsRef<Path>>(
 }
 
 pub fn append_to_relative_name(relative_name: &str, filename: &str) -> String {
+    if filename.len() == 0 {
+        return relative_name.to_string()
+    }
+
     if relative_name.len() == 0 {
         filename.to_owned()
     } else {
