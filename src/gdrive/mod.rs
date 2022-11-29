@@ -3,19 +3,19 @@ mod drive_api;
 pub mod oauth;
 
 pub use credential::{FatAccessToken, GoogleCredential};
+use reqwest::blocking::Client;
 
 use crate::{
     append_to_relative_name, backend::FileRepository, gdrive::drive_api::DriveApi,
     split_relative_name, DirectoryInfo, Error, FileInfo, PathInfo,
 };
 use std::{cell::RefCell, collections::HashMap};
-use ureq::Agent;
 
 use self::drive_api::FilesReq;
 
 #[derive(Debug)]
 pub struct GDriveBackend {
-    agent: Agent,
+    client: Client,
 
     /// Google drive does not use paths. Instead, it identifies files using ids.
     /// For example, there is no specific API to list all of the files in a directory (by path).
@@ -34,7 +34,7 @@ impl GDriveBackend {
     pub fn new(credential: GoogleCredential) -> Self {
         Self {
             credential: credential,
-            agent: Agent::new(),
+            client: Client::new(),
             id_cache: Default::default(),
         }
     }
@@ -46,7 +46,10 @@ impl GDriveBackend {
     }
 
     fn make_drive_api(&self) -> crate::Result<DriveApi> {
-        Ok(DriveApi::new(self.agent.clone(), &self.credential))
+        Ok(DriveApi::new(
+            self.client.clone(),
+            self.credential.get_or_refresh_token()?,
+        ))
     }
 
     /// Try and find the Google-Drive-ID of the given relative name (path). If use_cache is set,
@@ -144,7 +147,7 @@ impl GDriveBackend {
                     ..Default::default()
                 };
 
-                let id = self.make_drive_api()?.files_create(req)?;
+                let id = self.make_drive_api()?.files_create(req)?.id;
                 self.cache_id(relative_name, &id);
 
                 Ok(id)
@@ -208,14 +211,17 @@ impl<'a> FileRepository for GDriveBackend {
                 let (parent, filename) = split_relative_name(relative_name);
                 let parent_id = self.mkdir_all(parent)?;
 
-                let id = self.make_drive_api()?.files_create_upload(
-                    FilesReq {
-                        name: Some(filename.to_string()),
-                        parents: Some(vec![parent_id]),
-                        ..Default::default()
-                    },
-                    src,
-                )?;
+                let id = self
+                    .make_drive_api()?
+                    .files_create_upload(
+                        FilesReq {
+                            name: Some(filename.to_string()),
+                            parents: Some(vec![parent_id]),
+                            ..Default::default()
+                        },
+                        src,
+                    )?
+                    .id;
                 self.cache_id(relative_name, &id);
             }
             Err(err) => return Err(err),

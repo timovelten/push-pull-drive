@@ -1,12 +1,11 @@
 use std::{fmt::Display, str::FromStr};
 
+use oauth2::AccessToken;
+use reqwest::blocking::Client;
 use serde::de;
 use serde::Deserialize;
 use serde::Serialize;
-use time::{OffsetDateTime};
-use ureq::{Agent, Response};
-
-use super::GoogleCredential;
+use time::OffsetDateTime;
 
 /// This module is dedicated to actually making the API calls we need to
 /// Google Drive. It does not much beyond that. In particular, it
@@ -30,6 +29,12 @@ pub struct File {
     pub sha1_checksum: Option<String>,
 }
 
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct FileId {
+    pub id: String,
+}
+
 impl File {
     pub fn is_folder(&self) -> bool {
         self.size.is_none() && self.mime_type == "application/vnd.google-apps.folder"
@@ -48,7 +53,7 @@ pub struct FilesListResp {
 pub struct FilesReq {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
 
@@ -57,52 +62,48 @@ pub struct FilesReq {
     pub modified_time: Option<OffsetDateTime>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub parents: Option<Vec<String>>
+    pub parents: Option<Vec<String>>,
 }
 
 /// This struct just exists to extract common paramters that would
 /// need to be passed to each function here in any case. It should not be kept
 /// around and is generally extremly short lived.
-pub struct DriveApi<'a> {
-    agent: Agent,
-    cred: &'a GoogleCredential
+pub struct DriveApi {
+    client: Client,
+    token: AccessToken,
 }
 
-impl<'a> DriveApi<'a> {
+impl DriveApi {
     // Chunksize of 20 MiB seems like a reasonable choice.
     const CHUNKSIZE: usize = (256 * 1024 * 4) * 20;
     const RETRY_COUNT: usize = 3;
 
-    pub fn new(agent: Agent, cred: &'a GoogleCredential) -> Self {
-        Self {
-            agent,
-            cred
-        }
+    pub fn new(client: Client, token: AccessToken) -> Self {
+        Self { client, token }
     }
 
     /// Note: you should probably always add the query parameter ... and trashed = false
-    pub fn file_list(&self, q: &str, next_page_token: &str) -> crate::Result<FilesListResp> {
+    pub fn file_list(
+        &self,
+        q: &str,
+        next_page_token: Option<&str>,
+    ) -> crate::Result<FilesListResp> {
         // Our response type is hardcoded anyways, and we almost always use the same
         // fields anyway. So we just hardcode it here and move one.
-        let mut req = self
-            .agent
-            .get("https://www.googleapis.com/drive/v3/files")
-            .query(
-                "fields",
-                "nextPageToken,files/id,files/name,files/mimeType,files/size,files/sha1Checksum,files/modifiedTime",
-            )
-            // Our network connection should be stable. Why not use the max page size?
-            .query("pageSize", "1000");
+        let ret = self.client.get("https://www.googleapis.com/drive/v3/files")
+            .query(&[
+                Some(("fields", "nextPageToken,files/id,files/name,files/mimeType,files/size,files/sha1Checksum,files/modifiedTime")),
+                Some(("pageSize", "1000")),
+                // Google does not complain about empty q paramter. Besides, it's never empty in practice
+                Some(("q", q)),
+                next_page_token.map(|x| ("pageToken", x))
+            ])
+            .bearer_auth(self.token.secret())
+            .send()?
+            .error_for_status()?
+            .json()?;
 
-        if q.len() > 0 {
-            req = req.query("q", q);
-        }
-
-        if next_page_token.len() > 0 {
-            req = req.query("pageToken", next_page_token);
-        }
-
-        Ok(self.cred.authenticate(req)?.call()?.into_json()?)
+        Ok(ret)
     }
 
     /// Wrap file_list and keep reading until nextPageToken is None. Return the end result.
@@ -111,7 +112,7 @@ impl<'a> DriveApi<'a> {
 
         let mut next_token = "".to_string();
         loop {
-            let resp = self.file_list(q, &next_token)?;
+            let resp = self.file_list(q, Some(&next_token))?;
             ret.extend(resp.files);
             if let Some(t) = resp.next_page_token {
                 next_token = t
@@ -124,13 +125,16 @@ impl<'a> DriveApi<'a> {
     }
 
     pub fn files_get(&self, id: &str) -> crate::Result<File> {
-        let req = self
-            .agent
-            .get(&format!("https://www.googleapis.com/drive/v3/files/{id}"))
-            .query("fields", "id,name,mimeType,size,sha1Checksum,modifiedTime");
+        let ret = self
+            .client
+            .get(format!("https://www.googleapis.com/drive/v3/files/{id}"))
+            .query(&[("fields", "id,name,mimeType,size,sha1Checksum,modifiedTime")])
+            .bearer_auth(self.token.secret())
+            .send()?
+            .error_for_status()?
+            .json()?;
 
-        let resp = self.cred.authenticate(req)?.call()?;
-        Ok(resp.into_json()?)
+        Ok(ret)
     }
 
     pub fn files_get_alt_media(
@@ -139,95 +143,107 @@ impl<'a> DriveApi<'a> {
         bytes_range: Option<(u64, u64)>,
         dst: &mut Vec<u8>,
     ) -> crate::Result<()> {
-        let mut req = self
-            .agent
-            .get(&format!("https://www.googleapis.com/drive/v3/files/{id}"))
-            .query("acknowledgeAbuse", "true")
-            .query("alt", "media");
+        let range_header = bytes_range.map(|(from, to)| format!("bytes={from}-{to}"));
 
-        if let Some((from, to)) = bytes_range {
-            req = req.set("Range", &format!("bytes={from}-{to}"));
-        }
+        let resp = self.client
+            .get(format!("https://www.googleapis.com/drive/v3/files/{id}"))
+            .query(&[
+                Some(("acknowledgeAbuse", "true")),
+                Some(("alt", "media")),
+                range_header.as_ref().map(|x| ("Range", x.as_str())),
+            ])
+            .bearer_auth(self.token.secret())
+            .send()?
+            .error_for_status()?;
 
-        let resp = self.cred.authenticate(req)?.call()?;
+        // FIXME: We need to use async here to actually have a progress bar, bytes_stream() is
+        // only available on the async client.
 
-        resp.into_reader().read_to_end(dst)?;
+        let body = resp.bytes()?;
+        dst.extend_from_slice(&body);
 
         Ok(())
     }
 
     pub fn files_delete(&self, id: &str) -> crate::Result<()> {
-        let req = self
-            .agent
-            .delete(&format!("https://www.googleapis.com/drive/v3/files/{id}"));
-
-        self.cred.authenticate(req)?.call()?;
+        self.client
+            .delete(format!("https://www.googleapis.com/drive/v3/files/{id}"))
+            .bearer_auth(self.token.secret())
+            .send()?;
 
         Ok(())
     }
 
-    pub fn files_create(&self, create_request: FilesReq) -> crate::Result<String> {
-        let req = self
-            .agent
-            .post("https://www.googleapis.com/drive/v3/files");
-        let resp = self.cred.authenticate(req)?.send_json(create_request)?;
-        
-        Ok(extract_id(resp))
+    pub fn files_create(&self, create_request: FilesReq) -> crate::Result<FileId> {
+        let ret = self
+            .client
+            .post("https://www.googleapis.com/drive/v3/files")
+            .json(&create_request)
+            .bearer_auth(self.token.secret())
+            .send()?
+            .error_for_status()?
+            .json()?;
+
+        Ok(ret)
     }
 
     pub fn files_create_upload(
         &self,
         create_request: FilesReq,
         bytes: &[u8],
-    ) -> crate::Result<String> {
-        let req = self
-            .agent
-            .post("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable");
-        let resp = self.cred.authenticate(req)?.send_json(create_request)?;
-        let resumable_session_url = resp.header("Location").unwrap();
+    ) -> crate::Result<FileId> {
+        let resp = self
+            .client
+            .post("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable")
+            .json(&create_request)
+            .bearer_auth(self.token.secret())
+            .send()?
+            .error_for_status()?;
+
+        let resumable_session_url = resp.headers().get("Location").unwrap().to_str().unwrap();
 
         self.upload(resumable_session_url, bytes)
     }
 
-    pub fn files_update_upload(&self, id: &str, bytes: &[u8]) -> crate::Result<String> {
-        let req = self
-            .agent
-            .patch(&format!("https://www.googleapis.com/upload/drive/v3/files/{id}?uploadType=resumable"));
-        let resp = self.cred.authenticate(req)?
+    pub fn files_update_upload(&self, id: &str, bytes: &[u8]) -> crate::Result<FileId> {
+        let resp = self
+            .client
+            .patch(format!("https://www.googleapis.com/upload/drive/v3/files/{id}?uploadType=resumable"))
             // Note that we could send a non empty object here, but for now,
             // we don't. We use another API request to change metadata.
-            .set("Content-Type", "application/json")
-            .send_string("{}")?;
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body("{}")
+            .bearer_auth(self.token.secret())
+            .send()?
+            .error_for_status()?;
 
-        let resumable_session_url = resp.header("Location").unwrap();
+        let resumable_session_url = resp.headers().get("Location").unwrap().to_str().unwrap();
 
-        let returned_id = self.upload(resumable_session_url, bytes)?;
-        debug_assert_eq!(returned_id, id);
-
-        Ok(returned_id)
+        self.upload(resumable_session_url, bytes)
     }
 
     pub fn files_update(&self, id: &str, update_req: FilesReq) -> crate::Result<()> {
-        let req = self
-            .agent
-            .patch(&format!("https://www.googleapis.com/drive/v3/files/{id}"));
+        let file_id: FileId = self
+            .client
+            .patch(format!("https://www.googleapis.com/drive/v3/files/{id}"))
+            .json(&update_req)
+            .bearer_auth(self.token.secret())
+            .send()?
+            .error_for_status()?
+            // Consume the response just to be sure
+            .json()?;
 
-        let resp = self.cred.authenticate(req)?
-            .send_json(update_req)?;
-
-        // Make sure to consume the response in one way or another.
-        let returned_id = extract_id(resp);
-        debug_assert_eq!(returned_id, id);
+        debug_assert_eq!(&file_id.id, id);
 
         Ok(())
     }
 
     // Returns the ID google returns afterwards
-    fn upload(&self, resumable_session_url: &str, bytes: &[u8]) -> crate::Result<String> {
+    fn upload(&self, resumable_session_url: &str, bytes: &[u8]) -> crate::Result<FileId> {
         const DELAY: [std::time::Duration; DriveApi::RETRY_COUNT] = [
             std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(3),
-            std::time::Duration::from_secs(10)
+            std::time::Duration::from_secs(10),
         ];
 
         let mut failed = 0;
@@ -249,14 +265,24 @@ impl<'a> DriveApi<'a> {
                 bytes.len()
             );
 
-            let req = self.agent.put(resumable_session_url).set("Content-Range", &range_header);
+            let resp = self
+                .client
+                .put(resumable_session_url)
+                .header(reqwest::header::CONTENT_RANGE, range_header)
+                .send()?;
 
-            // Note that ureq sets the content length for us (as is required by the google api)
-            match self.cred.authenticate(req)?.send_bytes(chunk) {
-                Ok(resp) if resp.status() == 308 => {
-                    // Find the range header of the response
-                    if let Some(range) = resp.header("Range") {
-                        let (from, to) = parse_range_header(range);
+            let status = resp.status().as_u16();
+
+            match status {
+                // Success
+                200..=299 => {
+                    // Success. We are done, extract the field and return it
+                    return Ok(resp.json()?);
+                }
+                // Not yet finished
+                308 => {
+                    if let Some(range) = resp.headers().get(reqwest::header::RANGE) {
+                        let (from, to) = parse_range_header(range.to_str().unwrap());
                         assert_eq!(from, 0, "range header indicates that remote has not receveived the beginning of a file but has received later parts");
 
                         cursor = to + 1;
@@ -267,18 +293,12 @@ impl<'a> DriveApi<'a> {
                         failed += 1;
                     }
                 }
-                Ok(resp) => {
-                    // We are done! Extract the file ID.
-                    return Ok(extract_id(resp));
-                }
-                Err(ureq::Error::Status(s, _)) if 500 <= s && s < 600 => {
-                    // Retry
+                // Internal server error
+                500..=599 => {
                     failed += 1;
                     continue;
                 }
-                Err(_) => {
-                    panic!("everything would be great without errors ._.");
-                }
+                _ => todo!("everything would be great without errors ._."),
             }
         }
 
@@ -293,16 +313,6 @@ fn parse_range_header(s: &str) -> (usize, usize) {
         usize::from_str(left).unwrap(),
         usize::from_str(right).unwrap(),
     )
-}
-
-fn extract_id(resp: Response) -> String {
-    resp.into_json::<serde_json::Value>()
-        .expect("google returned invalid json")
-        .get("id")
-        .expect("no id in file response")
-        .as_str()
-        .expect("id is not a string")
-        .to_string()
 }
 
 // Serde functions we need to serialize and deserialize the data correctly

@@ -1,8 +1,8 @@
 use std::cell::RefCell;
 
-use oauth2::reqwest::http_client;
+use oauth2::ureq::http_client;
 use oauth2::{
-    basic::BasicClient, AccessToken, ClientId,
+    basic::BasicClient, AccessToken,
     RefreshToken, TokenResponse
 };
 use time::OffsetDateTime;
@@ -63,15 +63,6 @@ impl GoogleCredential {
         ret
     }
 
-    pub fn authenticate(&self, req: ureq::Request) -> crate::Result<ureq::Request> {
-        let token = self.get_or_refresh_token()?;
-        
-        let ret = req.query("client", &self.client_id().as_str())
-            .set("Authorization", &format!("Bearer {}", token.secret()));
-
-        Ok(ret)
-    }
-
     fn needs_to_be_refreshed(&self) -> bool {
         self.token
             .borrow()
@@ -120,10 +111,6 @@ impl GoogleCredential {
         (self.callback)(fat_token);
 
         Ok(())
-    }
-
-    pub fn client_id(&self) -> &ClientId {
-        self.client.client_id()
     }
 }
 
