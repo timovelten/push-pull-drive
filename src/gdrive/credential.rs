@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::sync::Mutex;
 
 use oauth2::ureq::http_client;
 use oauth2::{
@@ -27,17 +27,51 @@ impl FatAccessToken {
     }
 }
 
+#[derive(Debug)]
 pub struct GoogleCredential {
+    inner: Mutex<GoogleCredentialImpl>
+}
+
+impl GoogleCredential {
+    pub fn new<F: Fn(FatAccessToken) + 'static + Send>(
+        google_client: BasicClient,
+        refresh_token: RefreshToken,
+        last_token: Option<FatAccessToken>,
+        new_token_callback: F,
+    ) -> Self {
+        let inner = GoogleCredentialImpl {
+            client: google_client,
+            refresh_token,
+            token: last_token,
+            callback: Box::new(new_token_callback),
+        };
+
+        GoogleCredential { inner: Mutex::new(inner) }
+    }
+
+    pub fn get_or_refresh_token(&self) -> crate::Result<AccessToken> {
+        self.inner.lock().unwrap().get_or_refresh_token()
+    }
+}
+
+const _: () = {
+    pub const fn assert_send<T: Send>() {}
+    pub const fn assert_sync<T: Sync>() {}
+    assert_send::<GoogleCredential>();
+    assert_sync::<GoogleCredential>();
+};
+
+struct GoogleCredentialImpl {
     // Immutable state, this will not be changed after initial creation.
     client: BasicClient,
     refresh_token: RefreshToken,
 
-    token: RefCell<Option<FatAccessToken>>,
+    token: Option<FatAccessToken>,
 
-    callback: Box<dyn Fn(FatAccessToken)>,
+    callback: Box<dyn Fn(FatAccessToken) + Send>,
 }
 
-impl std::fmt::Debug for GoogleCredential {
+impl std::fmt::Debug for GoogleCredentialImpl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GoogleCredential")
             .field("client", &self.client)
@@ -46,33 +80,16 @@ impl std::fmt::Debug for GoogleCredential {
     }
 }
 
-impl GoogleCredential {
-    pub fn new<F: Fn(FatAccessToken) + 'static>(
-        google_client: BasicClient,
-        refresh_token: RefreshToken,
-        last_token: Option<FatAccessToken>,
-        new_token_callback: F,
-    ) -> Self {
-        let ret = Self {
-            client: google_client,
-            refresh_token,
-            token: RefCell::new(last_token),
-            callback: Box::new(new_token_callback),
-        };
-
-        ret
-    }
-
+impl GoogleCredentialImpl {
     fn needs_to_be_refreshed(&self) -> bool {
         self.token
-            .borrow()
             .as_ref()
             .map(|x| x.needs_to_be_refreshed())
             .unwrap_or(true)
     }
 
     pub fn get_token(&self) -> Option<AccessToken> {
-        if let Some(fat_token) = self.token.borrow().as_ref() {
+        if let Some(fat_token) = self.token.as_ref() {
             if fat_token.is_expired() {
                 return None;
             }
@@ -83,7 +100,7 @@ impl GoogleCredential {
         }
     }
 
-    pub fn get_or_refresh_token(&self) -> crate::Result<AccessToken> {
+    pub fn get_or_refresh_token(&mut self) -> crate::Result<AccessToken> {
         if self.needs_to_be_refreshed() {
             self.refresh_token()?;
         }
@@ -93,7 +110,7 @@ impl GoogleCredential {
             .expect("token refresh succeeded but got no new token (or token is already expired)"))
     }
 
-    pub fn refresh_token(&self) -> crate::Result<()> {
+    pub fn refresh_token(&mut self) -> crate::Result<()> {
         let now = OffsetDateTime::now_utc();
         let token_response = self
             .client
@@ -106,7 +123,7 @@ impl GoogleCredential {
             expires: now + token_response.expires_in().expect("no expires_in field")
         };
 
-        self.token.replace(Some(fat_token.clone()));
+        self.token = Some(fat_token.clone());
         
         (self.callback)(fat_token);
 

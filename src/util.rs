@@ -15,6 +15,13 @@ pub fn datetime_to_filetime(time: OffsetDateTime) -> filetime::FileTime {
     filetime::FileTime::from_unix_time(time.unix_timestamp(), time.nanosecond())
 }
 
+#[allow(dead_code)]
+pub mod assert {
+    pub const fn send<T: Send>() {}
+    pub const fn sync<T: Send>() {}
+    pub const fn clone<T: Clone>() {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

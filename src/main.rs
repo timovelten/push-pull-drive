@@ -15,11 +15,12 @@ use gdrive::{FatAccessToken, GDriveBackend, GoogleCredential};
 use oauth2::{AccessToken, ClientId, ClientSecret, RefreshToken};
 use std::{
     fs::File,
-    path::{Path, PathBuf}, io::ErrorKind
+    io::ErrorKind,
+    path::{Path, PathBuf},
 };
 use time::OffsetDateTime;
 
-pub use error::{Result, Error};
+pub use error::{Error, Result};
 pub use fileinfo::*;
 pub use paths::*;
 
@@ -91,8 +92,8 @@ enum Backends {
 fn main() {
     let cli = Cli::parse();
     match handle_command(cli.command) {
-        Ok(_) => {},
-        Err(err) => println!("{} [{:?}]", err, err)
+        Ok(_) => {}
+        Err(err) => println!("{} [{:?}]", err, err),
     }
 }
 
@@ -168,11 +169,10 @@ impl UninitializedApp {
         let db = db::DbRepository::new_from_path(config_dir, crate::DATABASE_NAME)?;
 
         // This will be needed anyways, so we create it here
-        let local = {
-            let mut x = LocalBackend::new(root_path.as_ref().to_owned());
-            x.ignore(crate::CONFIG_DIR);
-            x
-        };
+        let local = LocalBackend::new(
+            root_path.as_ref().to_owned(),
+            vec![crate::CONFIG_DIR.to_string()],
+        );
 
         let cwd = paths::relative_name(root_path, &self.cwd)?;
 
@@ -182,7 +182,7 @@ impl UninitializedApp {
             Some(s) if s == LOCAL_BACKEND => {
                 let local_path = db.get_value(KEY_LOCAL_PATH)?.ok_or(Error::ConfigInvalid)?;
 
-                let remote = LocalBackend::new(local_path.into());
+                let remote = LocalBackend::new(local_path.into(), Vec::new());
 
                 Box::new(DefaultApp::new(cwd, db, local, remote))
             }
@@ -255,9 +255,9 @@ impl App for UninitializedApp {
 
         // Make sure the config directory exists
         match std::fs::create_dir(&config_dir) {
-            Ok(_) => {},
-            Err(err) if err.kind() == ErrorKind::AlreadyExists => {},
-            Err(err) => return Err(err.into())
+            Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err.into()),
         };
 
         // In an earlier version, we failed here if the database already existed. We

@@ -1,7 +1,7 @@
 use crate::{
     backend::FileRepository,
     paths,
-    util::{datetime_to_filetime, u8_slice_to_hex_string},
+    util::{self, datetime_to_filetime, u8_slice_to_hex_string},
     DirectoryInfo, Error, FileInfo, PathInfo,
 };
 use sha1::{Digest, Sha1};
@@ -11,7 +11,7 @@ use std::{
 };
 use time::OffsetDateTime;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LocalBackend {
     /// A path on the local file system. Note that although from this type definition
     /// it may look like we support non-valid-unicode paths, this is not the case
@@ -25,16 +25,17 @@ pub struct LocalBackend {
     ignore_prefixes: Vec<String>,
 }
 
+const _: () = {
+    util::assert::send::<LocalBackend>();
+    util::assert::clone::<LocalBackend>();
+};
+
 impl LocalBackend {
-    pub fn new(root_path: PathBuf) -> Self {
+    pub fn new(root_path: PathBuf, ignore_prefixes: Vec<String>) -> Self {
         Self {
             root_path: root_path,
-            ignore_prefixes: Vec::new(),
+            ignore_prefixes: ignore_prefixes,
         }
-    }
-
-    pub fn ignore(&mut self, prefix: &str) {
-        self.ignore_prefixes.push(prefix.into());
     }
 
     fn get_local_path_from_relative_name(&self, relative_name: &str) -> PathBuf {
@@ -118,8 +119,7 @@ impl FileRepository for LocalBackend {
                 continue;
             }
 
-            let info = self
-                .info(&f_relative_name)?;
+            let info = self.info(&f_relative_name)?;
 
             ret.push(info)
         }
@@ -127,11 +127,7 @@ impl FileRepository for LocalBackend {
         Ok(ret)
     }
 
-    fn read_file(
-        &self,
-        relative_name: &str,
-        dst: &mut Vec<u8>,
-    ) -> crate::Result<()> {
+    fn read_file(&self, relative_name: &str, dst: &mut Vec<u8>) -> crate::Result<()> {
         if self.is_ignored(relative_name) {
             return Err(Error::NotFound(relative_name.to_owned()));
         }
@@ -189,17 +185,10 @@ mod tests {
     use super::*;
     use std::{io::Write, path::Path};
 
-    /// Create a LocalBackend in some temporary location. Note that the temporary directory will
-    /// be deleted once the TempDir object is dropped.
-    fn create_local_backend_temp_location() -> (LocalBackend, tempfile::TempDir) {
-        let tempdir = tempfile::tempdir().expect("failed to create temp dir");
-        (LocalBackend::new(tempdir.path().to_owned()), tempdir)
-    }
-
     #[test]
     fn test_read_dir() {
-        let (mut b, tmp) = create_local_backend_temp_location();
-        b.ignore("ignored");
+        let tmp = tempfile::tempdir().unwrap();
+        let b = LocalBackend::new(tmp.path().to_owned(), vec!["ignored".into()]);
 
         assert!(b.read_dir("").unwrap().is_empty());
         assert!(matches!(
@@ -270,7 +259,8 @@ mod tests {
 
     #[test]
     fn test_read_file() {
-        let (mut b, tmp) = create_local_backend_temp_location();
+        let tmp = tempfile::tempdir().unwrap();
+        let b = LocalBackend::new(tmp.path().to_owned(), Vec::new());
 
         let test_bytes = (0..1_000_000u64).map(|x| x as u8).collect::<Vec<_>>();
 
@@ -295,7 +285,7 @@ mod tests {
 
         assert_eq!(file_bytes, test_bytes);
 
-        b.ignore("dir/subdir");
+        let b = LocalBackend::new(tmp.path().to_owned(), vec!["dir/subdir".into()]);
         let res = b.read_file(relative_name, &mut file_bytes);
         assert!(
             matches!(res, Err(Error::NotFound(_))),
@@ -306,12 +296,12 @@ mod tests {
 
     #[test]
     fn test_write_file() {
-        let (mut b, tmp) = create_local_backend_temp_location();
+        let tmp = tempfile::tempdir().unwrap();
+        let b = LocalBackend::new(tmp.path().to_owned(), vec!["dir/we/ignore".into()]);
         let test_bytes = (0..1_000_000u64).map(|x| x as u8).collect::<Vec<_>>();
 
         // Test if we can write to ignored locations
-        b.ignore("dir/we/ignore");
-        let x = b.write_file( "dir/we/ignore/subdir/test", &vec![]);
+        let x = b.write_file("dir/we/ignore/subdir/test", &vec![]);
         assert!(matches!(x, Err(Error::NotAllowed(_))));
 
         // Now write an actual file

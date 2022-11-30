@@ -9,11 +9,11 @@ use crate::{
     append_to_relative_name, backend::FileRepository, gdrive::drive_api::DriveApi,
     split_relative_name, DirectoryInfo, Error, FileInfo, PathInfo,
 };
-use std::{cell::RefCell, collections::HashMap};
+use std::{collections::HashMap, sync::{Arc, Mutex}};
 
 use self::drive_api::FilesReq;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GDriveBackend {
     client: Client,
 
@@ -23,9 +23,8 @@ pub struct GDriveBackend {
     /// For this, we assume that this object is generally short lived and pretend
     /// like concurrent modification is not an issue (someone could move the folder,
     /// for example. Then the cached ID would point to another path now.).
-    id_cache: RefCell<HashMap<String, String>>,
-
-    credential: GoogleCredential,
+    id_cache: Arc<IdCache>,
+    credential: Arc<GoogleCredential>,
 }
 
 impl GDriveBackend {
@@ -33,16 +32,10 @@ impl GDriveBackend {
 
     pub fn new(credential: GoogleCredential) -> Self {
         Self {
-            credential: credential,
+            credential: Arc::new(credential),
             client: Client::new(),
             id_cache: Default::default(),
         }
-    }
-
-    fn cache_id(&self, relative_name: &str, id: &str) {
-        self.id_cache
-            .borrow_mut()
-            .insert(relative_name.to_string(), id.to_string());
     }
 
     fn make_drive_api(&self) -> crate::Result<DriveApi> {
@@ -69,7 +62,7 @@ impl GDriveBackend {
 
         // Check if its cached
         if use_cache {
-            if let Some(x) = self.id_cache.borrow().get(relative_name) {
+            if let Some(x) = self.id_cache.get(relative_name) {
                 return Ok(x.clone());
             }
         }
@@ -91,7 +84,7 @@ impl GDriveBackend {
         for file in files {
             let this_relative_name = append_to_relative_name(parent_relative_name, &file.name);
             // Use the opportunity to remember a lot of the ids
-            self.cache_id(&this_relative_name, &file.id);
+            self.id_cache.update(&this_relative_name, &file.id);
 
             if this_relative_name == relative_name {
                 if ret.is_some() {
@@ -110,7 +103,7 @@ impl GDriveBackend {
         }
 
         if let Some(ret) = ret {
-            self.cache_id(relative_name, &ret);
+            self.id_cache.update(relative_name, &ret);
             Ok(ret)
         } else {
             println!("Could not find {}", relative_name);
@@ -148,7 +141,7 @@ impl GDriveBackend {
                 };
 
                 let id = self.make_drive_api()?.files_create(req)?.id;
-                self.cache_id(relative_name, &id);
+                self.id_cache.update(relative_name, &id);
 
                 Ok(id)
             }
@@ -222,7 +215,8 @@ impl<'a> FileRepository for GDriveBackend {
                         src,
                     )?
                     .id;
-                self.cache_id(relative_name, &id);
+
+                self.id_cache.update(relative_name, &id);
             }
             Err(err) => return Err(err),
         }
@@ -235,7 +229,7 @@ impl<'a> FileRepository for GDriveBackend {
         self.make_drive_api()?.files_delete(&id)?;
 
         // Try not to invalidate our own cache
-        self.id_cache.borrow_mut().remove(relative_name);
+        self.id_cache.delete(relative_name);
 
         Ok(())
     }
@@ -279,3 +273,33 @@ impl<'a> FileRepository for GDriveBackend {
         Ok(ret)
     }
 }
+
+#[derive(Default, Debug)]
+struct IdCache {
+    inner: Mutex<HashMap<String, String>>
+}
+
+impl IdCache {
+    pub fn update<K: ToString, V: ToString>(&self, key: K, val: V) {
+        self.inner.lock().unwrap().insert(key.to_string(), val.to_string());
+    }
+
+    pub fn get(&self, key: &str) -> Option<String> {
+        self.inner.lock().unwrap().get(key).map(|x| x.to_owned())
+    }
+
+    pub fn delete(&self, key: &str) {
+        self.inner.lock().unwrap().remove(key);
+    }
+}
+
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    const fn assert_sync<T: Send>() {}
+    const fn assert_clone<T: Clone>() {}
+
+    assert_send::<IdCache>();
+    assert_sync::<IdCache>();
+
+    assert_send::<GDriveBackend>();
+};
