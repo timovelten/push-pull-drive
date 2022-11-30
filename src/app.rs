@@ -198,9 +198,9 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
     }
 
     // Determines how files have changed when comapared to another directory structure.
-    fn status<RD: crate::backend::ReadDir>(
+    fn status<T: FileRepository>(
         &self,
-        r: &RD,
+        repo: &T,
     ) -> crate::Result<HashMap<String, FileChange>> {
         let mut ret = HashMap::new();
 
@@ -211,39 +211,41 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
             .map(|tf| (tf.relative_name.to_owned(), tf))
             .collect::<HashMap<_, _>>();
 
-        let mut files = HashSet::new();
+        let mut all_files_in_repo = HashSet::new();
 
-        let walker = DirWalker::new(self.cwd.to_owned(), r);
+        // Walking the file structure is really not that complicated, since we
+        // do not really care about order
+        let mut next_directories = vec![self.cwd.clone()];
 
-        for path_info in walker {
-            let p = match path_info {
-                Ok(info) => info,
-                Err(err) => {
-                    println!("Ignoring error: {:?}", err);
-                    continue;
-                }
-            };
+        while next_directories.len() > 0 {
+            let files = repo.read_dirs(&next_directories)?;
+            next_directories.clear();
 
-            if let PathInfo::File(info) = p {
-                files.insert(info.relative_name.clone());
+            for path_info in files {
+                match path_info {
+                    PathInfo::Dir(dir) => next_directories.push(dir.relative_name),
+                    PathInfo::File(info) => {
+                        all_files_in_repo.insert(info.relative_name.clone());
 
-                if let Some(tf) = tfs.get(&info.relative_name) {
-                    debug_assert_eq!(tf.relative_name, info.relative_name);
-
-                    // This file exists in the remote, and we track it. So check if it was modified.
-                    if info.is_newer_than(&tf.clone().into()) {
-                        ret.insert(info.relative_name, FileChange::Modified);
+                        if let Some(tf) = tfs.get(&info.relative_name) {
+                            debug_assert_eq!(tf.relative_name, info.relative_name);
+        
+                            // This file exists in the remote, and we track it. So check if it was modified.
+                            if info.is_newer_than(&tf.clone().into()) {
+                                ret.insert(info.relative_name, FileChange::Modified);
+                            }
+                        } else {
+                            // Remote file is new
+                            ret.insert(info.relative_name, FileChange::New);
+                        }
                     }
-                } else {
-                    // Remote file is new
-                    ret.insert(info.relative_name, FileChange::New);
                 }
             }
         }
 
         // Finally, use the list of files we built to determine which of tracked files were deleted
         for (_, tf) in tfs {
-            if !files.contains(&tf.relative_name) {
+            if !all_files_in_repo.contains(&tf.relative_name) {
                 ret.insert(tf.relative_name, FileChange::Deleted);
             }
         }

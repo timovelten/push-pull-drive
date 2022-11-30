@@ -27,6 +27,7 @@ pub struct File {
     #[serde(deserialize_with = "optional_from_str")]
     pub size: Option<u64>,
     pub sha1_checksum: Option<String>,
+    pub parents: Option<[String; 1]>
 }
 
 #[derive(Deserialize, Debug)]
@@ -92,7 +93,7 @@ impl DriveApi {
         // fields anyway. So we just hardcode it here and move one.
         let ret = self.client.get("https://www.googleapis.com/drive/v3/files")
             .query(&[
-                Some(("fields", "nextPageToken,files/id,files/name,files/mimeType,files/size,files/sha1Checksum,files/modifiedTime")),
+                Some(("fields", "nextPageToken,files/id,files/name,files/mimeType,files/size,files/sha1Checksum,files/modifiedTime,files/parents")),
                 Some(("pageSize", "1000")),
                 // Google does not complain about empty q paramter. Besides, it's never empty in practice
                 Some(("q", q)),
@@ -128,7 +129,7 @@ impl DriveApi {
         let ret = self
             .client
             .get(format!("https://www.googleapis.com/drive/v3/files/{id}"))
-            .query(&[("fields", "id,name,mimeType,size,sha1Checksum,modifiedTime")])
+            .query(&[("fields", "id,name,mimeType,size,sha1Checksum,modifiedTime,parents")])
             .bearer_auth(self.token.secret())
             .send()?
             .error_for_status()?

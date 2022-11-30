@@ -4,8 +4,12 @@ use crate::{PathInfo, DirectoryInfo};
 
 pub const KEY_BACKEND: &str = "backend";
 
-pub trait FileRepository: Debug {
-    fn read_dir(&self, relative_name: &str) -> crate::Result<Vec<PathInfo>>;
+pub trait FileRepository: Debug + Send + Clone {
+    fn read_dirs<T: AsRef<str>>(&self, dirs_relative_name: &[T]) -> crate::Result<Vec<PathInfo>>;
+
+    fn read_dir(&self, relative_name: &str) -> crate::Result<Vec<PathInfo>> {
+        self.read_dirs(&[relative_name])
+    }
 
     fn read_file(
         &self,

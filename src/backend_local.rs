@@ -1,7 +1,7 @@
 use crate::{
     backend::FileRepository,
     paths,
-    util::{self, datetime_to_filetime, u8_slice_to_hex_string},
+    util::{datetime_to_filetime, u8_slice_to_hex_string},
     DirectoryInfo, Error, FileInfo, PathInfo,
 };
 use sha1::{Digest, Sha1};
@@ -24,11 +24,6 @@ pub struct LocalBackend {
     /// info() will also throw an error when asked about these files.
     ignore_prefixes: Vec<String>,
 }
-
-const _: () = {
-    util::assert::send::<LocalBackend>();
-    util::assert::clone::<LocalBackend>();
-};
 
 impl LocalBackend {
     pub fn new(root_path: PathBuf, ignore_prefixes: Vec<String>) -> Self {
@@ -177,6 +172,14 @@ impl FileRepository for LocalBackend {
         filetime::set_file_mtime(local_path, datetime_to_filetime(modtime))?;
 
         Ok(())
+    }
+
+    fn read_dirs<T: AsRef<str>>(&self, dirs_relative_name: &[T]) -> crate::Result<Vec<PathInfo>> {
+        let mut ret = Vec::new();
+        for relative_name in dirs_relative_name {
+            ret.extend(self.read_dir(relative_name.as_ref())?)
+        }
+        Ok(ret)
     }
 }
 

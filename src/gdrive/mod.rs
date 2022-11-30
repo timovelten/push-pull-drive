@@ -9,7 +9,10 @@ use crate::{
     append_to_relative_name, backend::FileRepository, gdrive::drive_api::DriveApi,
     split_relative_name, DirectoryInfo, Error, FileInfo, PathInfo,
 };
-use std::{collections::HashMap, sync::{Arc, Mutex}};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use self::drive_api::FilesReq;
 
@@ -28,8 +31,6 @@ pub struct GDriveBackend {
 }
 
 impl GDriveBackend {
-    const ROOT: &'static str = "root";
-
     pub fn new(credential: GoogleCredential) -> Self {
         Self {
             credential: Arc::new(credential),
@@ -56,15 +57,21 @@ impl GDriveBackend {
         use_cache: bool,
         only_folders: bool,
     ) -> crate::Result<String> {
-        if relative_name == "" {
-            return Ok(Self::ROOT.to_string());
-        }
-
         // Check if its cached
         if use_cache {
             if let Some(x) = self.id_cache.get(relative_name) {
                 return Ok(x.clone());
             }
+        }
+
+        // Are we looking for root? root also has an Id and we need to find it,
+        // because we use these ids to determine paths in read dirs.
+        if relative_name == "" {
+            let f = self.make_drive_api()?.files_get("root")?;
+            debug_assert_eq!(f.parents, None);
+
+            self.id_cache.update(relative_name, &f.id);
+            return Ok(f.id);
         }
 
         // If not, find our parent, get its id, list its contents. We should be in that list.
@@ -122,7 +129,7 @@ impl GDriveBackend {
     fn mkdir_all(&self, relative_name: &str) -> crate::Result<String> {
         // Base case: root does not need to be created
         if relative_name == "" {
-            return Ok(Self::ROOT.to_string());
+            return self.get_drive_id(relative_name);
         }
 
         // Base case: If this already exists, just return its id
@@ -272,16 +279,88 @@ impl<'a> FileRepository for GDriveBackend {
 
         Ok(ret)
     }
+
+    fn read_dirs<T: AsRef<str>>(&self, dirs: &[T]) -> crate::Result<Vec<PathInfo>> {
+        const BATCH_SIZE: usize = 8;
+
+        let mut ret = Vec::new();
+
+        // ID's seem to be no longer than 50 characters. We batch them in groups of 8 for now.
+        // That also has the advantage that we do not have to allocate at all here (for a reverse
+        // lookup table).
+        let mut ids = Vec::new();
+        for rns_chunk in dirs.chunks(BATCH_SIZE) {
+            ids.clear();
+            for i in 0..rns_chunk.len() {
+                ids.insert(i, self.get_drive_id(rns_chunk[i].as_ref())?);
+            }
+
+            let mut q = ids
+                .iter()
+                .map(|id| format!("'{id}' in parents"))
+                .collect::<Vec<String>>()
+                .join(" or ");
+
+            q = format!("({q}) and trashed = false");
+
+            let files = self.make_drive_api()?.file_list_all(&q)?;
+
+            for file in files {
+                let parent_id = match file.parents {
+                    Some([x]) => x,
+                    _ => panic!("unexpectedly got file without parents"),
+                };
+
+                let parent_relative_name_idx = ids
+                    .iter()
+                    .position(|id| id == &parent_id)
+                    .expect("failed to find path of parent");
+
+                let relative_name = append_to_relative_name(
+                    rns_chunk[parent_relative_name_idx].as_ref(),
+                    &file.name,
+                );
+
+                let res = match (file.size, file.sha1_checksum, file.mime_type.as_str()) {
+                    (Some(size), Some(sha1), _) => Some(PathInfo::File(crate::FileInfo {
+                        relative_name,
+                        size,
+                        modified: file.modified_time,
+                        hash: Some(sha1),
+                    })),
+                    (_, _, "application/vnd.google-apps.folder") => {
+                        Some(PathInfo::Dir(crate::DirectoryInfo { relative_name }))
+                    }
+                    (_, _, _) => {
+                        // Skip types we cannot cateogorize into file / folder
+                        // FIXME: Do something for Google docs here
+                        None
+                    }
+                };
+
+                if let Some(res) = res {
+                    ret.push(res);
+                }
+            }
+
+
+        }
+
+        Ok(ret)
+    }
 }
 
 #[derive(Default, Debug)]
 struct IdCache {
-    inner: Mutex<HashMap<String, String>>
+    inner: Mutex<HashMap<String, String>>,
 }
 
 impl IdCache {
     pub fn update<K: ToString, V: ToString>(&self, key: K, val: V) {
-        self.inner.lock().unwrap().insert(key.to_string(), val.to_string());
+        self.inner
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), val.to_string());
     }
 
     pub fn get(&self, key: &str) -> Option<String> {
