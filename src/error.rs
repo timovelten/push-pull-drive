@@ -46,8 +46,6 @@ pub enum Error {
     IoError(std::io::Error),
     #[error(transparent)]
     HttpError(#[from] reqwest::Error),
-    #[error(transparent)]
-    HttpTransportError(ureq::Error),
     #[error("a http request had an unsuccessful status code")]
     HttpStatusError { status: u16, resp: String },
     #[error(transparent)]
@@ -73,19 +71,5 @@ impl<'a> From<(io::Error, &str)> for Error {
 impl From<io::Error> for Error {
     fn from(x: io::Error) -> Self {
         (x, "").into()
-    }
-}
-
-impl From<ureq::Error> for Error {
-    fn from(e: ureq::Error) -> Self {
-        match e {
-            ureq::Error::Status(s, resp) => Self::HttpStatusError {
-                status: s,
-                resp: resp
-                    .into_string()
-                    .unwrap_or_else(|e| format!("failed to read content {:?}", e)),
-            },
-            ureq::Error::Transport(_) => Self::HttpTransportError(e),
-        }
     }
 }

@@ -2,8 +2,6 @@ use std::fmt::Debug;
 use time::OffsetDateTime;
 use crate::{PathInfo, DirectoryInfo};
 
-pub const KEY_BACKEND: &str = "backend";
-
 pub trait FileRepository: Debug + Send + Clone {
     fn read_dirs<T: AsRef<str>>(&self, dirs_relative_name: &[T]) -> crate::Result<Vec<PathInfo>>;
 

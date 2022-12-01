@@ -9,7 +9,6 @@ mod paths;
 mod util;
 
 use crate::{app::DefaultApp, backend_local::LocalBackend};
-use backend::KEY_BACKEND;
 use clap::{Parser, Subcommand};
 use gdrive::{FatAccessToken, GDriveBackend, GoogleCredential};
 use oauth2::{AccessToken, ClientId, ClientSecret, RefreshToken};
@@ -28,6 +27,8 @@ const CONFIG_DIR: &str = ".ppdrive";
 const DATABASE_NAME: &str = "database.sqlite3";
 
 // Constants, that are used in the app configuration (database)
+pub const KEY_BACKEND: &str = "backend";
+
 const GDRIVE_BACKEND: &str = "gdrive";
 const KEY_GDRIVE_CLIENT_SECRET: &str = "s";
 const KEY_GDRIVE_CLIENT_ID: &str = "cid";
