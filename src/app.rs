@@ -9,7 +9,7 @@
 //! abc/def/ceg
 //! i.e. a slash separated path, that does not contain dots. In particular, it does not start with a dot.
 
-use crate::backend::{FileRepository, DirWalker};
+use crate::backend::FileRepository;
 use crate::{db, App, Error, PathInfo, append_to_relative_name};
 use crate::{db::TrackedFile, FileChange};
 use std::collections::HashMap;
@@ -105,7 +105,7 @@ impl<L: FileRepository, R: FileRepository> App for DefaultApp<L, R> {
                 },
                 FileChange::Deleted => {
                     Self::prompter_yes_no_all(
-                        &format!("Local file {} was deleted, but the corresponding remote file was changed since the last pull. Delte remote file?", rel), 
+                        &format!("Local file {} was deleted, but the corresponding remote file was changed since the last pull. Delete remote file?", rel), 
                         &mut all_yes_del, &mut all_no_del
                     )
                 }
