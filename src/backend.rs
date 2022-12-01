@@ -27,30 +27,3 @@ pub trait FileRepository: Debug + Send + Clone {
 
     fn info(&self, relative_name: &str) -> crate::Result<PathInfo>;
 }
-
-impl<F> ReadDir for F
-where
-    F: FileRepository,
-{
-    fn read_dir(&self, relative_name: &str) -> crate::Result<Vec<PathInfo>> {
-        self.read_dir(relative_name)
-    }
-}
-
-pub trait ReadDir {
-    fn read_dir(&self, relative_name: &str) -> crate::Result<Vec<PathInfo>>;
-}
-
-enum DirWalkerState {
-    RetrieveIndex {
-        // relative name of the directory, of which we need to retrieve the index.
-        relative_name: String,
-    },
-    YieldFiles {
-        index: Vec<PathInfo>,
-    },
-    ContinueWithNextDirectory,
-    Done,
-    // This state is really just a debugging aid.
-    Invalid,
-}

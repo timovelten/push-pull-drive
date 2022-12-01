@@ -68,7 +68,7 @@ pub struct FilesReq {
 
 /// This struct just exists to extract common paramters that would
 /// need to be passed to each function here in any case. It should not be kept
-/// around and is generally extremly short lived.
+/// around and is generally extremely short lived.
 pub struct DriveApi {
     client: Client,
     token: AccessToken,
