@@ -1,11 +1,17 @@
 use std::{fmt::Display, str::FromStr};
 
+use super::extensions::RequestBuilderExt;
+use super::extensions::ResponseExt;
+use super::extensions::UrlExt;
+use http::Request;
+use isahc::HttpClient;
+use isahc::ReadResponseExt;
 use oauth2::AccessToken;
-use reqwest::blocking::Client;
 use serde::de;
 use serde::Deserialize;
 use serde::Serialize;
 use time::OffsetDateTime;
+use url::Url;
 
 /// This module is dedicated to actually making the API calls we need to
 /// Google Drive. It does not much beyond that. In particular, it
@@ -27,7 +33,7 @@ pub struct File {
     #[serde(deserialize_with = "optional_from_str")]
     pub size: Option<u64>,
     pub sha1_checksum: Option<String>,
-    pub parents: Option<[String; 1]>
+    pub parents: Option<[String; 1]>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -70,7 +76,7 @@ pub struct FilesReq {
 /// need to be passed to each function here in any case. It should not be kept
 /// around and is generally extremely short lived.
 pub struct DriveApi {
-    client: Client,
+    client: HttpClient,
     token: AccessToken,
 }
 
@@ -79,7 +85,7 @@ impl DriveApi {
     const CHUNKSIZE: usize = (256 * 1024 * 4) * 20;
     const RETRY_COUNT: usize = 3;
 
-    pub fn new(client: Client, token: AccessToken) -> Self {
+    pub fn new(client: HttpClient, token: AccessToken) -> Self {
         Self { client, token }
     }
 
@@ -91,20 +97,20 @@ impl DriveApi {
     ) -> crate::Result<FilesListResp> {
         // Our response type is hardcoded anyways, and we almost always use the same
         // fields anyway. So we just hardcode it here and move one.
-        let ret = self.client.get("https://www.googleapis.com/drive/v3/files")
-            .query(&[
+        let url = Url::parse("https://www.googleapis.com/drive/v3/files").unwrap()
+            .with_query_pairs(&[
                 Some(("fields", "nextPageToken,files/id,files/name,files/mimeType,files/size,files/sha1Checksum,files/modifiedTime,files/parents")),
                 Some(("pageSize", "1000")),
                 // Google does not complain about empty q paramter. Besides, it's never empty in practice
                 Some(("q", q)),
                 next_page_token.map(|x| ("pageToken", x))
-            ])
-            .bearer_auth(self.token.secret())
-            .send()?
-            .error_for_status()?
-            .json()?;
+            ]);
 
-        Ok(ret)
+        let req = Request::get(url.to_string())
+            .bearer_auth(self.token.secret())
+            .body(())?;
+
+        Ok(self.client.send(req)?.json_error_for_status()?.json()?)
     }
 
     /// Wrap file_list and keep reading until nextPageToken is None. Return the end result.
@@ -126,16 +132,18 @@ impl DriveApi {
     }
 
     pub fn files_get(&self, id: &str) -> crate::Result<File> {
-        let ret = self
-            .client
-            .get(format!("https://www.googleapis.com/drive/v3/files/{id}"))
-            .query(&[("fields", "id,name,mimeType,size,sha1Checksum,modifiedTime,parents")])
-            .bearer_auth(self.token.secret())
-            .send()?
-            .error_for_status()?
-            .json()?;
+        let url = Url::parse(&format!("https://www.googleapis.com/drive/v3/files/{id}"))
+            .unwrap()
+            .with_query_pairs(&[(
+                "fields",
+                "id,name,mimeType,size,sha1Checksum,modifiedTime,parents",
+            )]);
 
-        Ok(ret)
+        let req = Request::get(url.to_string())
+            .bearer_auth(self.token.secret())
+            .body(())?;
+
+        Ok(self.client.send(req)?.json_error_for_status()?.json()?)
     }
 
     pub fn files_get_alt_media(
@@ -146,16 +154,19 @@ impl DriveApi {
     ) -> crate::Result<()> {
         let range_header = bytes_range.map(|(from, to)| format!("bytes={from}-{to}"));
 
-        let resp = self.client
-            .get(format!("https://www.googleapis.com/drive/v3/files/{id}"))
-            .query(&[
+        let url = Url::parse(&format!("https://www.googleapis.com/drive/v3/files/{id}"))
+            .unwrap()
+            .with_query_pairs(&[
                 Some(("acknowledgeAbuse", "true")),
                 Some(("alt", "media")),
                 range_header.as_ref().map(|x| ("Range", x.as_str())),
-            ])
+            ]);
+
+        let req = Request::get(url.to_string())
             .bearer_auth(self.token.secret())
-            .send()?
-            .error_for_status()?;
+            .body(())?;
+
+        let mut resp = self.client.send(req)?.json_error_for_status()?;
 
         // FIXME: We need to use async here to actually have a progress bar, bytes_stream() is
         // only available on the async client.
@@ -167,25 +178,25 @@ impl DriveApi {
     }
 
     pub fn files_delete(&self, id: &str) -> crate::Result<()> {
-        self.client
-            .delete(format!("https://www.googleapis.com/drive/v3/files/{id}"))
+        let url = Url::parse(&format!("https://www.googleapis.com/drive/v3/files/{id}")).unwrap();
+
+        let req = Request::delete(url.to_string())
             .bearer_auth(self.token.secret())
-            .send()?;
+            .body(())?;
+
+        self.client.send(req)?.json_error_for_status()?;
 
         Ok(())
     }
 
     pub fn files_create(&self, create_request: FilesReq) -> crate::Result<FileId> {
-        let ret = self
-            .client
-            .post("https://www.googleapis.com/drive/v3/files")
-            .json(&create_request)
-            .bearer_auth(self.token.secret())
-            .send()?
-            .error_for_status()?
-            .json()?;
+        let url = Url::parse("https://www.googleapis.com/drive/v3/files").unwrap();
 
-        Ok(ret)
+        let req = Request::post(url.to_string())
+            .bearer_auth(self.token.secret())
+            .json_body(&create_request)?;
+
+        Ok(self.client.send(req)?.json_error_for_status()?.json()?)
     }
 
     pub fn files_create_upload(
@@ -193,13 +204,15 @@ impl DriveApi {
         create_request: FilesReq,
         bytes: &[u8],
     ) -> crate::Result<FileId> {
-        let resp = self
-            .client
-            .post("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable")
-            .json(&create_request)
+        let url =
+            Url::parse("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable")
+                .unwrap();
+
+        let req = Request::post(url.to_string())
             .bearer_auth(self.token.secret())
-            .send()?
-            .error_for_status()?;
+            .json_body(&create_request)?;
+
+        let resp = self.client.send(req)?.json_error_for_status()?;
 
         let resumable_session_url = resp.headers().get("Location").unwrap().to_str().unwrap();
 
@@ -207,16 +220,18 @@ impl DriveApi {
     }
 
     pub fn files_update_upload(&self, id: &str, bytes: &[u8]) -> crate::Result<FileId> {
-        let resp = self
-            .client
-            .patch(format!("https://www.googleapis.com/upload/drive/v3/files/{id}?uploadType=resumable"))
+        let url = Url::parse(&format!(
+            "https://www.googleapis.com/upload/drive/v3/files/{id}?uploadType=resumable"
+        )).unwrap();
+
+        let req = Request::patch(url.to_string())
             // Note that we could send a non empty object here, but for now,
             // we don't. We use another API request to change metadata.
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body("{}")
+            .header(http::header::CONTENT_TYPE, "application/json")
             .bearer_auth(self.token.secret())
-            .send()?
-            .error_for_status()?;
+            .body("{}")?;
+
+        let resp = self.client.send(req)?.json_error_for_status()?;
 
         let resumable_session_url = resp.headers().get("Location").unwrap().to_str().unwrap();
 
@@ -224,14 +239,14 @@ impl DriveApi {
     }
 
     pub fn files_update(&self, id: &str, update_req: FilesReq) -> crate::Result<()> {
-        let file_id: FileId = self
-            .client
-            .patch(format!("https://www.googleapis.com/drive/v3/files/{id}"))
-            .json(&update_req)
+        let url = Url::parse(&format!("https://www.googleapis.com/drive/v3/files/{id}")).unwrap();
+
+        let req = Request::patch(url.to_string())
             .bearer_auth(self.token.secret())
-            .send()?
-            .error_for_status()?
-            // Consume the response just to be sure
+            .json_body(&update_req)?;
+
+        let file_id: FileId = self.client.send(req)?
+            .json_error_for_status()?
             .json()?;
 
         debug_assert_eq!(&file_id.id, id);
@@ -266,11 +281,10 @@ impl DriveApi {
                 bytes.len()
             );
 
-            let resp = self
-                .client
-                .put(resumable_session_url)
-                .header(reqwest::header::CONTENT_RANGE, range_header)
-                .send()?;
+            let req = Request::put(resumable_session_url)
+                .header(http::header::CONTENT_RANGE, range_header)
+                .body(())?;
+            let mut resp = self.client.send(req)?;
 
             let status = resp.status().as_u16();
 
@@ -282,7 +296,7 @@ impl DriveApi {
                 }
                 // Not yet finished
                 308 => {
-                    if let Some(range) = resp.headers().get(reqwest::header::RANGE) {
+                    if let Some(range) = resp.headers().get(http::header::RANGE) {
                         let (from, to) = parse_range_header(range.to_str().unwrap());
                         assert_eq!(from, 0, "range header indicates that remote has not receveived the beginning of a file but has received later parts");
 

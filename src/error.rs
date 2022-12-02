@@ -45,7 +45,9 @@ pub enum Error {
     #[error(transparent)]
     IoError(std::io::Error),
     #[error(transparent)]
-    HttpError(#[from] reqwest::Error),
+    HttpError(#[from] isahc::Error),
+    #[error(transparent)]
+    HttpParseError(#[from] http::Error),
     #[error("a http request had an unsuccessful status code")]
     HttpStatusError { status: u16, resp: String },
     #[error(transparent)]

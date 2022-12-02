@@ -1,9 +1,10 @@
 mod credential;
 mod drive_api;
 pub mod oauth;
+mod extensions;
 
 pub use credential::{FatAccessToken, GoogleCredential};
-use reqwest::blocking::Client;
+use isahc::HttpClient;
 
 use crate::{
     append_to_relative_name, backend::FileRepository, gdrive::drive_api::DriveApi,
@@ -18,7 +19,7 @@ use self::drive_api::FilesReq;
 
 #[derive(Debug, Clone)]
 pub struct GDriveBackend {
-    client: Client,
+    client: HttpClient,
 
     /// Google drive does not use paths. Instead, it identifies files using ids.
     /// For example, there is no specific API to list all of the files in a directory (by path).
@@ -34,7 +35,7 @@ impl GDriveBackend {
     pub fn new(credential: GoogleCredential) -> Self {
         Self {
             credential: Arc::new(credential),
-            client: Client::new(),
+            client: HttpClient::new().unwrap(),
             id_cache: Default::default(),
         }
     }

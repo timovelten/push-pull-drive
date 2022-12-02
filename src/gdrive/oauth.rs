@@ -7,7 +7,7 @@ use oauth2::{
     basic::BasicClient, AuthorizationCode, CsrfToken, PkceCodeChallenge, RedirectUrl,
     RefreshToken, Scope, TokenResponse,
 };
-use oauth2::{reqwest::http_client, AuthUrl, ClientId, ClientSecret, RevocationUrl, TokenUrl};
+use oauth2::{curl::http_client, AuthUrl, ClientId, ClientSecret, RevocationUrl, TokenUrl};
 use time::OffsetDateTime;
 use url::Url;
 

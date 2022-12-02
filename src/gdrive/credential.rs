@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 
-use oauth2::reqwest::http_client;
+use oauth2::curl::http_client;
 use oauth2::{
     basic::BasicClient, AccessToken,
     RefreshToken, TokenResponse
