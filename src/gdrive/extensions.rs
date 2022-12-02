@@ -11,7 +11,7 @@ impl UrlExt for Url {
         let serializer = serde_urlencoded::Serializer::new(&mut pairs);
         
         if let Err(err) = query.serialize(serializer) {
-            todo!("handle serialization error");
+            todo!("handle serialization error {:?}", err);
         }
 
         drop(pairs);
@@ -27,7 +27,7 @@ pub trait RequestBuilderExt {
 }
 
 impl RequestBuilderExt for http::request::Builder {
-    fn bearer_auth(mut self, token: &str) -> Self {
+    fn bearer_auth(self, token: &str) -> Self {
         self.header(http::header::AUTHORIZATION, format!("Bearer {}", token))
     }
 

@@ -1,6 +1,6 @@
 mod app;
 mod backend;
-mod backend_local;
+mod local;
 mod db;
 mod error;
 mod fileinfo;
@@ -8,7 +8,7 @@ mod gdrive;
 mod paths;
 mod util;
 
-use crate::{app::DefaultApp, backend_local::LocalBackend};
+use crate::{app::DefaultApp, local::LocalBackend};
 use clap::{Parser, Subcommand};
 use gdrive::{FatAccessToken, GDriveBackend, GoogleCredential};
 use oauth2::{AccessToken, ClientId, ClientSecret, RefreshToken};
