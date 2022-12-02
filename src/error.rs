@@ -39,6 +39,9 @@ pub enum Error {
     #[error("database does not contain schema version (it has likely not been initialzed properly) or does not exist at all")]
     DatabaseNotInitialized,
 
+    #[error("")]
+    TooMuchConcurrency,
+
     // Transparent errors we just pass through
     #[error(transparent)]
     DatabaseError(#[from] rusqlite::Error),

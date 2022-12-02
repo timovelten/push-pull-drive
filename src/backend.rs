@@ -1,8 +1,17 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, io::{Read, Seek}};
 use time::OffsetDateTime;
 use crate::PathInfo;
 
-pub trait FileRepository: Debug + Send + Clone {
+pub trait ReadSeek : Read + Seek {}
+impl <T: Read + Seek> ReadSeek for T {}
+
+/// Implementations should ensure that the number of concurrent requests does not exceed
+/// the capabilities of an underlying server. Preferably, this should be done using
+/// `HttpClient::max_connections_per_host`. Alterantively, it could be implemented
+/// manually using a Semaphore.
+pub trait FileRepository: Debug + Send + Sync {
+    type Reader: std::io::Read;
+
     fn read_dirs<T: AsRef<str>>(&self, dirs_relative_name: &[T]) -> crate::Result<Vec<PathInfo>>;
 
     fn read_dir(&self, relative_name: &str) -> crate::Result<Vec<PathInfo>> {
@@ -11,14 +20,13 @@ pub trait FileRepository: Debug + Send + Clone {
 
     fn read_file(
         &self,
-        relative_name: &str,
-        dst: &mut Vec<u8>,
-    ) -> crate::Result<()>;
+        relative_name: &str
+    ) -> crate::Result<Self::Reader>;
 
-    fn write_file(
+    fn write_file<R: ReadSeek>(
         &self,
         relative_name: &str,
-        src: &[u8],
+        src: R,
     ) -> crate::Result<()>;
 
     fn delete_file(&self, relative_name: &str) -> crate::Result<()>;

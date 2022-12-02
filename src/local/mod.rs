@@ -7,11 +7,11 @@ use crate::{
 use sha1::{Digest, Sha1};
 use std::{
     fs::{File, OpenOptions},
-    path::PathBuf,
+    path::PathBuf, io::Read,
 };
 use time::OffsetDateTime;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LocalBackend {
     /// A path on the local file system. Note that although from this type definition
     /// it may look like we support non-valid-unicode paths, this is not the case
@@ -48,6 +48,8 @@ impl LocalBackend {
     }
 }
 impl FileRepository for LocalBackend {
+    type Reader = File;
+
     fn info(&self, relative_name: &str) -> crate::Result<PathInfo> {
         if self.is_ignored(relative_name) {
             return Err(Error::NotFound(relative_name.to_string()));
@@ -122,20 +124,16 @@ impl FileRepository for LocalBackend {
         Ok(ret)
     }
 
-    fn read_file(&self, relative_name: &str, dst: &mut Vec<u8>) -> crate::Result<()> {
+    fn read_file(&self, relative_name: &str) -> crate::Result<Self::Reader> {
         if self.is_ignored(relative_name) {
             return Err(Error::NotFound(relative_name.to_owned()));
         }
 
         let local_path = self.get_local_path_from_relative_name(relative_name);
-        let mut file = File::open(local_path)?;
-
-        std::io::copy(&mut file, dst)?;
-
-        Ok(())
+        Ok(File::open(local_path)?)
     }
 
-    fn write_file(&self, relative_name: &str, mut src: &[u8]) -> crate::Result<()> {
+    fn write_file<R: Read>(&self, relative_name: &str, mut src: R) -> crate::Result<()> {
         if self.is_ignored(relative_name) {
             return Err(Error::NotAllowed(relative_name.to_owned()));
         }
@@ -186,7 +184,7 @@ impl FileRepository for LocalBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{io::Write, path::Path};
+    use std::{io::{Write, Cursor}, path::Path};
 
     #[test]
     fn test_read_dir() {
@@ -284,12 +282,13 @@ mod tests {
         drop(f);
 
         let mut file_bytes: Vec<u8> = Vec::new();
-        b.read_file(relative_name, &mut file_bytes).unwrap();
+        let mut reader = b.read_file(relative_name).unwrap();
+        std::io::copy(&mut reader, &mut file_bytes).unwrap();
 
         assert_eq!(file_bytes, test_bytes);
 
         let b = LocalBackend::new(tmp.path().to_owned(), vec!["dir/subdir".into()]);
-        let res = b.read_file(relative_name, &mut file_bytes);
+        let res = b.read_file(relative_name);
         assert!(
             matches!(res, Err(Error::NotFound(_))),
             "should be not found but got {:?}",
@@ -304,7 +303,7 @@ mod tests {
         let test_bytes = (0..1_000_000u64).map(|x| x as u8).collect::<Vec<_>>();
 
         // Test if we can write to ignored locations
-        let x = b.write_file("dir/we/ignore/subdir/test", &vec![]);
+        let x = b.write_file("dir/we/ignore/subdir/test", std::io::empty());
         assert!(matches!(x, Err(Error::NotAllowed(_))));
 
         // Now write an actual file
@@ -314,7 +313,7 @@ mod tests {
         let modtime_should_be = OffsetDateTime::now_utc();
         b.write_file(
             "dir/that-does-not-exist/somefile",
-            &mut (test_bytes.as_slice()),
+            Cursor::new(&test_bytes),
         )
         .unwrap();
 
@@ -323,9 +322,10 @@ mod tests {
 
         let mut f = File::open(fpath).unwrap();
 
-        let mut file_bytes = Vec::new();
+        let mut file_bytes: Vec<u8> = Vec::new();
         std::io::copy(&mut f, &mut file_bytes).unwrap();
 
+        assert_eq!(file_bytes.len(), test_bytes.len());
         assert_eq!(file_bytes, test_bytes);
 
         let modtime = OffsetDateTime::from(f.metadata().unwrap().modified().unwrap());

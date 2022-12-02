@@ -4,20 +4,20 @@ pub mod oauth;
 mod extensions;
 
 pub use credential::{FatAccessToken, GoogleCredential};
-use isahc::HttpClient;
+use isahc::{HttpClient};
 
 use crate::{
-    append_to_relative_name, backend::FileRepository, gdrive::drive_api::DriveApi,
+    append_to_relative_name, backend::{FileRepository, ReadSeek}, gdrive::drive_api::DriveApi,
     split_relative_name, DirectoryInfo, Error, FileInfo, PathInfo,
 };
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex}
 };
 
 use self::drive_api::FilesReq;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct GDriveBackend {
     client: HttpClient,
 
@@ -33,9 +33,14 @@ pub struct GDriveBackend {
 
 impl GDriveBackend {
     pub fn new(credential: GoogleCredential) -> Self {
+        let client = HttpClient::builder()
+            .max_connections_per_host(10)
+            .build()
+            .unwrap();
+
         Self {
             credential: Arc::new(credential),
-            client: HttpClient::new().unwrap(),
+            client,
             id_cache: Default::default(),
         }
     }
@@ -114,8 +119,6 @@ impl GDriveBackend {
             self.id_cache.update(relative_name, &ret);
             Ok(ret)
         } else {
-            println!("Could not find {}", relative_name);
-            println!("heres our cache {:?}", self.id_cache);
             Err(Error::NotFound(relative_name.to_string()))
         }
     }
@@ -161,10 +164,10 @@ impl GDriveBackend {
 }
 
 impl<'a> FileRepository for GDriveBackend {
+    type Reader = isahc::Body;
+
     fn read_dir(&self, relative_name: &str) -> crate::Result<Vec<crate::PathInfo>> {
         let id = self.get_drive_id(relative_name)?;
-
-        println!("Read dir {}", relative_name);
 
         let files = self
             .make_drive_api()?
@@ -194,14 +197,12 @@ impl<'a> FileRepository for GDriveBackend {
         Ok(ret)
     }
 
-    fn read_file(&self, relative_name: &str, dst: &mut Vec<u8>) -> crate::Result<()> {
+    fn read_file(&self, relative_name: &str) -> crate::Result<Self::Reader> {
         let id = self.get_drive_id(relative_name)?;
-        self.make_drive_api()?.files_get_alt_media(&id, None, dst)?;
-
-        Ok(())
+        Ok(self.make_drive_api()?.files_get_alt_media(&id, None)?)
     }
 
-    fn write_file(&self, relative_name: &str, src: &[u8]) -> crate::Result<()> {
+    fn write_file<R: ReadSeek>(&self, relative_name: &str, src: R) -> crate::Result<()> {
         match self.get_drive_id(relative_name) {
             Ok(id) => {
                 // The file already exists, update it...
@@ -343,8 +344,6 @@ impl<'a> FileRepository for GDriveBackend {
                     ret.push(res);
                 }
             }
-
-
         }
 
         Ok(ret)

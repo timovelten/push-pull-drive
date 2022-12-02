@@ -14,7 +14,7 @@ use crate::{db, App, Error, PathInfo, append_to_relative_name};
 use crate::{db::TrackedFile, FileChange};
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{Write, Cursor};
 
 pub struct DefaultApp<L, R> {
     // Note how this app does not even know the "root" directory, because it does not need to!
@@ -320,13 +320,9 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         changes: I,
         track: bool,
     ) -> crate::Result<()> {
-        // Allocate the temporary buffer only once, so we at least minimize the number of allocations
-        let mut buffer: Vec<u8> = Vec::new();
-
         for (relative_name, change) in changes {
             // TODO: Add proper progress reporting.
             println!("{}...", relative_name);
-            buffer.clear();
 
             match change {
                 FileChange::New | FileChange::Modified => {
@@ -338,8 +334,11 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
                         return Err(Error::NotAFile(relative_name));
                     };
 
-                    from.read_file(&relative_name, &mut buffer)?;
-                    to.write_file(&relative_name, &mut buffer.as_slice())?;
+                    let mut reader = from.read_file(&relative_name)?;
+                    let mut bytes: Vec<u8> = Vec::new();
+                    std::io::copy(&mut reader, &mut bytes).unwrap();
+
+                    to.write_file(&relative_name, Cursor::new(bytes))?;
                     to.set_modified_time(&relative_name, fileinfo.modified)?;
 
                     if track {

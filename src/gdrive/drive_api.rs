@@ -1,4 +1,7 @@
+use std::io::SeekFrom;
 use std::{fmt::Display, str::FromStr};
+
+use crate::backend::ReadSeek;
 
 use super::extensions::RequestBuilderExt;
 use super::extensions::ResponseExt;
@@ -149,9 +152,8 @@ impl DriveApi {
     pub fn files_get_alt_media(
         &self,
         id: &str,
-        bytes_range: Option<(u64, u64)>,
-        dst: &mut Vec<u8>,
-    ) -> crate::Result<()> {
+        bytes_range: Option<(u64, u64)>
+    ) -> crate::Result<isahc::Body> {
         let range_header = bytes_range.map(|(from, to)| format!("bytes={from}-{to}"));
 
         let url = Url::parse(&format!("https://www.googleapis.com/drive/v3/files/{id}"))
@@ -166,15 +168,8 @@ impl DriveApi {
             .bearer_auth(self.token.secret())
             .body(())?;
 
-        let mut resp = self.client.send(req)?.json_error_for_status()?;
-
-        // FIXME: We need to use async here to actually have a progress bar, bytes_stream() is
-        // only available on the async client.
-
-        let body = resp.bytes()?;
-        dst.extend_from_slice(&body);
-
-        Ok(())
+        let resp = self.client.send(req)?.json_error_for_status()?;
+        Ok(resp.into_body())
     }
 
     pub fn files_delete(&self, id: &str) -> crate::Result<()> {
@@ -199,10 +194,10 @@ impl DriveApi {
         Ok(self.client.send(req)?.json_error_for_status()?.json()?)
     }
 
-    pub fn files_create_upload(
+    pub fn files_create_upload<R: ReadSeek>(
         &self,
         create_request: FilesReq,
-        bytes: &[u8],
+        src: R,
     ) -> crate::Result<FileId> {
         let url =
             Url::parse("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable")
@@ -216,10 +211,10 @@ impl DriveApi {
 
         let resumable_session_url = resp.headers().get("Location").unwrap().to_str().unwrap();
 
-        self.upload(resumable_session_url, bytes)
+        self.upload(resumable_session_url, src)
     }
 
-    pub fn files_update_upload(&self, id: &str, bytes: &[u8]) -> crate::Result<FileId> {
+    pub fn files_update_upload<R: ReadSeek>(&self, id: &str, src: R) -> crate::Result<FileId> {
         let url = Url::parse(&format!(
             "https://www.googleapis.com/upload/drive/v3/files/{id}?uploadType=resumable"
         )).unwrap();
@@ -235,7 +230,7 @@ impl DriveApi {
 
         let resumable_session_url = resp.headers().get("Location").unwrap().to_str().unwrap();
 
-        self.upload(resumable_session_url, bytes)
+        self.upload(resumable_session_url, src)
     }
 
     pub fn files_update(&self, id: &str, update_req: FilesReq) -> crate::Result<()> {
@@ -254,46 +249,46 @@ impl DriveApi {
         Ok(())
     }
 
-    // Returns the ID google returns afterwards
-    fn upload(&self, resumable_session_url: &str, bytes: &[u8]) -> crate::Result<FileId> {
-        const DELAY: [std::time::Duration; DriveApi::RETRY_COUNT] = [
-            std::time::Duration::from_secs(1),
-            std::time::Duration::from_secs(3),
-            std::time::Duration::from_secs(10),
-        ];
+    // Try and read everything from the reader. Try to not but it into memory.
+    // At this point, it's already seekable, so we do not have to do that.
+    fn upload<R: ReadSeek>(&self, resumable_session_url: &str, mut src: R) -> crate::Result<FileId> {
+        // Determine the length of the of reader, because it makes our job easier.
+        // This is copied from the standard library, where this is an unstable function.
+        let old_pos = src.stream_position()?;
+        let len = src.seek(SeekFrom::End(0))?;
+        src.seek(SeekFrom::Start(old_pos))?;
+
+        let mut backing_buffer = vec![0u8; Self::CHUNKSIZE];
 
         let mut failed = 0;
         let mut cursor = 0;
+        let id: FileId = loop {
+            if failed > Self::RETRY_COUNT {
+                panic!("failed 3 times");
+            }
 
-        while failed < DELAY.len() {
-            std::thread::sleep(DELAY[failed]);
+            let read = src.read(&mut backing_buffer)?;
+            let chunk = &backing_buffer[0..read];
 
-            let chunksize = std::cmp::min(Self::CHUNKSIZE, bytes.len() - cursor);
-            let chunk = &bytes[cursor..cursor + chunksize];
-
-            println!("Sent chunk...");
-
-            // Upload CHUNKSIZE bytes to the resumable URL
             let range_header = &format!(
                 "bytes {}-{}/{}",
                 cursor,
                 cursor + chunk.len() - 1,
-                bytes.len()
+                len
             );
 
             let req = Request::put(resumable_session_url)
                 .header(http::header::CONTENT_RANGE, range_header)
-                .body(())?;
-            let mut resp = self.client.send(req)?;
+                .body(chunk)?;
 
-            let status = resp.status().as_u16();
+            let mut resp = self.client.send(req)?
+                // FIXME: This should be retried instead of just failing, but leave it like this for now
+                .json_error_for_status()?;
 
-            match status {
-                // Success
-                200..=299 => {
-                    // Success. We are done, extract the field and return it
-                    return Ok(resp.json()?);
-                }
+            match resp.status().as_u16() {
+                // Success. We are done, extract the field and return it
+                200..=299 => break resp.json()?,
+                
                 // Not yet finished
                 308 => {
                     if let Some(range) = resp.headers().get(http::header::RANGE) {
@@ -308,16 +303,11 @@ impl DriveApi {
                         failed += 1;
                     }
                 }
-                // Internal server error
-                500..=599 => {
-                    failed += 1;
-                    continue;
-                }
-                _ => todo!("everything would be great without errors ._."),
+                x => panic!("unexpected status code {}", x)
             }
-        }
+        };
 
-        todo!("make an error")
+        Ok(id)
     }
 }
 
