@@ -28,8 +28,8 @@ pub struct LocalBackend {
 impl LocalBackend {
     pub fn new(root_path: PathBuf, ignore_prefixes: Vec<String>) -> Self {
         Self {
-            root_path: root_path,
-            ignore_prefixes: ignore_prefixes,
+            root_path,
+            ignore_prefixes,
         }
     }
 
