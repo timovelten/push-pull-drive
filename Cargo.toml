@@ -20,6 +20,8 @@ oauth2 = { version = "4.3.0", default-features = false, features = ["curl"] }
 isahc = { version = "1.7.2", features = ["json"] }
 serde_urlencoded = "0.7.1"
 http = "0.2.8"
+tokio = { version = "1.22.0", features = ["full"] }
+async-trait = "0.1.59"
 
 [dev-dependencies]
 tempfile = "3.3.0"
