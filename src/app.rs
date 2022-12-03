@@ -218,8 +218,8 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         let mut next_directories = vec![self.cwd.clone()];
 
         while next_directories.len() > 0 {
-            let files = repo.read_dirs(&next_directories)?;
-            next_directories.clear();
+            let files = repo.read_dirs(next_directories)?;
+            next_directories = Vec::new();
 
             for path_info in files {
                 match path_info {

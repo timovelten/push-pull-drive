@@ -172,7 +172,7 @@ impl FileRepository for LocalBackend {
         Ok(())
     }
 
-    fn read_dirs<T: AsRef<str>>(&self, dirs_relative_name: &[T]) -> crate::Result<Vec<PathInfo>> {
+    fn read_dirs(&self, dirs_relative_name: Vec<String>) -> crate::Result<Vec<PathInfo>> {
         let mut ret = Vec::new();
         for relative_name in dirs_relative_name {
             ret.extend(self.read_dir(relative_name.as_ref())?)

@@ -282,7 +282,7 @@ impl<'a> FileRepository for GDriveBackend {
         Ok(ret)
     }
 
-    fn read_dirs<T: AsRef<str>>(&self, dirs: &[T]) -> crate::Result<Vec<PathInfo>> {
+    fn read_dirs(&self, dirs: Vec<String>) -> crate::Result<Vec<PathInfo>> {
         const BATCH_SIZE: usize = 8;
 
         let mut ret = Vec::new();

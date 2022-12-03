@@ -12,10 +12,10 @@ impl <T: Read + Seek + Send> ReadSeek for T {}
 pub trait FileRepository: Debug + Send + Sync {
     type Reader: Read + Send;
 
-    fn read_dirs<T: AsRef<str>>(&self, dirs_relative_name: &[T]) -> crate::Result<Vec<PathInfo>>;
+    fn read_dirs(&self, dirs: Vec<String>) -> crate::Result<Vec<PathInfo>>;
 
     fn read_dir(&self, relative_name: &str) -> crate::Result<Vec<PathInfo>> {
-        self.read_dirs(&[relative_name])
+        self.read_dirs(vec![relative_name.to_string()])
     }
 
     fn read_file(
