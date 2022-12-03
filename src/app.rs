@@ -60,24 +60,26 @@ impl<L: FileRepository, R: FileRepository> App for DefaultApp<L, R> {
     }
 
     fn pull_cmd(&self, yes: bool) -> crate::Result<()> {
-        self.push_pull_cmd_helper(&self.remote, &self.local, yes, |rel, theirs, ours| {
+        self.push_pull_cmd_helper(&self.remote, &self.local, yes, |theirs, ours| {
             // If our file was deleted, we put there whatever remote has done ever since
-            if ours == FileChange::Deleted {
+            if ours.is_deleted() {
                 return true;
             }
             
             let (mut all_yes_change, mut all_no_change) = (false, false);
             let (mut all_yes_del, mut all_no_del) = (false, false);
             match theirs {
-                FileChange::New | FileChange::Modified => {
+                FileChange::New(_) | FileChange::Modified(_) => {
                     Self::prompter_yes_no_all(
-                        &format!("Remote file {} was changed, but the corresponding local file has un-pushed changes. Overwrite local file?", rel), 
+                        &format!("Remote file {} was changed, but the corresponding local file has un-pushed changes. Overwrite local file?", ours.relative_name()), 
                         &mut all_yes_change, &mut all_no_change
                     )
                 },
-                FileChange::Deleted => {
+                FileChange::Deleted {
+                    relative_name: _
+                } => {
                     Self::prompter_yes_no_all(
-                        &format!("Remote file {} was deleted, but the corresponding local file has un-pushed changes. Delete local file?", rel), 
+                        &format!("Remote file {} was deleted, but the corresponding local file has un-pushed changes. Delete local file?", ours.relative_name()), 
                         &mut all_yes_del, &mut all_no_del
                     )
                 }
@@ -86,10 +88,10 @@ impl<L: FileRepository, R: FileRepository> App for DefaultApp<L, R> {
     }
 
     fn push_cmd(&self, yes: bool) -> crate::Result<()> {
-        self.push_pull_cmd_helper(&self.local, &self.remote, yes, |rel, ours, theirs| {
+        self.push_pull_cmd_helper(&self.local, &self.remote, yes, |ours, theirs| {
             // If the file was deleted remotely, there isn't really a conflict; we can just push our file and
             // be done.
-            if theirs == FileChange::Deleted {
+            if theirs.is_deleted() {
                 return true;
             }
 
@@ -97,15 +99,17 @@ impl<L: FileRepository, R: FileRepository> App for DefaultApp<L, R> {
             let (mut all_yes_change, mut all_no_change) = (false, false);
             let (mut all_yes_del, mut all_no_del) = (false, false);
             match ours {
-                FileChange::New | FileChange::Modified => {
+                FileChange::New(info) | FileChange::Modified(info) => {
                     Self::prompter_yes_no_all(
-                        &format!("Local file {} was changed, but the corresponding remote file was also changed since the last pull. Overwrite remote file?", rel), 
+                        &format!("Local file {} was changed, but the corresponding remote file was also changed since the last pull. Overwrite remote file?", info.relative_name), 
                         &mut all_yes_change, &mut all_no_change
                     )
                 },
-                FileChange::Deleted => {
+                FileChange::Deleted {
+                    relative_name
+                } => {
                     Self::prompter_yes_no_all(
-                        &format!("Local file {} was deleted, but the corresponding remote file was changed since the last pull. Delete remote file?", rel), 
+                        &format!("Local file {} was deleted, but the corresponding remote file was changed since the last pull. Delete remote file?", relative_name), 
                         &mut all_yes_del, &mut all_no_del
                     )
                 }
@@ -201,8 +205,8 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
     fn status<T: FileRepository>(
         &self,
         repo: &T,
-    ) -> crate::Result<HashMap<String, FileChange>> {
-        let mut ret = HashMap::new();
+    ) -> crate::Result<StatusReport> {
+        let mut ret: Vec<FileChange> = Vec::new();
 
         let tfs = self
             .db
@@ -232,11 +236,11 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         
                             // This file exists in the remote, and we track it. So check if it was modified.
                             if info.is_newer_than(&tf.clone().into()) {
-                                ret.insert(info.relative_name, FileChange::Modified);
+                                ret.push(FileChange::Modified(info));
                             }
                         } else {
                             // Remote file is new
-                            ret.insert(info.relative_name, FileChange::New);
+                            ret.push(FileChange::New(info));
                         }
                     }
                 }
@@ -246,17 +250,17 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         // Finally, use the list of files we built to determine which of tracked files were deleted
         for (_, tf) in tfs {
             if !all_files_in_repo.contains(&tf.relative_name) {
-                ret.insert(tf.relative_name, FileChange::Deleted);
+                ret.push(FileChange::Deleted { relative_name: tf.relative_name.clone() });
             }
         }
 
-        Ok(ret)
+        Ok(StatusReport::new(ret))
     }
 
     fn push_pull_cmd_helper<
         A: FileRepository,
         B: FileRepository,
-        F: FnMut(&str, FileChange, FileChange) -> bool,
+        F: FnMut(FileChange, FileChange) -> bool,
     >(
         &self,
         from: &A,
@@ -265,25 +269,24 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         mut resolver: F,
     ) -> crate::Result<()> {
         // Query the changes in from. We
-        let mut from_status = self.status(from)?.into_iter().collect::<Vec<_>>();
-        from_status.sort();
+        let from_status = self.status(from)?;
 
         // If the user wants to not check for conflicts, we do not even need the remote status
         let to_status = if yes {
-            HashMap::new()
+            StatusReport::new(Vec::new())
         } else {
             self.status(to)?
         };
 
         // We could probably save this allocation, but realistically, what would that accomplish.
-        let mut to_be_commited = vec![];
-        for (relative_name, our_change) in from_status {
-            if let Some(&their_change) = to_status.get(&relative_name) {
-                if resolver(&relative_name, our_change, their_change) {
-                    to_be_commited.push((relative_name, our_change));
+        let mut to_be_commited = Vec::new();
+        for our_change in from_status.into_inner() {
+            if let Some(their_change) = to_status.get(our_change.relative_name().as_str()) {
+                if resolver(our_change.clone(), their_change.clone()) {
+                    to_be_commited.push(our_change);
                 }
             } else {
-                to_be_commited.push((relative_name, our_change));
+                to_be_commited.push(our_change);
             }
         }
 
@@ -293,8 +296,8 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         }
 
         // Commit these changes?
-        for (rel, ch) in &to_be_commited {
-            println!("{:?}: {}", ch, rel);
+        for ch in &to_be_commited {
+            println!("{:?}", ch);
         }
 
         if Self::prompter("Commit these changes?") {
@@ -312,40 +315,41 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
     fn push<
         A: FileRepository,
         B: FileRepository,
-        I: IntoIterator<Item = (String, FileChange)>,
     >(
         &self,
         from: &A,
         to: &B,
-        changes: I,
+        changes: Vec<FileChange>,
         track: bool,
     ) -> crate::Result<()> {
-        for (relative_name, change) in changes {
+        for change in changes {
             // TODO: Add proper progress reporting.
-            println!("{}...", relative_name);
+            println!("{}...", change.relative_name());
 
             match change {
-                FileChange::New | FileChange::Modified => {
+                FileChange::New(info) | FileChange::Modified(info) => {
                     // For now, we just download the entire file into memory.
                     // There are worse things...
-                    let fileinfo = if let PathInfo::File(info) = from.info(&relative_name)? {
+                    let fileinfo = if let PathInfo::File(info) = from.info(&info.relative_name)? {
                         info
                     } else {
-                        return Err(Error::NotAFile(relative_name));
+                        return Err(Error::NotAFile(info.relative_name));
                     };
 
-                    let mut reader = from.read_file(&relative_name)?;
+                    let mut reader = from.read_file(&info.relative_name)?;
                     let mut bytes: Vec<u8> = Vec::new();
                     std::io::copy(&mut reader, &mut bytes).unwrap();
 
-                    to.write_file(&relative_name, Cursor::new(bytes))?;
-                    to.set_modified_time(&relative_name, fileinfo.modified)?;
+                    to.write_file(&info.relative_name, Cursor::new(bytes))?;
+                    to.set_modified_time(&info.relative_name, fileinfo.modified)?;
 
                     if track {
-                        self.track_current_version(&relative_name)?;
+                        self.track_current_version(&info.relative_name)?;
                     }
                 }
-                FileChange::Deleted => {
+                FileChange::Deleted {
+                    relative_name
+                } => {
                     to.delete_file(&relative_name)?;
 
                     if track {
@@ -358,7 +362,47 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         Ok(())
     }
 
-    fn print_status(&self, changes: &HashMap<String, FileChange>) {
-        println!("{:#?}", changes);
+    fn print_status(&self, changes: &StatusReport) {
+        for change in changes.inner().iter() {
+            match change {
+                FileChange::New(info) => println!("New: {}", info.relative_name),
+                FileChange::Modified(info) => println!("Modified: {}", info.relative_name),
+                FileChange::Deleted { relative_name } => println!("Deleted: {}", relative_name), 
+            }
+        }
     }
 }
+
+/// A datastructure holding a list of `FileChanges` in a way that makes it at least somehwat
+/// efficient to check if a certain relative name is contained inside.
+/// In other words, this is a thin wrapper around Vec<FileChange> which is enforced to always
+/// be sorted by the relative name and `get` uses binary search.
+struct StatusReport {
+    inner: Vec<FileChange>
+}
+
+impl StatusReport {
+    pub fn new(mut v: Vec<FileChange>) -> Self {
+        v.sort_by(|x, y| x.relative_name().cmp(&y.relative_name()));
+
+        Self {
+            inner: v
+        }
+    }
+
+    fn inner(&self) -> &Vec<FileChange> {
+        &self.inner
+    }
+
+    pub fn into_inner(self) -> Vec<FileChange> {
+        self.inner
+    } 
+
+    pub fn get<S: AsRef<str>>(&self, relative_name: S) -> Option<&FileChange> {
+        let rel_name = relative_name.as_ref();
+        let idx = self.inner.binary_search_by(|x| x.relative_name().as_str().cmp(rel_name))
+            .ok()?;
+        Some(&self.inner[idx])
+    }
+}
+

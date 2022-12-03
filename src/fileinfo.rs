@@ -1,8 +1,31 @@
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum FileChange {
-    New,
-    Modified,
-    Deleted,
+    New(FileInfo),
+    Modified(FileInfo),
+    Deleted {
+        relative_name: String
+    },
+}
+
+impl FileChange {
+    pub fn relative_name(&self) -> &String {
+        match self {
+            FileChange::New(info) | FileChange::Modified(info) => &info.relative_name,
+            FileChange::Deleted { relative_name } => relative_name,
+        }
+    }
+
+    pub fn is_new(&self) -> bool {
+        matches!(self, FileChange::New(_))
+    }
+
+    pub fn is_modified(&self) -> bool {
+        matches!(self, FileChange::Modified(_))
+    }
+
+    pub fn is_deleted(&self) -> bool {
+        matches!(self, FileChange::Deleted { relative_name: _})
+    }
 }
 
 pub type HashValue = String;
