@@ -14,7 +14,7 @@ use crate::{db, App, Error, PathInfo, append_to_relative_name};
 use crate::{db::TrackedFile, FileChange};
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::io::{Write, Cursor};
+use std::io::Write;
 
 pub struct DefaultApp<L, R> {
     // Note how this app does not even know the "root" directory, because it does not need to!
@@ -336,11 +336,8 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
                         return Err(Error::NotAFile(info.relative_name));
                     };
 
-                    let mut reader = from.read_file(&info.relative_name)?;
-                    let mut bytes: Vec<u8> = Vec::new();
-                    std::io::copy(&mut reader, &mut bytes).unwrap();
-
-                    to.write_file(&info.relative_name, Cursor::new(bytes))?;
+                    let bytes = from.read_file(&info.relative_name)?;
+                    to.write_file(&info.relative_name, bytes)?;
                     to.set_modified_time(&info.relative_name, fileinfo.modified)?;
 
                     if track {

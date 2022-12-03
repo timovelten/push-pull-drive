@@ -7,7 +7,7 @@ pub use credential::{FatAccessToken, GoogleCredential};
 use isahc::{HttpClient};
 
 use crate::{
-    append_to_relative_name, backend::{FileRepository, ReadSeek}, gdrive::drive_api::DriveApi,
+    append_to_relative_name, backend::FileRepository, gdrive::drive_api::DriveApi,
     split_relative_name, DirectoryInfo, Error, FileInfo, PathInfo,
 };
 use std::{
@@ -164,8 +164,6 @@ impl GDriveBackend {
 }
 
 impl<'a> FileRepository for GDriveBackend {
-    type Reader = isahc::Body;
-
     fn read_dir(&self, relative_name: &str) -> crate::Result<Vec<crate::PathInfo>> {
         let id = self.get_drive_id(relative_name)?;
 
@@ -197,12 +195,19 @@ impl<'a> FileRepository for GDriveBackend {
         Ok(ret)
     }
 
-    fn read_file(&self, relative_name: &str) -> crate::Result<Self::Reader> {
+    fn read_file(&self, relative_name: &str) -> crate::Result<Vec<u8>> {
         let id = self.get_drive_id(relative_name)?;
-        Ok(self.make_drive_api()?.files_get_alt_media(&id, None)?)
+        let mut body = self.make_drive_api()?.files_get_alt_media(&id, None)?;
+
+        let mut ret = Vec::new();
+        std::io::copy(&mut body, &mut ret)?;
+
+        Ok(ret)
     }
 
-    fn write_file<R: ReadSeek>(&self, relative_name: &str, src: R) -> crate::Result<()> {
+    fn write_file<R: AsRef<[u8]>>(&self, relative_name: &str, src: R) -> crate::Result<()> {
+        let src = src.as_ref();
+
         match self.get_drive_id(relative_name) {
             Ok(id) => {
                 // The file already exists, update it...

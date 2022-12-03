@@ -1,7 +1,5 @@
-use std::io::SeekFrom;
+use std::io::{Cursor, Read};
 use std::{fmt::Display, str::FromStr};
-
-use crate::backend::ReadSeek;
 
 use super::extensions::RequestBuilderExt;
 use super::extensions::ResponseExt;
@@ -194,7 +192,7 @@ impl DriveApi {
         Ok(self.client.send(req)?.json_error_for_status()?.json()?)
     }
 
-    pub fn files_create_upload<R: ReadSeek>(
+    pub fn files_create_upload<R: AsRef<[u8]>>(
         &self,
         create_request: FilesReq,
         src: R,
@@ -214,7 +212,7 @@ impl DriveApi {
         self.upload(resumable_session_url, src)
     }
 
-    pub fn files_update_upload<R: ReadSeek>(&self, id: &str, src: R) -> crate::Result<FileId> {
+    pub fn files_update_upload<R: AsRef<[u8]>>(&self, id: &str, src: R) -> crate::Result<FileId> {
         let url = Url::parse(&format!(
             "https://www.googleapis.com/upload/drive/v3/files/{id}?uploadType=resumable"
         )).unwrap();
@@ -251,12 +249,10 @@ impl DriveApi {
 
     // Try and read everything from the reader. Try to not but it into memory.
     // At this point, it's already seekable, so we do not have to do that.
-    fn upload<R: ReadSeek>(&self, resumable_session_url: &str, mut src: R) -> crate::Result<FileId> {
-        // Determine the length of the of reader, because it makes our job easier.
-        // This is copied from the standard library, where this is an unstable function.
-        let old_pos = src.stream_position()?;
-        let len = src.seek(SeekFrom::End(0))?;
-        src.seek(SeekFrom::Start(old_pos))?;
+    fn upload<R: AsRef<[u8]>>(&self, resumable_session_url: &str, src: R) -> crate::Result<FileId> {
+        let src = src.as_ref();
+        let len = src.len();
+        let mut src = Cursor::new(src.as_ref());
 
         let mut backing_buffer = vec![0u8; Self::CHUNKSIZE];
 
@@ -267,7 +263,7 @@ impl DriveApi {
                 panic!("failed 3 times");
             }
 
-            let read = src.read(&mut backing_buffer)?;
+            let read =  src.read(&mut backing_buffer)?;
             let chunk = &backing_buffer[0..read];
 
             let range_header = &format!(
