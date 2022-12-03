@@ -7,7 +7,7 @@ use crate::{
 use sha1::{Digest, Sha1};
 use std::{
     fs::{File, OpenOptions},
-    path::PathBuf, io::Cursor,
+    path::PathBuf, io::Cursor, sync::Arc,
 };
 use time::OffsetDateTime;
 
@@ -135,8 +135,8 @@ impl FileRepository for LocalBackend {
         Ok(out)
     }
 
-    fn write_file<R: AsRef<[u8]>>(&self, relative_name: &str, src: R) -> crate::Result<()> {
-        let mut src = Cursor::new(src.as_ref());
+    fn write_file(&self, relative_name: &str, src: Arc<[u8]>) -> crate::Result<()> {
+        let mut src = Cursor::new(src);
 
         if self.is_ignored(relative_name) {
             return Err(Error::NotAllowed(relative_name.to_owned()));
@@ -304,7 +304,7 @@ mod tests {
         let test_bytes = (0..1_000_000u64).map(|x| x as u8).collect::<Vec<_>>();
 
         // Test if we can write to ignored locations
-        let x = b.write_file("dir/we/ignore/subdir/test", []);
+        let x = b.write_file("dir/we/ignore/subdir/test", Arc::new([]));
         assert!(matches!(x, Err(Error::NotAllowed(_))));
 
         // Now write an actual file
@@ -314,7 +314,7 @@ mod tests {
         let modtime_should_be = OffsetDateTime::now_utc();
         b.write_file(
             "dir/that-does-not-exist/somefile",
-            &test_bytes,
+            test_bytes.clone().into(),
         )
         .unwrap();
 

@@ -205,7 +205,7 @@ impl<'a> FileRepository for GDriveBackend {
         Ok(ret)
     }
 
-    fn write_file<R: AsRef<[u8]>>(&self, relative_name: &str, src: R) -> crate::Result<()> {
+    fn write_file(&self, relative_name: &str, src: Arc<[u8]>) -> crate::Result<()> {
         let src = src.as_ref();
 
         match self.get_drive_id(relative_name) {

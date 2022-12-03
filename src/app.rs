@@ -337,7 +337,7 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
                     };
 
                     let bytes = from.read_file(&info.relative_name)?;
-                    to.write_file(&info.relative_name, bytes)?;
+                    to.write_file(&info.relative_name, bytes.into())?;
                     to.set_modified_time(&info.relative_name, fileinfo.modified)?;
 
                     if track {

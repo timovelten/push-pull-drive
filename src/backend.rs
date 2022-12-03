@@ -1,4 +1,4 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::Arc};
 use time::OffsetDateTime;
 use crate::PathInfo;
 
@@ -18,10 +18,10 @@ pub trait FileRepository: Debug + Send + Sync {
         relative_name: &str
     ) -> crate::Result<Vec<u8>>;
 
-    fn write_file<R: AsRef<[u8]>>(
+    fn write_file(
         &self,
         relative_name: &str,
-        src: R,
+        src: Arc<[u8]>,
     ) -> crate::Result<()>;
 
     fn delete_file(&self, relative_name: &str) -> crate::Result<()>;
