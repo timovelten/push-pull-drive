@@ -1,5 +1,6 @@
-use std::{fmt::Debug, sync::Arc};
+use std::fmt::Debug;
 use async_trait::async_trait;
+use futures::AsyncRead;
 use time::OffsetDateTime;
 use crate::PathInfo;
 
@@ -9,6 +10,8 @@ use crate::PathInfo;
 /// manually using a Semaphore.
 #[async_trait]
 pub trait FileRepository: Debug + Send + Sync {
+    type Reader: AsyncRead + Send;
+
     async fn read_dirs(&self, dirs: Vec<String>) -> crate::Result<Vec<PathInfo>>;
 
     async fn read_dir(&self, relative_name: &str) -> crate::Result<Vec<PathInfo>> {
@@ -18,12 +21,13 @@ pub trait FileRepository: Debug + Send + Sync {
     async fn read_file(
         &self,
         relative_name: &str
-    ) -> crate::Result<Vec<u8>>;
+    ) -> crate::Result<(Self::Reader, u64)>;
 
-    async fn write_file(
+    async fn write_file<R: AsyncRead + Send>(
         &self,
         relative_name: &str,
-        src: Arc<[u8]>,
+        src: R,
+        len: u64
     ) -> crate::Result<()>;
 
     async fn delete_file(&self, relative_name: &str) -> crate::Result<()>;

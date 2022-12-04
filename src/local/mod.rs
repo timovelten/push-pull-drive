@@ -5,11 +5,12 @@ use crate::{
     DirectoryInfo, Error, FileInfo, PathInfo,
 };
 use async_trait::async_trait;
+use futures::AsyncRead;
 use sha1::{Digest, Sha1};
 use tokio::task::spawn_blocking;
+use tokio_util::compat::{FuturesAsyncReadCompatExt, Compat, TokioAsyncReadCompatExt};
 use std::{
-    fs::{File, OpenOptions},
-    io::Cursor,
+    fs::File,
     path::PathBuf,
     sync::Arc,
 };
@@ -134,46 +135,6 @@ impl InnerLocalBackend {
         Ok(ret)
     }
 
-    fn read_file_block(&self, relative_name: &str) -> crate::Result<Vec<u8>> {
-        if self.is_ignored(relative_name) {
-            return Err(Error::NotFound(relative_name.to_owned()));
-        }
-
-        let local_path = self.get_local_path_from_relative_name(relative_name);
-        let mut f = File::open(local_path)?;
-
-        let mut out = Vec::new();
-        std::io::copy(&mut f, &mut out)?;
-        Ok(out)
-    }
-
-    fn write_file_block(&self, relative_name: &str, src: Arc<[u8]>) -> crate::Result<()> {
-        let mut src = Cursor::new(src);
-
-        if self.is_ignored(relative_name) {
-            return Err(Error::NotAllowed(relative_name.to_owned()));
-        }
-
-        let local_path = self.get_local_path_from_relative_name(relative_name);
-
-        let mut dir = local_path.clone();
-        dir.pop();
-
-        // Make sure the directories exist..
-        std::fs::create_dir_all(dir)?;
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&local_path)?;
-
-        std::io::copy(&mut src, &mut file)?;
-        drop(file);
-
-        Ok(())
-    }
-
     fn delete_file_block(&self, relative_name: &str) -> crate::Result<()> {
         let local_path = self.get_local_path_from_relative_name(relative_name);
         std::fs::remove_file(local_path)?;
@@ -205,6 +166,8 @@ impl InnerLocalBackend {
 
 #[async_trait]
 impl FileRepository for LocalBackend {
+    type Reader = Compat<tokio::fs::File>;
+
     async fn info(&self, relative_name: &str) -> crate::Result<PathInfo> {
         let inner = self.inner.clone();
         let relative_name = relative_name.to_string();
@@ -221,20 +184,42 @@ impl FileRepository for LocalBackend {
         }).await.unwrap()
     }
 
-    async fn read_file(&self, relative_name: &str) -> crate::Result<Vec<u8>> {
-        let inner = self.inner.clone();
-        let relative_name = relative_name.to_string();
-        spawn_blocking(move || {
-            inner.read_file_block(&relative_name)
-        }).await.unwrap()
+    async fn read_file(&self, relative_name: &str) -> crate::Result<(Self::Reader, u64)> {
+        if self.inner.is_ignored(relative_name) {
+            return Err(Error::NotFound(relative_name.to_owned()));
+        }
+
+        let local_path = self.inner.get_local_path_from_relative_name(relative_name);
+
+        let f = tokio::fs::File::open(local_path).await?;
+        let len = f.metadata().await?.len();
+        Ok((f.compat(), len))
     }
 
-    async fn write_file(&self, relative_name: &str, src: Arc<[u8]>) -> crate::Result<()> {
-        let inner = self.inner.clone();
-        let relative_name = relative_name.to_string();
-        spawn_blocking(move || {
-            inner.write_file_block(&relative_name, src)
-        }).await.unwrap()
+    async fn write_file<R: AsyncRead + Send>(&self, relative_name: &str, src: R, _len: u64) -> crate::Result<()> {
+        if self.inner.is_ignored(relative_name) {
+            return Err(Error::NotAllowed(relative_name.to_owned()));
+        }
+
+        let local_path = self.inner.get_local_path_from_relative_name(relative_name);
+
+        let mut dir = local_path.clone();
+        dir.pop();
+
+        // Make sure the directories exist..
+        std::fs::create_dir_all(dir)?;
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&local_path).await?;
+
+        let mut src = Box::pin(src.compat());
+        tokio::io::copy(&mut src, &mut file).await?;
+        drop(file);
+
+        Ok(())
     }
 
     async fn delete_file(&self, relative_name: &str) -> crate::Result<()> {
@@ -267,8 +252,10 @@ impl FileRepository for LocalBackend {
 
 #[cfg(test)]
 mod tests {
+    use futures::io::Cursor;
+
     use super::*;
-    use std::{io::Write, path::Path};
+    use std::{path::Path, fs::OpenOptions, io::Write};
 
     #[tokio::test]
     async fn test_read_dir() {
@@ -365,7 +352,11 @@ mod tests {
         f.write_all(&test_bytes).unwrap();
         drop(f);
 
-        let file_bytes = b.read_file(relative_name).await.unwrap();
+        let (mut reader, len) = b.read_file(relative_name).await.unwrap();
+        assert_eq!(test_bytes.len() as u64, len);
+
+        let mut file_bytes = Vec::new();
+        futures::io::copy(&mut reader, &mut file_bytes).await.unwrap();
         assert_eq!(file_bytes, test_bytes);
 
         let b = LocalBackend::new(tmp.path().to_owned(), vec!["dir/subdir".into()]);
@@ -384,7 +375,7 @@ mod tests {
         let test_bytes = (0..1_000_000u64).map(|x| x as u8).collect::<Vec<_>>();
 
         // Test if we can write to ignored locations
-        let x = b.write_file("dir/we/ignore/subdir/test", Arc::new([])).await;
+        let x = b.write_file("dir/we/ignore/subdir/test", futures::io::empty(), 0).await;
         assert!(matches!(x, Err(Error::NotAllowed(_))));
 
         // Now write an actual file
@@ -394,7 +385,8 @@ mod tests {
         let modtime_should_be = OffsetDateTime::now_utc();
         b.write_file(
             "dir/that-does-not-exist/somefile",
-            test_bytes.clone().into(),
+            Cursor::new(&test_bytes),
+            test_bytes.len() as u64
         )
         .await
         .unwrap();

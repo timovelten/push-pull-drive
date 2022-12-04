@@ -317,7 +317,7 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
 
         // Commit these changes?
         for ch in &to_be_commited {
-            println!("{:?}", ch);
+            println!("{:?}", ch.relative_name());
         }
 
         if Self::prompter("Commit these changes?") {
@@ -357,8 +357,8 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
                         return Err(Error::NotAFile(info.relative_name));
                     };
 
-                    let bytes = from.read_file(&info.relative_name).await?;
-                    to.write_file(&info.relative_name, bytes.into()).await?;
+                    let (reader, len) = from.read_file(&info.relative_name).await?;
+                    to.write_file(&info.relative_name, reader, len).await?;
                     to.set_modified_time(&info.relative_name, fileinfo.modified).await?;
 
                     if track {

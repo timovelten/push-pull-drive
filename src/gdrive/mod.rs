@@ -6,6 +6,7 @@ mod extensions;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 pub use credential::{FatAccessToken, GoogleCredential};
+use futures::AsyncRead;
 use isahc::{HttpClient};
 use tokio::sync::{Semaphore, SemaphorePermit};
 
@@ -197,6 +198,8 @@ impl GDriveBackend {
 
 #[async_trait]
 impl<'a> FileRepository for GDriveBackend {
+    type Reader = isahc::AsyncBody;
+
     async fn read_dir(&self, relative_name: &str) -> crate::Result<Vec<crate::PathInfo>> {
         let id = self.get_drive_id(relative_name).await?;
 
@@ -228,19 +231,17 @@ impl<'a> FileRepository for GDriveBackend {
         Ok(ret)
     }
 
-    async fn read_file(&self, relative_name: &str) -> crate::Result<Vec<u8>> {
+    async fn read_file(&self, relative_name: &str) -> crate::Result<(Self::Reader, u64)> {
         let id = self.get_drive_id(relative_name).await?;
-        let body = self.make_drive_api().await?.files_get_alt_media(&id, None).await?;
-        Ok(body)
+        let ret = self.make_drive_api().await?.files_get_alt_media(&id, None).await?;
+        Ok(ret)
     }
 
-    async fn write_file(&self, relative_name: &str, src: Arc<[u8]>) -> crate::Result<()> {
-        let src = src.as_ref();
-
+    async fn write_file<R: AsyncRead + Send>(&self, relative_name: &str, src: R, len: u64) -> crate::Result<()> {
         match self.get_drive_id(relative_name).await {
             Ok(id) => {
                 // The file already exists, update it...
-                self.make_drive_api().await?.files_update_upload(&id, src).await?;
+                self.make_drive_api().await?.files_update_upload(&id, src, len).await?;
             }
             Err(Error::NotFound(_)) => {
                 // We need to create the file. For that, we need to place it in the right path
@@ -257,6 +258,7 @@ impl<'a> FileRepository for GDriveBackend {
                             ..Default::default()
                         },
                         src,
+                        len
                     ).await?
                     .id;
 

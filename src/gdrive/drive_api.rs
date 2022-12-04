@@ -1,9 +1,9 @@
-use std::io::{Cursor, Read};
 use std::{fmt::Display, str::FromStr};
 
 use super::extensions::RequestBuilderExt;
 use super::extensions::ResponseExt;
 use super::extensions::UrlExt;
+use futures::{AsyncReadExt, AsyncRead};
 use http::Request;
 use isahc::{HttpClient, AsyncReadResponseExt};
 use oauth2::AccessToken;
@@ -11,7 +11,6 @@ use serde::de;
 use serde::Deserialize;
 use serde::Serialize;
 use time::OffsetDateTime;
-use tokio_util::compat::FuturesAsyncReadCompatExt;
 use url::Url;
 
 /// This module is dedicated to actually making the API calls we need to
@@ -151,28 +150,43 @@ impl DriveApi {
         &self,
         id: &str,
         bytes_range: Option<(u64, u64)>
-    ) -> crate::Result<Vec<u8>> {
-        let range_header = bytes_range.map(|(from, to)| format!("bytes={from}-{to}"));
+    ) -> crate::Result<(isahc::AsyncBody, u64)> {
+        let range_header = if let Some((_, _)) = bytes_range {
+            todo!("make the output of this work with content length (I think right now it does not)")
+        } else {
+            "bytes=0-".to_string()
+        };
 
         let url = Url::parse(&format!("https://www.googleapis.com/drive/v3/files/{id}"))
             .unwrap()
             .with_query_pairs(&[
                 Some(("acknowledgeAbuse", "true")),
-                Some(("alt", "media")),
-                range_header.as_ref().map(|x| ("Range", x.as_str())),
+                Some(("alt", "media"))
             ]);
 
         let req = Request::get(url.to_string())
+            // We include a range header in any case, so that google always includes a content range
+            // response, from which we can know the files length (content-length is unrealiable because
+            // the response will almost always be gzip encoded)
+            .header(http::header::RANGE, range_header)
             .bearer_auth(self.token.secret())
             .body(())?;
 
         let resp = self.client.send_async(req).await?.json_error_for_status()?;
-        let mut body = resp.into_body().compat();
+    
+        let len = resp.headers().get(http::header::CONTENT_RANGE)
+                .and_then(|range| {
+                    // Try and parse the Content-Range header
+                    let (_, x) = range.to_str().unwrap().split_once('/')?;
+                    x.parse::<u64>().ok()
+                })
+                .or_else(|| {
+                    // Otherwise, last ditch effort: try and use content length
+                    resp.body().len()
+                })
+                .unwrap_or_else(|| panic!("google sent a file and we have no way of knowing how long it is: {}", id));
 
-
-        let mut out = Vec::new();
-        tokio::io::copy(&mut body, &mut out).await?;
-        Ok(out)
+        Ok((resp.into_body(), len))
     }
 
     pub async fn files_delete(&self, id: &str) -> crate::Result<()> {
@@ -197,10 +211,11 @@ impl DriveApi {
         Ok(self.client.send_async(req).await?.json_error_for_status()?.json().await?)
     }
 
-    pub async fn files_create_upload<R: AsRef<[u8]>>(
+    pub async fn files_create_upload<R: AsyncRead + Send>(
         &self,
         create_request: FilesReq,
         src: R,
+        len: u64
     ) -> crate::Result<FileId> {
         let url =
             Url::parse("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable")
@@ -214,10 +229,10 @@ impl DriveApi {
 
         let resumable_session_url = resp.headers().get("Location").unwrap().to_str().unwrap();
 
-        self.upload(resumable_session_url, src).await
+        self.upload(resumable_session_url, src, len).await
     }
 
-    pub async fn files_update_upload<R: AsRef<[u8]>>(&self, id: &str, src: R) -> crate::Result<FileId> {
+    pub async fn files_update_upload<R: AsyncRead + Send>(&self, id: &str, src: R, len: u64) -> crate::Result<FileId> {
         let url = Url::parse(&format!(
             "https://www.googleapis.com/upload/drive/v3/files/{id}?uploadType=resumable"
         )).unwrap();
@@ -233,7 +248,7 @@ impl DriveApi {
 
         let resumable_session_url = resp.headers().get("Location").unwrap().to_str().unwrap();
 
-        self.upload(resumable_session_url, src).await
+        self.upload(resumable_session_url, src, len).await
     }
 
     pub async fn files_update(&self, id: &str, update_req: FilesReq) -> crate::Result<()> {
@@ -254,33 +269,39 @@ impl DriveApi {
 
     // Try and read everything from the reader. Try to not but it into memory.
     // At this point, it's already seekable, so we do not have to do that.
-    async fn upload<R: AsRef<[u8]>>(&self, resumable_session_url: &str, src: R) -> crate::Result<FileId> {
-        let src = src.as_ref();
-        let len = src.len();
-        let mut src = Cursor::new(src.as_ref());
+    async fn upload<R: AsyncRead + Send>(&self, resumable_session_url: &str, src: R, len: u64) -> crate::Result<FileId> {
+        // I have no idea what I'm doing here. I should probably read that blog
+        // post "Pin and suffering" again (great title btw)
+        let mut src = Box::pin(src);
 
-        let mut backing_buffer = vec![0u8; Self::CHUNKSIZE];
+        let mut buf = vec![0u8; Self::CHUNKSIZE].into_boxed_slice();
+        let mut offset = 0;
 
         let mut failed = 0;
-        let mut cursor = 0;
+        let mut bytes_sent = 0;        
         let id: FileId = loop {
             if failed > Self::RETRY_COUNT {
                 panic!("failed 3 times");
             }
 
-            let read =  src.read(&mut backing_buffer)?;
-            let chunk = &backing_buffer[0..read];
+            // It could happen, that we still have data to send from the previous iteration.
+            // This is possible, because google might not consume everything we send,
+            // i.e. indicate with the range header that it has not consumed the entire bytes.
+            // We carry over the remaining bytes into the next iteration and send them again
+            // along with new data, if possible.
+            let read =  src.read(&mut buf[offset..]).await?;
+            let send_buffer = &buf[..offset + read];
 
             let range_header = &format!(
                 "bytes {}-{}/{}",
-                cursor,
-                cursor + chunk.len() - 1,
+                bytes_sent,
+                bytes_sent + send_buffer.len() - 1,
                 len
             );
 
             let req = Request::put(resumable_session_url)
                 .header(http::header::CONTENT_RANGE, range_header)
-                .body(chunk)?;
+                .body(send_buffer)?;
 
             let mut resp = self.client.send_async(req).await?
                 // FIXME: This should be retried instead of just failing, but leave it like this for now
@@ -296,7 +317,23 @@ impl DriveApi {
                         let (from, to) = parse_range_header(range.to_str().unwrap());
                         assert_eq!(from, 0, "range header indicates that remote has not receveived the beginning of a file but has received later parts");
 
-                        cursor = to + 1;
+                        let bytes_received = 1 + to - bytes_sent;
+                        bytes_sent += bytes_received;
+
+                        if bytes_received < buf.len() {
+                            // FIXME: This path is very cold and completely untested
+
+                            // If remote has not processed the whole data, carry this over into the
+                            // next iteration...
+                            buf.copy_within(0..bytes_received, 0);
+
+                            //...but we also have to care to not overwrite this data with fresh data
+                            offset = bytes_received;
+                        } else {
+                            // Remote has processed everything we sent
+                            offset = 0;
+                        }
+
                         failed = 0;
                     } else {
                         // Remote has received no bytes. Loop...
