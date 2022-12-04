@@ -3,8 +3,11 @@ mod drive_api;
 pub mod oauth;
 mod extensions;
 
+use async_recursion::async_recursion;
+use async_trait::async_trait;
 pub use credential::{FatAccessToken, GoogleCredential};
 use isahc::{HttpClient};
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::{
     append_to_relative_name, backend::FileRepository, gdrive::drive_api::DriveApi,
@@ -19,6 +22,10 @@ use self::drive_api::FilesReq;
 
 #[derive(Debug)]
 pub struct GDriveBackend {
+    /// Google does not really like concurrent connections. In my personal testing,
+    /// the limit seemed to be somewhere below 10.
+    sem: tokio::sync::Semaphore,
+
     client: HttpClient,
 
     /// Google drive does not use paths. Instead, it identifies files using ids.
@@ -31,6 +38,19 @@ pub struct GDriveBackend {
     credential: Arc<GoogleCredential>,
 }
 
+struct DriveApiGuard<'a> {
+    _permit: SemaphorePermit<'a>,
+    drive_api: DriveApi,
+}
+
+impl std::ops::Deref for DriveApiGuard<'_> {
+    type Target = DriveApi;
+
+    fn deref(&self) -> &Self::Target {
+        &self.drive_api
+    }
+}
+
 impl GDriveBackend {
     pub fn new(credential: GoogleCredential) -> Self {
         let client = HttpClient::builder()
@@ -39,17 +59,23 @@ impl GDriveBackend {
             .unwrap();
 
         Self {
+            sem: Semaphore::new(6),
             credential: Arc::new(credential),
             client,
             id_cache: Default::default(),
         }
     }
 
-    fn make_drive_api(&self) -> crate::Result<DriveApi> {
-        Ok(DriveApi::new(
+    async fn make_drive_api(&self) -> crate::Result<DriveApiGuard<'_>> {
+        let permit = self.sem.acquire().await.unwrap(); 
+        let drive_api = DriveApi::new(
             self.client.clone(),
             self.credential.get_or_refresh_token()?,
-        ))
+        );
+        
+        Ok(DriveApiGuard {
+            _permit: permit, drive_api
+        })
     }
 
     /// Try and find the Google-Drive-ID of the given relative name (path). If use_cache is set,
@@ -57,7 +83,9 @@ impl GDriveBackend {
     /// of the object Self, since it is assumed that this object is generally short lived.
     /// If only_folders is set, this returns the Error::NotAFolder if *something* exists at the given
     /// relative path, but it is not a folder.
-    fn get_drive_id_advanced(
+    /// FIXME: Handroll this recursion to avoid async_recursion
+    #[async_recursion]
+    async fn get_drive_id_advanced(
         &self,
         relative_name: &str,
         use_cache: bool,
@@ -73,17 +101,17 @@ impl GDriveBackend {
         // Are we looking for root? root also has an Id and we need to find it,
         // because we use these ids to determine paths in read dirs.
         if relative_name == "" {
-            let f = self.make_drive_api()?.files_get("root")?;
+            let f = self.make_drive_api().await?.files_get("root").await?;
             debug_assert_eq!(f.parents, None);
 
             self.id_cache.update(relative_name, &f.id);
             return Ok(f.id);
         }
-
+        
         // If not, find our parent, get its id, list its contents. We should be in that list.
         let (parent_relative_name, _) = split_relative_name(relative_name);
         let parent_id =
-            self.get_drive_id_advanced(parent_relative_name, use_cache, only_folders)?;
+            self.get_drive_id_advanced(parent_relative_name, use_cache, only_folders).await?;
 
         // It would be possible here to only list the folders first, and check if
         // we are looking for a folder. This would only really be worth it when one assumes that
@@ -92,8 +120,11 @@ impl GDriveBackend {
         let mut ret = None;
 
         let files = self
-            .make_drive_api()?
-            .file_list_all(&format!("'{parent_id}' in parents and trashed=false"))?;
+            .make_drive_api()
+            .await?
+            .file_list_all(&format!("'{parent_id}' in parents and trashed=false"))
+            .await?;
+
         for file in files {
             let this_relative_name = append_to_relative_name(parent_relative_name, &file.name);
             // Use the opportunity to remember a lot of the ids
@@ -123,27 +154,28 @@ impl GDriveBackend {
         }
     }
 
-    fn get_drive_id(&self, relative_name: &str) -> crate::Result<String> {
-        self.get_drive_id_advanced(relative_name, true, false)
+    async fn get_drive_id(&self, relative_name: &str) -> crate::Result<String> {
+        self.get_drive_id_advanced(relative_name, true, false).await
     }
 
     /// Creates the given relative name and returns its id. If this path
     /// already exists and is the path of a file (and not a folder) this returns
     /// `Error::NotAFolder`.
-    fn mkdir_all(&self, relative_name: &str) -> crate::Result<String> {
+    #[async_recursion]
+    async fn mkdir_all(&self, relative_name: &str) -> crate::Result<String> {
         // Base case: root does not need to be created
         if relative_name == "" {
-            return self.get_drive_id(relative_name);
+            return self.get_drive_id(relative_name).await;
         }
 
         // Base case: If this already exists, just return its id
-        match self.get_drive_id_advanced(relative_name, true, true) {
+        match self.get_drive_id_advanced(relative_name, true, true).await {
             Ok(id) => return Ok(id),
             Err(Error::NotFound(_)) => {
                 // Path does not yet exist, so we find our parent and create a new folder there.
                 let (parent, name) = split_relative_name(relative_name);
 
-                let parent_id = self.mkdir_all(parent)?;
+                let parent_id = self.mkdir_all(parent).await?;
                 let req = drive_api::FilesReq {
                     name: Some(name.to_string()),
                     mime_type: Some("application/vnd.google-apps.folder".to_string()),
@@ -151,7 +183,7 @@ impl GDriveBackend {
                     ..Default::default()
                 };
 
-                let id = self.make_drive_api()?.files_create(req)?.id;
+                let id = self.make_drive_api().await?.files_create(req).await?.id;
                 self.id_cache.update(relative_name, &id);
 
                 Ok(id)
@@ -163,13 +195,14 @@ impl GDriveBackend {
     }
 }
 
+#[async_trait]
 impl<'a> FileRepository for GDriveBackend {
-    fn read_dir(&self, relative_name: &str) -> crate::Result<Vec<crate::PathInfo>> {
-        let id = self.get_drive_id(relative_name)?;
+    async fn read_dir(&self, relative_name: &str) -> crate::Result<Vec<crate::PathInfo>> {
+        let id = self.get_drive_id(relative_name).await?;
 
         let files = self
-            .make_drive_api()?
-            .file_list_all(&format!("'{id}' in parents and trashed=false"))?;
+            .make_drive_api().await?
+            .file_list_all(&format!("'{id}' in parents and trashed=false")).await?;
         let ret = files
             .into_iter()
             .filter_map(|x| {
@@ -195,31 +228,28 @@ impl<'a> FileRepository for GDriveBackend {
         Ok(ret)
     }
 
-    fn read_file(&self, relative_name: &str) -> crate::Result<Vec<u8>> {
-        let id = self.get_drive_id(relative_name)?;
-        let mut body = self.make_drive_api()?.files_get_alt_media(&id, None)?;
-
-        let mut ret = Vec::new();
-        std::io::copy(&mut body, &mut ret)?;
-
-        Ok(ret)
+    async fn read_file(&self, relative_name: &str) -> crate::Result<Vec<u8>> {
+        let id = self.get_drive_id(relative_name).await?;
+        let body = self.make_drive_api().await?.files_get_alt_media(&id, None).await?;
+        Ok(body)
     }
 
-    fn write_file(&self, relative_name: &str, src: Arc<[u8]>) -> crate::Result<()> {
+    async fn write_file(&self, relative_name: &str, src: Arc<[u8]>) -> crate::Result<()> {
         let src = src.as_ref();
 
-        match self.get_drive_id(relative_name) {
+        match self.get_drive_id(relative_name).await {
             Ok(id) => {
                 // The file already exists, update it...
-                self.make_drive_api()?.files_update_upload(&id, src)?;
+                self.make_drive_api().await?.files_update_upload(&id, src).await?;
             }
             Err(Error::NotFound(_)) => {
                 // We need to create the file. For that, we need to place it in the right path
                 let (parent, filename) = split_relative_name(relative_name);
-                let parent_id = self.mkdir_all(parent)?;
+                let parent_id = self.mkdir_all(parent).await?;
 
                 let id = self
-                    .make_drive_api()?
+                    .make_drive_api()
+                    .await?
                     .files_create_upload(
                         FilesReq {
                             name: Some(filename.to_string()),
@@ -227,7 +257,7 @@ impl<'a> FileRepository for GDriveBackend {
                             ..Default::default()
                         },
                         src,
-                    )?
+                    ).await?
                     .id;
 
                 self.id_cache.update(relative_name, &id);
@@ -238,9 +268,9 @@ impl<'a> FileRepository for GDriveBackend {
         Ok(())
     }
 
-    fn delete_file(&self, relative_name: &str) -> crate::Result<()> {
-        let id = self.get_drive_id(relative_name)?;
-        self.make_drive_api()?.files_delete(&id)?;
+    async fn delete_file(&self, relative_name: &str) -> crate::Result<()> {
+        let id = self.get_drive_id(relative_name).await?;
+        self.make_drive_api().await?.files_delete(&id).await?;
 
         // Try not to invalidate our own cache
         self.id_cache.delete(relative_name);
@@ -248,28 +278,28 @@ impl<'a> FileRepository for GDriveBackend {
         Ok(())
     }
 
-    fn set_modified_time(
+    async fn set_modified_time(
         &self,
         relative_name: &str,
         modtime: time::OffsetDateTime,
     ) -> crate::Result<()> {
-        let id = self.get_drive_id(relative_name)?;
+        let id = self.get_drive_id(relative_name).await?;
 
-        self.make_drive_api()?.files_update(
+        self.make_drive_api().await?.files_update(
             &id,
             FilesReq {
                 modified_time: Some(modtime),
                 ..Default::default()
             },
-        )?;
+        ).await?;
 
         Ok(())
     }
 
-    fn info(&self, relative_name: &str) -> crate::Result<crate::PathInfo> {
-        let id = self.get_drive_id(relative_name)?;
+    async fn info(&self, relative_name: &str) -> crate::Result<crate::PathInfo> {
+        let id = self.get_drive_id(relative_name).await?;
 
-        let metadata = self.make_drive_api()?.files_get(&id)?;
+        let metadata = self.make_drive_api().await?.files_get(&id).await?;
 
         let ret = if let Some(size) = metadata.size {
             PathInfo::File(FileInfo {
@@ -287,7 +317,7 @@ impl<'a> FileRepository for GDriveBackend {
         Ok(ret)
     }
 
-    fn read_dirs(&self, dirs: Vec<String>) -> crate::Result<Vec<PathInfo>> {
+    async fn read_dirs(&self, dirs: Vec<String>) -> crate::Result<Vec<PathInfo>> {
         const BATCH_SIZE: usize = 8;
 
         let mut ret = Vec::new();
@@ -299,7 +329,7 @@ impl<'a> FileRepository for GDriveBackend {
         for rns_chunk in dirs.chunks(BATCH_SIZE) {
             ids.clear();
             for i in 0..rns_chunk.len() {
-                ids.insert(i, self.get_drive_id(rns_chunk[i].as_ref())?);
+                ids.insert(i, self.get_drive_id(rns_chunk[i].as_ref()).await?);
             }
 
             let mut q = ids
@@ -310,7 +340,7 @@ impl<'a> FileRepository for GDriveBackend {
 
             q = format!("({q}) and trashed = false");
 
-            let files = self.make_drive_api()?.file_list_all(&q)?;
+            let files = self.make_drive_api().await?.file_list_all(&q).await?;
 
             for file in files {
                 let parent_id = match file.parents {

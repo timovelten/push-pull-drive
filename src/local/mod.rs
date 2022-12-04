@@ -4,15 +4,23 @@ use crate::{
     util::{datetime_to_filetime, u8_slice_to_hex_string},
     DirectoryInfo, Error, FileInfo, PathInfo,
 };
+use async_trait::async_trait;
 use sha1::{Digest, Sha1};
+use tokio::task::spawn_blocking;
 use std::{
     fs::{File, OpenOptions},
-    path::PathBuf, io::Cursor, sync::Arc,
+    io::Cursor,
+    path::PathBuf,
+    sync::Arc,
 };
 use time::OffsetDateTime;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LocalBackend {
+    inner: Arc<InnerLocalBackend>,
+}
+#[derive(Debug, Clone)]
+struct InnerLocalBackend {
     /// A path on the local file system. Note that although from this type definition
     /// it may look like we support non-valid-unicode paths, this is not the case
     /// and will panic at runtime.
@@ -28,11 +36,16 @@ pub struct LocalBackend {
 impl LocalBackend {
     pub fn new(root_path: PathBuf, ignore_prefixes: Vec<String>) -> Self {
         Self {
-            root_path,
-            ignore_prefixes,
+            inner: Arc::new(InnerLocalBackend {
+                root_path,
+                ignore_prefixes,
+            }),
         }
     }
+}
 
+
+impl InnerLocalBackend {
     fn get_local_path_from_relative_name(&self, relative_name: &str) -> PathBuf {
         self.root_path.join(relative_name)
     }
@@ -46,9 +59,8 @@ impl LocalBackend {
 
         false
     }
-}
-impl FileRepository for LocalBackend {
-    fn info(&self, relative_name: &str) -> crate::Result<PathInfo> {
+
+    fn info_block(&self, relative_name: &str) -> crate::Result<PathInfo> {
         if self.is_ignored(relative_name) {
             return Err(Error::NotFound(relative_name.to_string()));
         }
@@ -82,7 +94,7 @@ impl FileRepository for LocalBackend {
         }
     }
 
-    fn read_dir(&self, relative_name: &str) -> crate::Result<Vec<PathInfo>> {
+    fn read_dir_block(&self, relative_name: &str) -> crate::Result<Vec<PathInfo>> {
         let local_path = self.get_local_path_from_relative_name(relative_name);
 
         let mut ret = vec![];
@@ -114,7 +126,7 @@ impl FileRepository for LocalBackend {
                 continue;
             }
 
-            let info = self.info(&f_relative_name)?;
+            let info = self.info_block(&f_relative_name)?;
 
             ret.push(info)
         }
@@ -122,7 +134,7 @@ impl FileRepository for LocalBackend {
         Ok(ret)
     }
 
-    fn read_file(&self, relative_name: &str) -> crate::Result<Vec<u8>> {
+    fn read_file_block(&self, relative_name: &str) -> crate::Result<Vec<u8>> {
         if self.is_ignored(relative_name) {
             return Err(Error::NotFound(relative_name.to_owned()));
         }
@@ -135,7 +147,7 @@ impl FileRepository for LocalBackend {
         Ok(out)
     }
 
-    fn write_file(&self, relative_name: &str, src: Arc<[u8]>) -> crate::Result<()> {
+    fn write_file_block(&self, relative_name: &str, src: Arc<[u8]>) -> crate::Result<()> {
         let mut src = Cursor::new(src);
 
         if self.is_ignored(relative_name) {
@@ -162,26 +174,94 @@ impl FileRepository for LocalBackend {
         Ok(())
     }
 
-    fn delete_file(&self, relative_name: &str) -> crate::Result<()> {
+    fn delete_file_block(&self, relative_name: &str) -> crate::Result<()> {
         let local_path = self.get_local_path_from_relative_name(relative_name);
         std::fs::remove_file(local_path)?;
 
         Ok(())
     }
 
-    fn set_modified_time(&self, relative_name: &str, modtime: OffsetDateTime) -> crate::Result<()> {
+    fn set_modified_time_block(
+        &self,
+        relative_name: &str,
+        modtime: OffsetDateTime,
+    ) -> crate::Result<()> {
         let local_path = self.get_local_path_from_relative_name(relative_name);
         filetime::set_file_mtime(local_path, datetime_to_filetime(modtime))?;
 
         Ok(())
     }
 
-    fn read_dirs(&self, dirs_relative_name: Vec<String>) -> crate::Result<Vec<PathInfo>> {
+    fn read_dirs_block(&self, dirs_relative_name: Vec<String>) -> crate::Result<Vec<PathInfo>> {
         let mut ret = Vec::new();
         for relative_name in dirs_relative_name {
-            ret.extend(self.read_dir(relative_name.as_ref())?)
+            ret.extend(self.read_dir_block(relative_name.as_ref())?)
         }
         Ok(ret)
+    }
+}
+
+
+
+#[async_trait]
+impl FileRepository for LocalBackend {
+    async fn info(&self, relative_name: &str) -> crate::Result<PathInfo> {
+        let inner = self.inner.clone();
+        let relative_name = relative_name.to_string();
+        spawn_blocking(move || {
+            inner.info_block(&relative_name)
+        }).await.unwrap()
+    }
+
+    async fn read_dir(&self, relative_name: &str) -> crate::Result<Vec<PathInfo>> {
+        let inner = self.inner.clone();
+        let relative_name = relative_name.to_string();
+        spawn_blocking(move || {
+            inner.read_dir_block(&relative_name)
+        }).await.unwrap()
+    }
+
+    async fn read_file(&self, relative_name: &str) -> crate::Result<Vec<u8>> {
+        let inner = self.inner.clone();
+        let relative_name = relative_name.to_string();
+        spawn_blocking(move || {
+            inner.read_file_block(&relative_name)
+        }).await.unwrap()
+    }
+
+    async fn write_file(&self, relative_name: &str, src: Arc<[u8]>) -> crate::Result<()> {
+        let inner = self.inner.clone();
+        let relative_name = relative_name.to_string();
+        spawn_blocking(move || {
+            inner.write_file_block(&relative_name, src)
+        }).await.unwrap()
+    }
+
+    async fn delete_file(&self, relative_name: &str) -> crate::Result<()> {
+        let inner = self.inner.clone();
+        let relative_name = relative_name.to_string();
+        spawn_blocking(move || {
+            inner.delete_file_block(&relative_name)
+        }).await.unwrap()
+    }
+
+    async fn set_modified_time(
+        &self,
+        relative_name: &str,
+        modtime: OffsetDateTime,
+    ) -> crate::Result<()> {
+        let inner = self.inner.clone();
+        let relative_name = relative_name.to_string();
+        spawn_blocking(move || {
+            inner.set_modified_time_block(&relative_name, modtime)
+        }).await.unwrap()
+    }
+
+    async fn read_dirs(&self, dirs_relative_name: Vec<String>) -> crate::Result<Vec<PathInfo>> {
+        let inner = self.inner.clone();
+        spawn_blocking(move || {
+            inner.read_dirs_block(dirs_relative_name)
+        }).await.unwrap()
     }
 }
 
@@ -190,14 +270,14 @@ mod tests {
     use super::*;
     use std::{io::Write, path::Path};
 
-    #[test]
-    fn test_read_dir() {
+    #[tokio::test]
+    async fn test_read_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let b = LocalBackend::new(tmp.path().to_owned(), vec!["ignored".into()]);
 
-        assert!(b.read_dir("").unwrap().is_empty());
+        assert!(b.read_dir("").await.unwrap().is_empty());
         assert!(matches!(
-            b.read_dir("does-not-exist"),
+            b.read_dir("does-not-exist").await,
             Err(Error::NotFound(_))
         ));
 
@@ -241,7 +321,7 @@ mod tests {
 
         let mut next_directories = vec!["".to_owned()];
         while let Some(relative_name) = next_directories.pop() {
-            for info in b.read_dir(&relative_name).unwrap() {
+            for info in b.read_dir(&relative_name).await.unwrap() {
                 match info {
                     PathInfo::Dir(d) => next_directories.push(d.relative_name),
                     PathInfo::File(info) => {
@@ -262,8 +342,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_read_file() {
+    #[tokio::test]
+    async fn test_read_file() {
         let tmp = tempfile::tempdir().unwrap();
         let b = LocalBackend::new(tmp.path().to_owned(), Vec::new());
 
@@ -285,11 +365,11 @@ mod tests {
         f.write_all(&test_bytes).unwrap();
         drop(f);
 
-        let file_bytes = b.read_file(relative_name).unwrap();
+        let file_bytes = b.read_file(relative_name).await.unwrap();
         assert_eq!(file_bytes, test_bytes);
 
         let b = LocalBackend::new(tmp.path().to_owned(), vec!["dir/subdir".into()]);
-        let res = b.read_file(relative_name);
+        let res = b.read_file(relative_name).await;
         assert!(
             matches!(res, Err(Error::NotFound(_))),
             "should be not found but got {:?}",
@@ -297,14 +377,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_write_file() {
+    #[tokio::test]
+    async fn test_write_file() {
         let tmp = tempfile::tempdir().unwrap();
         let b = LocalBackend::new(tmp.path().to_owned(), vec!["dir/we/ignore".into()]);
         let test_bytes = (0..1_000_000u64).map(|x| x as u8).collect::<Vec<_>>();
 
         // Test if we can write to ignored locations
-        let x = b.write_file("dir/we/ignore/subdir/test", Arc::new([]));
+        let x = b.write_file("dir/we/ignore/subdir/test", Arc::new([])).await;
         assert!(matches!(x, Err(Error::NotAllowed(_))));
 
         // Now write an actual file
@@ -316,9 +396,11 @@ mod tests {
             "dir/that-does-not-exist/somefile",
             test_bytes.clone().into(),
         )
+        .await
         .unwrap();
 
         b.set_modified_time("dir/that-does-not-exist/somefile", modtime_should_be)
+            .await
             .unwrap();
 
         let mut f = File::open(fpath).unwrap();

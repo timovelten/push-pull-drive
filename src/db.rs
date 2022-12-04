@@ -4,6 +4,7 @@ use std::{
 };
 
 use crate::Error;
+
 use lazy_static::lazy_static;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 

@@ -5,13 +5,13 @@ use super::extensions::RequestBuilderExt;
 use super::extensions::ResponseExt;
 use super::extensions::UrlExt;
 use http::Request;
-use isahc::HttpClient;
-use isahc::ReadResponseExt;
+use isahc::{HttpClient, AsyncReadResponseExt};
 use oauth2::AccessToken;
 use serde::de;
 use serde::Deserialize;
 use serde::Serialize;
 use time::OffsetDateTime;
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 use url::Url;
 
 /// This module is dedicated to actually making the API calls we need to
@@ -91,7 +91,7 @@ impl DriveApi {
     }
 
     /// Note: you should probably always add the query parameter ... and trashed = false
-    pub fn file_list(
+    pub async fn file_list(
         &self,
         q: &str,
         next_page_token: Option<&str>,
@@ -111,16 +111,16 @@ impl DriveApi {
             .bearer_auth(self.token.secret())
             .body(())?;
 
-        Ok(self.client.send(req)?.json_error_for_status()?.json()?)
+        Ok(self.client.send_async(req).await?.json_error_for_status()?.json().await?)
     }
 
     /// Wrap file_list and keep reading until nextPageToken is None. Return the end result.
-    pub fn file_list_all(&self, q: &str) -> crate::Result<Vec<File>> {
+    pub async fn file_list_all(&self, q: &str) -> crate::Result<Vec<File>> {
         let mut ret = Vec::new();
 
         let mut next_token = "".to_string();
         loop {
-            let resp = self.file_list(q, Some(&next_token))?;
+            let resp = self.file_list(q, Some(&next_token)).await?;
             ret.extend(resp.files);
             if let Some(t) = resp.next_page_token {
                 next_token = t
@@ -132,7 +132,7 @@ impl DriveApi {
         Ok(ret)
     }
 
-    pub fn files_get(&self, id: &str) -> crate::Result<File> {
+    pub async fn files_get(&self, id: &str) -> crate::Result<File> {
         let url = Url::parse(&format!("https://www.googleapis.com/drive/v3/files/{id}"))
             .unwrap()
             .with_query_pairs(&[(
@@ -144,14 +144,14 @@ impl DriveApi {
             .bearer_auth(self.token.secret())
             .body(())?;
 
-        Ok(self.client.send(req)?.json_error_for_status()?.json()?)
+        Ok(self.client.send_async(req).await?.json_error_for_status()?.json().await?)
     }
 
-    pub fn files_get_alt_media(
+    pub async fn files_get_alt_media(
         &self,
         id: &str,
         bytes_range: Option<(u64, u64)>
-    ) -> crate::Result<isahc::Body> {
+    ) -> crate::Result<Vec<u8>> {
         let range_header = bytes_range.map(|(from, to)| format!("bytes={from}-{to}"));
 
         let url = Url::parse(&format!("https://www.googleapis.com/drive/v3/files/{id}"))
@@ -166,33 +166,38 @@ impl DriveApi {
             .bearer_auth(self.token.secret())
             .body(())?;
 
-        let resp = self.client.send(req)?.json_error_for_status()?;
-        Ok(resp.into_body())
+        let resp = self.client.send_async(req).await?.json_error_for_status()?;
+        let mut body = resp.into_body().compat();
+
+
+        let mut out = Vec::new();
+        tokio::io::copy(&mut body, &mut out).await?;
+        Ok(out)
     }
 
-    pub fn files_delete(&self, id: &str) -> crate::Result<()> {
+    pub async fn files_delete(&self, id: &str) -> crate::Result<()> {
         let url = Url::parse(&format!("https://www.googleapis.com/drive/v3/files/{id}")).unwrap();
 
         let req = Request::delete(url.to_string())
             .bearer_auth(self.token.secret())
             .body(())?;
 
-        self.client.send(req)?.json_error_for_status()?;
+        self.client.send_async(req).await?.json_error_for_status()?;
 
         Ok(())
     }
 
-    pub fn files_create(&self, create_request: FilesReq) -> crate::Result<FileId> {
+    pub async fn files_create(&self, create_request: FilesReq) -> crate::Result<FileId> {
         let url = Url::parse("https://www.googleapis.com/drive/v3/files").unwrap();
 
         let req = Request::post(url.to_string())
             .bearer_auth(self.token.secret())
             .json_body(&create_request)?;
 
-        Ok(self.client.send(req)?.json_error_for_status()?.json()?)
+        Ok(self.client.send_async(req).await?.json_error_for_status()?.json().await?)
     }
 
-    pub fn files_create_upload<R: AsRef<[u8]>>(
+    pub async fn files_create_upload<R: AsRef<[u8]>>(
         &self,
         create_request: FilesReq,
         src: R,
@@ -205,14 +210,14 @@ impl DriveApi {
             .bearer_auth(self.token.secret())
             .json_body(&create_request)?;
 
-        let resp = self.client.send(req)?.json_error_for_status()?;
+        let resp = self.client.send_async(req).await?.json_error_for_status()?;
 
         let resumable_session_url = resp.headers().get("Location").unwrap().to_str().unwrap();
 
-        self.upload(resumable_session_url, src)
+        self.upload(resumable_session_url, src).await
     }
 
-    pub fn files_update_upload<R: AsRef<[u8]>>(&self, id: &str, src: R) -> crate::Result<FileId> {
+    pub async fn files_update_upload<R: AsRef<[u8]>>(&self, id: &str, src: R) -> crate::Result<FileId> {
         let url = Url::parse(&format!(
             "https://www.googleapis.com/upload/drive/v3/files/{id}?uploadType=resumable"
         )).unwrap();
@@ -224,23 +229,23 @@ impl DriveApi {
             .bearer_auth(self.token.secret())
             .body("{}")?;
 
-        let resp = self.client.send(req)?.json_error_for_status()?;
+        let resp = self.client.send_async(req).await?.json_error_for_status()?;
 
         let resumable_session_url = resp.headers().get("Location").unwrap().to_str().unwrap();
 
-        self.upload(resumable_session_url, src)
+        self.upload(resumable_session_url, src).await
     }
 
-    pub fn files_update(&self, id: &str, update_req: FilesReq) -> crate::Result<()> {
+    pub async fn files_update(&self, id: &str, update_req: FilesReq) -> crate::Result<()> {
         let url = Url::parse(&format!("https://www.googleapis.com/drive/v3/files/{id}")).unwrap();
 
         let req = Request::patch(url.to_string())
             .bearer_auth(self.token.secret())
             .json_body(&update_req)?;
 
-        let file_id: FileId = self.client.send(req)?
+        let file_id: FileId = self.client.send_async(req).await?
             .json_error_for_status()?
-            .json()?;
+            .json().await?;
 
         debug_assert_eq!(&file_id.id, id);
 
@@ -249,7 +254,7 @@ impl DriveApi {
 
     // Try and read everything from the reader. Try to not but it into memory.
     // At this point, it's already seekable, so we do not have to do that.
-    fn upload<R: AsRef<[u8]>>(&self, resumable_session_url: &str, src: R) -> crate::Result<FileId> {
+    async fn upload<R: AsRef<[u8]>>(&self, resumable_session_url: &str, src: R) -> crate::Result<FileId> {
         let src = src.as_ref();
         let len = src.len();
         let mut src = Cursor::new(src.as_ref());
@@ -277,13 +282,13 @@ impl DriveApi {
                 .header(http::header::CONTENT_RANGE, range_header)
                 .body(chunk)?;
 
-            let mut resp = self.client.send(req)?
+            let mut resp = self.client.send_async(req).await?
                 // FIXME: This should be retried instead of just failing, but leave it like this for now
                 .json_error_for_status()?;
 
             match resp.status().as_u16() {
                 // Success. We are done, extract the field and return it
-                200..=299 => break resp.json()?,
+                200..=299 => break resp.json().await?,
                 
                 // Not yet finished
                 308 => {

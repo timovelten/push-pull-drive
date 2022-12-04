@@ -45,6 +45,20 @@ pub trait ResponseExt : Sized {
 
 impl ResponseExt for http::Response<isahc::Body> {
     fn json_error_for_status(self) -> crate::Result<Self> {
-        Ok(self)
+        if self.status().is_client_error() || self.status().is_server_error() {
+            Err(crate::Error::HttpStatusError { status: self.status().as_u16(), resp: String::new() })
+        } else {
+            Ok(self)
+        }
+    }
+}
+
+impl ResponseExt for http::Response<isahc::AsyncBody> {
+    fn json_error_for_status(self) -> crate::Result<Self> {
+        if self.status().is_client_error() || self.status().is_server_error() {
+            Err(crate::Error::HttpStatusError { status: self.status().as_u16(), resp: String::new() })
+        } else {
+            Ok(self)
+        }
     }
 }

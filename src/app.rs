@@ -9,6 +9,11 @@
 //! abc/def/ceg
 //! i.e. a slash separated path, that does not contain dots. In particular, it does not start with a dot.
 
+use futures::StreamExt;
+
+use tokio::runtime::{Runtime, self};
+use tokio::task::spawn_blocking;
+
 use crate::backend::FileRepository;
 use crate::{db, App, Error, PathInfo, append_to_relative_name};
 use crate::{db::TrackedFile, FileChange};
@@ -17,6 +22,8 @@ use std::collections::HashSet;
 use std::io::Write;
 
 pub struct DefaultApp<L, R> {
+    rt: Runtime,
+    
     // Note how this app does not even know the "root" directory, because it does not need to!
     
     /// This is *not* the cwd we get from the operation system. Instead, this
@@ -32,6 +39,7 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
     /// This expects to find a folder CONFIG_DIR containing the FILE DATABASE_NAME to succeed.
     pub fn new(cwd: String, db: db::DbRepository, local: L, remote: R) -> Self {
         DefaultApp {
+            rt: runtime::Builder::new_current_thread().enable_all().build().unwrap(),
             db,
             cwd,
             local,
@@ -46,14 +54,18 @@ impl<L: FileRepository, R: FileRepository> App for DefaultApp<L, R> {
     }
 
     fn status_cmd(&self) -> crate::Result<()> {
-        let status = self.status(&self.local)?;
+        let status = self.rt.block_on(async {
+            self.status(&self.local).await
+        })?;
         self.print_status(&status);
 
         Ok(())
     }
 
     fn remote_status_cmd(&self) -> crate::Result<()> {
-        let status = self.status(&self.remote)?;
+        let status = self.rt.block_on(async {
+            self.status(&self.remote).await
+        })?;
         self.print_status(&status);
 
         Ok(())
@@ -120,7 +132,10 @@ impl<L: FileRepository, R: FileRepository> App for DefaultApp<L, R> {
     fn remote_ls(&self, path: Option<String>) -> crate::Result<()> {
         let path = append_to_relative_name(&self.cwd, path.as_ref().map(|x| x.as_str()).unwrap_or(""));
 
-        for file in self.remote.read_dir(&path)? {
+        let dirs = self.rt.block_on(async {
+            self.remote.read_dir(&path).await
+        })?;
+        for file in dirs {
             println!("{} [{:?}]", file.relative_name(), file);
         }
 
@@ -181,8 +196,8 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         }
     }
 
-    fn track_current_version(&self, relative_name: &str) -> crate::Result<()> {
-        let path_info = self.local.info(relative_name)?;
+    async fn track_current_version(&self, relative_name: &str) -> crate::Result<()> {
+        let path_info = self.local.info(relative_name).await?;
 
         if let PathInfo::File(info) = path_info {
             let tf = TrackedFile {
@@ -193,7 +208,8 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
             };
 
             // TODO: Calculate hashes
-            self.db.update_tracked_file(tf)?;
+            let db = self.db.clone();
+            spawn_blocking(move || db.update_tracked_file(tf)).await.unwrap()?;
 
             Ok(())
         } else {
@@ -202,7 +218,7 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
     }
 
     // Determines how files have changed when comapared to another directory structure.
-    fn status<T: FileRepository>(
+    async fn status<T: FileRepository>(
         &self,
         repo: &T,
     ) -> crate::Result<StatusReport> {
@@ -222,7 +238,7 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         let mut next_directories = vec![self.cwd.clone()];
 
         while next_directories.len() > 0 {
-            let files = repo.read_dirs(next_directories)?;
+            let files = repo.read_dirs(next_directories).await?;
             next_directories = Vec::new();
 
             for path_info in files {
@@ -269,13 +285,17 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         mut resolver: F,
     ) -> crate::Result<()> {
         // Query the changes in from. We
-        let from_status = self.status(from)?;
+        let from_status = self.rt.block_on(async {
+            self.status(from).await
+        })?;
 
         // If the user wants to not check for conflicts, we do not even need the remote status
         let to_status = if yes {
             StatusReport::new(Vec::new())
         } else {
-            self.status(to)?
+            self.rt.block_on(async {
+                self.status(to).await
+            })?
         };
 
         // We could probably save this allocation, but realistically, what would that accomplish.
@@ -301,7 +321,9 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         }
 
         if Self::prompter("Commit these changes?") {
-            self.push(from, to, to_be_commited, true)?
+            self.rt.block_on(async {
+                self.push(from, to, to_be_commited, true).await
+            })?
         } else {
             println!("Aborting");
         }
@@ -312,7 +334,7 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
 
     /// Given a list of fileChanges, pushes these changes from A to B.
     /// If you think about it, both push and pull can be implemented from this.
-    fn push<
+    async fn push<
         A: FileRepository,
         B: FileRepository,
     >(
@@ -322,39 +344,42 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         changes: Vec<FileChange>,
         track: bool,
     ) -> crate::Result<()> {
-        for change in changes {
-            // TODO: Add proper progress reporting.
+        let fts = changes.into_iter().map(|change| async {
             println!("{}...", change.relative_name());
 
             match change {
                 FileChange::New(info) | FileChange::Modified(info) => {
                     // For now, we just download the entire file into memory.
                     // There are worse things...
-                    let fileinfo = if let PathInfo::File(info) = from.info(&info.relative_name)? {
+                    let fileinfo = if let PathInfo::File(info) = from.info(&info.relative_name).await? {
                         info
                     } else {
                         return Err(Error::NotAFile(info.relative_name));
                     };
 
-                    let bytes = from.read_file(&info.relative_name)?;
-                    to.write_file(&info.relative_name, bytes.into())?;
-                    to.set_modified_time(&info.relative_name, fileinfo.modified)?;
+                    let bytes = from.read_file(&info.relative_name).await?;
+                    to.write_file(&info.relative_name, bytes.into()).await?;
+                    to.set_modified_time(&info.relative_name, fileinfo.modified).await?;
 
                     if track {
-                        self.track_current_version(&info.relative_name)?;
+                        self.track_current_version(&info.relative_name).await?;
                     }
                 }
                 FileChange::Deleted {
                     relative_name
                 } => {
-                    to.delete_file(&relative_name)?;
+                    to.delete_file(&relative_name).await?;
 
                     if track {
                         self.db.delete_tracked_file(&relative_name)?;
                     }
                 }
-            }
-        }
+            };
+
+            Ok(())
+        });
+
+        let _x = futures::stream::iter(fts).buffer_unordered(10).count().await;
 
         Ok(())
     }
