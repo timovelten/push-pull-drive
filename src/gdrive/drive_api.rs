@@ -277,13 +277,8 @@ impl DriveApi {
         let mut buf = vec![0u8; Self::CHUNKSIZE].into_boxed_slice();
         let mut offset = 0;
 
-        let mut failed = 0;
         let mut bytes_sent = 0;        
         let id: FileId = loop {
-            if failed > Self::RETRY_COUNT {
-                panic!("failed 3 times");
-            }
-
             // It could happen, that we still have data to send from the previous iteration.
             // This is possible, because google might not consume everything we send,
             // i.e. indicate with the range header that it has not consumed the entire bytes.
@@ -333,12 +328,12 @@ impl DriveApi {
                             // Remote has processed everything we sent
                             offset = 0;
                         }
-
-                        failed = 0;
                     } else {
                         // Remote has received no bytes. Loop...
                         // Note that the try counter prevents us from looping indefinitely.
-                        failed += 1;
+                        todo!("Remote has received no bytes.")
+                        // FIXME: Retry here, but be careful: We must ensure that the old bytes are
+                        // not overwritten, perhaps by setting offset to its maximum?
                     }
                 }
                 x => panic!("unexpected status code {}", x)
