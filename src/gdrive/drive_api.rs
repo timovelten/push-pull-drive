@@ -83,7 +83,6 @@ pub struct DriveApi {
 impl DriveApi {
     // Chunksize of 20 MiB seems like a reasonable choice.
     const CHUNKSIZE: usize = (256 * 1024 * 4) * 20;
-    const RETRY_COUNT: usize = 3;
 
     pub fn new(client: HttpClient, token: AccessToken) -> Self {
         Self { client, token }
