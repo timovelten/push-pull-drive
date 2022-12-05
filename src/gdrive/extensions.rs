@@ -35,8 +35,6 @@ impl RequestBuilderExt for http::request::Builder {
         self = self.header(http::header::CONTENT_TYPE, "application/json");
         Ok(self.body(serde_json::to_vec(value)?)?)
     }
-
-
 }
 
 pub trait ResponseExt : Sized {

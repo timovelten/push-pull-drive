@@ -10,6 +10,7 @@
 //! i.e. a slash separated path, that does not contain dots. In particular, it does not start with a dot.
 use futures::StreamExt;
 
+use futures::stream::FuturesUnordered;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use tokio::runtime::{Runtime, self};
 use tokio::task::spawn_blocking;
@@ -345,7 +346,7 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         changes: Vec<FileChange>,
         track: bool,
     ) -> crate::Result<()> {
-        let mut fts = Vec::new();
+        let fts = FuturesUnordered::new();
 
         let multi = MultiProgress::new();
         let style = ProgressStyle::with_template(
@@ -422,7 +423,7 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         }
 
         // Wait for all of the futures to finish
-        futures::stream::iter(fts).buffer_unordered(20).count().await;
+        fts.count().await;
 
         Ok(())
     }

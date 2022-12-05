@@ -8,7 +8,7 @@ use async_trait::async_trait;
 pub use credential::{FatAccessToken, GoogleCredential};
 use futures::AsyncRead;
 use isahc::{HttpClient};
-use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio::sync::{Semaphore, OwnedSemaphorePermit};
 
 use crate::{
     append_to_relative_name, backend::FileRepository, gdrive::drive_api::DriveApi,
@@ -25,7 +25,7 @@ use self::drive_api::FilesReq;
 pub struct GDriveBackend {
     /// Google does not really like concurrent connections. In my personal testing,
     /// the limit seemed to be somewhere below 10.
-    sem: tokio::sync::Semaphore,
+    sem: Arc<tokio::sync::Semaphore>,
 
     client: HttpClient,
 
@@ -39,16 +39,36 @@ pub struct GDriveBackend {
     credential: Arc<GoogleCredential>,
 }
 
-struct DriveApiGuard<'a> {
-    _permit: SemaphorePermit<'a>,
-    drive_api: DriveApi,
+pub struct SemaphoreGuarded<T> {
+    permit: OwnedSemaphorePermit,
+    inner: T,
 }
 
-impl std::ops::Deref for DriveApiGuard<'_> {
-    type Target = DriveApi;
+impl <T> SemaphoreGuarded<T> {
+    // SAFTEY: Refer to the pin_utils documentation. This struct does not implement drop, does
+    // not implement Unpin and is not repr(packed).
+    pin_utils::unsafe_pinned!(inner: T);
+
+    fn into_permit(self) -> OwnedSemaphorePermit {
+        self.permit
+    }
+}
+
+impl <T> std::ops::Deref for SemaphoreGuarded<T> {
+    type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        &self.drive_api
+        &self.inner
+    }
+}
+
+impl <T> AsyncRead for SemaphoreGuarded<T> where T: AsyncRead {
+    fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut [u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+        self.inner().as_mut().poll_read(cx, buf)
     }
 }
 
@@ -59,23 +79,21 @@ impl GDriveBackend {
             .unwrap();
 
         Self {
-            sem: Semaphore::new(6),
+            sem: Arc::new(Semaphore::new(6)),
             credential: Arc::new(credential),
             client,
             id_cache: Default::default(),
         }
     }
 
-    async fn make_drive_api(&self) -> crate::Result<DriveApiGuard<'_>> {
-        let permit = self.sem.acquire().await.unwrap(); 
-        let drive_api = DriveApi::new(
+    async fn make_drive_api(&self) -> crate::Result<SemaphoreGuarded<DriveApi>> {
+        let permit = self.sem.clone().acquire_owned().await.unwrap(); 
+        let inner = DriveApi::new(
             self.client.clone(),
             self.credential.get_or_refresh_token()?,
         );
         
-        Ok(DriveApiGuard {
-            _permit: permit, drive_api
-        })
+        Ok(SemaphoreGuarded { permit, inner })
     }
 
     /// Try and find the Google-Drive-ID of the given relative name (path). If use_cache is set,
@@ -196,8 +214,8 @@ impl GDriveBackend {
 }
 
 #[async_trait]
-impl<'a> FileRepository for GDriveBackend {
-    type Reader = isahc::AsyncBody;
+impl FileRepository for GDriveBackend {
+    type Reader = SemaphoreGuarded<isahc::AsyncBody>;
 
     async fn read_dir(&self, relative_name: &str) -> crate::Result<Vec<crate::PathInfo>> {
         let id = self.get_drive_id(relative_name).await?;
@@ -232,8 +250,15 @@ impl<'a> FileRepository for GDriveBackend {
 
     async fn read_file(&self, relative_name: &str) -> crate::Result<(Self::Reader, u64)> {
         let id = self.get_drive_id(relative_name).await?;
-        let ret = self.make_drive_api().await?.files_get_alt_media(&id, None).await?;
-        Ok(ret)
+        let drive_api = self.make_drive_api().await?;
+
+        let (inner, len) = drive_api.files_get_alt_media(&id, None).await?;
+        // This is still open! We need to ensure that the connections to Google stays below
+        // the limit we set out in the beginning. Otherwise, what is the point
+        // of doing this at all.
+        let permit = drive_api.into_permit();
+
+        Ok((SemaphoreGuarded { permit, inner }, len))
     }
 
     async fn write_file<R: AsyncRead + Send>(&self, relative_name: &str, src: R, len: u64) -> crate::Result<()> {
