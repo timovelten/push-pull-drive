@@ -10,7 +10,6 @@
 //! i.e. a slash separated path, that does not contain dots. In particular, it does not start with a dot.
 use futures::StreamExt;
 
-use futures::stream::FuturesUnordered;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use tokio::runtime::{Runtime, self};
 use tokio::task::spawn_blocking;
@@ -41,7 +40,8 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
     /// This expects to find a folder CONFIG_DIR containing the FILE DATABASE_NAME to succeed.
     pub fn new(cwd: String, db: db::DbRepository, local: L, remote: R) -> Self {
         DefaultApp {
-            rt: runtime::Builder::new_current_thread().enable_all().build().unwrap(),
+            rt: runtime::Builder::new_multi_thread()
+                .enable_all().build().unwrap(),
             db,
             cwd,
             local,
@@ -155,9 +155,9 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
             return false;
         }
 
+        println!("{}", q);
         loop {
-            println!("{} [y - Yes, y! - Yes all, n - No, n! - No all]", q);
-            print!("> ");
+            print!("[y - Yes, y! - Yes all, n - No, n! - No all] > ");
             std::io::stdout().flush().unwrap();
 
             let mut line = String::new();
@@ -181,9 +181,9 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
     }
 
     fn prompter(q: &str) -> bool {
+        println!("{}", q);
         loop {
-            println!("{} [y - Yes, n - No]", q);
-            print!("> ");
+            print!("[y - Yes, n - No] > ");
             std::io::stdout().flush().unwrap();
 
             let mut line = String::new();
@@ -319,7 +319,12 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
 
         // Commit these changes?
         for ch in &to_be_commited {
-            println!("{:?}", ch.relative_name());
+            let s = match ch {
+                FileChange::New(_) => "New",
+                FileChange::Modified(_) => "Modified",
+                FileChange::Deleted { relative_name:_ } => "Deleted",
+            };
+            println!("{}: {}", s, ch.relative_name());
         }
 
         if Self::prompter("Commit these changes?") {
@@ -346,7 +351,7 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         changes: Vec<FileChange>,
         track: bool,
     ) -> crate::Result<()> {
-        let fts = FuturesUnordered::new();
+        let mut fts = Vec::new();
 
         let multi = MultiProgress::new();
         let style = ProgressStyle::with_template(
@@ -370,6 +375,7 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         }
 
         for change in changes {
+
             let multi = multi.clone();
             let style = style.clone();
             let ft = async move {
@@ -423,7 +429,8 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         }
 
         // Wait for all of the futures to finish
-        fts.count().await;
+        let mut fts_stream = futures::stream::iter(fts).buffer_unordered(10);
+        while let Some(_) = fts_stream.next().await {}
 
         Ok(())
     }
