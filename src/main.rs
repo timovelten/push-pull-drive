@@ -40,6 +40,8 @@ const KEY_GDRIVE_REFRESH_TOKEN: &str = "rt";
 const LOCAL_BACKEND: &str = "local";
 const KEY_LOCAL_PATH: &str = "local_path";
 
+const CONCURRENT_FUTURES: usize = 10;
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]

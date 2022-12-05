@@ -57,7 +57,7 @@ impl<L: FileRepository, R: FileRepository> App for DefaultApp<L, R> {
 
     fn status_cmd(&self) -> crate::Result<()> {
         let status = self.rt.block_on(async {
-            self.status(&self.local).await
+            self.status(&self.local, false).await
         })?;
         self.print_status(&status);
 
@@ -66,7 +66,7 @@ impl<L: FileRepository, R: FileRepository> App for DefaultApp<L, R> {
 
     fn remote_status_cmd(&self) -> crate::Result<()> {
         let status = self.rt.block_on(async {
-            self.status(&self.remote).await
+            self.status(&self.remote, false).await
         })?;
         self.print_status(&status);
 
@@ -219,10 +219,13 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         }
     }
 
-    // Determines how files have changed when comapared to another directory structure.
+    /// Determine how the files in the given repo have changed from the index we have in
+    /// our database. If ignore_index is given, this will effectively list all files in the repo
+    /// as new.
     async fn status<T: FileRepository>(
         &self,
         repo: &T,
+        ignore_index: bool
     ) -> crate::Result<StatusReport> {
         let mut ret: Vec<FileChange> = Vec::new();
 
@@ -249,7 +252,13 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
                     PathInfo::File(info) => {
                         all_files_in_repo.insert(info.relative_name.clone());
 
-                        if let Some(tf) = tfs.get(&info.relative_name) {
+                        let tf = if !ignore_index {
+                            tfs.get(&info.relative_name)
+                        } else {
+                            None
+                        };
+
+                        if let Some(tf) =  tf {
                             debug_assert_eq!(tf.relative_name, info.relative_name);
         
                             // This file exists in the remote, and we track it. So check if it was modified.
@@ -288,7 +297,7 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
     ) -> crate::Result<()> {
         // Query the changes in from. We
         let from_status = self.rt.block_on(async {
-            self.status(from).await
+            self.status(from, false).await
         })?;
 
         // If the user wants to not check for conflicts, we do not even need the remote status
@@ -296,7 +305,7 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
             StatusReport::new(Vec::new())
         } else {
             self.rt.block_on(async {
-                self.status(to).await
+                self.status(to, false).await
             })?
         };
 
@@ -355,7 +364,7 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
 
         let multi = MultiProgress::new();
         let style = ProgressStyle::with_template(
-                "{bar:20.cyan/blue} {bytes}/{total_bytes} : {msg}",
+                "{bar:20.cyan/blue} {bytes}/{total_bytes} : {wide_msg}",
             ).unwrap()
             .progress_chars("##-");
 
@@ -375,26 +384,17 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         }
 
         for change in changes {
-
             let multi = multi.clone();
             let style = style.clone();
             let ft = async move {
-                    match change {
-                    FileChange::New(info) | FileChange::Modified(info) => {
-                        // For now, we just download the entire file into memory.
-                        // There are worse things...
-                        let fileinfo = if let PathInfo::File(info) = from.info(&info.relative_name).await? {
-                            info
-                        } else {
-                            return Err(Error::NotAFile(info.relative_name));
-                        };
-
-                        let (reader, len) = from.read_file(&info.relative_name).await?;
+                match change {
+                    FileChange::New(fileinfo) | FileChange::Modified(fileinfo) => {
+                        let (reader, len) = from.read_file(&fileinfo.relative_name).await?;
 
                         // Yay, progress reporting
                         let pb = ProgressBar::new(len)
                             .with_style(style)
-                            .with_message(info.relative_name.clone());
+                            .with_message(fileinfo.relative_name.clone());
 
                         let pb = multi.add(pb);
 
@@ -404,11 +404,17 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
 
                         let reader_with_progress = AsyncReadWithProgress::new(reader, reporter);
 
-                        to.write_file(&info.relative_name, reader_with_progress, len).await?;
-                        to.set_modified_time(&info.relative_name, fileinfo.modified).await?;
+                        to.write_file(&fileinfo.relative_name, reader_with_progress, len).await?;
+
+                        // FIXME: Add a Sanity check, and verify that fileinfo.size == len. 
+                        // Our fileinfo might be outdated (because downloading takes long)
+                        // if the file we downloaded has a different size than we expected, re-download
+                        // the fileinfo.
+
+                        to.set_modified_time(&fileinfo.relative_name, fileinfo.modified).await?;
 
                         if track {
-                            self.track_current_version(&info.relative_name).await?;
+                            self.track_current_version(&fileinfo.relative_name).await?;
                         }
                     }
                     FileChange::Deleted {
@@ -422,16 +428,21 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
                     }
                 }
 
-                Ok(())
+                Ok::<(), crate::Error>(())
             };
 
             fts.push(ft);
         }
 
-        // Wait for all of the futures to finish
-        let mut fts_stream = futures::stream::iter(fts).buffer_unordered(10);
-        while let Some(_) = fts_stream.next().await {}
+        let overall_progress = ProgressBar::new(fts.len() as u64);
+        let overall_progress = multi.add(overall_progress);
 
+        // Wait for all of the futures to finish
+        let mut fts_stream = futures::stream::iter(fts).buffer_unordered(crate::CONCURRENT_FUTURES);
+        while let Some(_) = fts_stream.next().await {
+            overall_progress.inc(1);
+        }
+            
         Ok(())
     }
 

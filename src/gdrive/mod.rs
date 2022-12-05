@@ -6,7 +6,7 @@ mod extensions;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 pub use credential::{FatAccessToken, GoogleCredential};
-use futures::AsyncRead;
+use futures::{AsyncRead, StreamExt};
 use isahc::{HttpClient};
 use tokio::sync::{Semaphore, OwnedSemaphorePermit};
 
@@ -344,66 +344,84 @@ impl FileRepository for GDriveBackend {
     }
 
     async fn read_dirs(&self, dirs: Vec<String>) -> crate::Result<Vec<PathInfo>> {
-        const BATCH_SIZE: usize = 8;
-
-        let mut ret = Vec::new();
-
-        // ID's seem to be no longer than 50 characters. We batch them in groups of 8 for now.
+        // ID's seem to be no longer than 50 characters. We batch them in groups of 12 for now.
         // That also has the advantage that we do not have to allocate at all here (for a reverse
         // lookup table).
-        let mut ids = Vec::new();
+        const BATCH_SIZE: usize = 12;
+
+        // We'll even make this fancy, and try to retrieve these directories in parallel!
+        let mut fts = Vec::new();
+
         for rns_chunk in dirs.chunks(BATCH_SIZE) {
-            ids.clear();
-            for i in 0..rns_chunk.len() {
-                ids.insert(i, self.get_drive_id(rns_chunk[i].as_ref()).await?);
-            }
+            let ft = async move {
+                let mut ids = Vec::new();
+                let mut res = Vec::new();
 
-            let mut q = ids
-                .iter()
-                .map(|id| format!("'{id}' in parents"))
-                .collect::<Vec<String>>()
-                .join(" or ");
-
-            q = format!("({q}) and trashed = false");
-
-            let files = self.make_drive_api().await?.file_list_all(&q).await?;
-
-            for file in files {
-                let parent_id = match file.parents {
-                    Some([x]) => x,
-                    _ => panic!("unexpectedly got file without parents"),
-                };
-
-                let parent_relative_name_idx = ids
-                    .iter()
-                    .position(|id| id == &parent_id)
-                    .expect("failed to find path of parent");
-
-                let relative_name = append_to_relative_name(
-                    rns_chunk[parent_relative_name_idx].as_ref(),
-                    &file.name,
-                );
-
-                let res = match (file.size, file.sha1_checksum, file.mime_type.as_str()) {
-                    (Some(size), Some(sha1), _) => Some(PathInfo::File(crate::FileInfo {
-                        relative_name,
-                        size,
-                        modified: file.modified_time,
-                        hash: Some(sha1),
-                    })),
-                    (_, _, "application/vnd.google-apps.folder") => {
-                        Some(PathInfo::Dir(crate::DirectoryInfo { relative_name }))
-                    }
-                    (_, _, _) => {
-                        // Skip types we cannot cateogorize into file / folder
-                        // FIXME: Do something for Google docs here
-                        None
-                    }
-                };
-
-                if let Some(res) = res {
-                    ret.push(res);
+                for i in 0..rns_chunk.len() {
+                    ids.insert(i, self.get_drive_id(rns_chunk[i].as_ref()).await?);
                 }
+    
+                let mut q = ids
+                    .iter()
+                    .map(|id| format!("'{id}' in parents"))
+                    .collect::<Vec<String>>()
+                    .join(" or ");
+    
+                q = format!("({q}) and trashed = false");
+    
+                let files = self.make_drive_api().await?.file_list_all(&q).await?;
+    
+                for file in files {
+                    let parent_id = match file.parents {
+                        Some([x]) => x,
+                        _ => panic!("unexpectedly got file without parents"),
+                    };
+    
+                    let parent_relative_name_idx = ids
+                        .iter()
+                        .position(|id| id == &parent_id)
+                        .expect("failed to find path of parent");
+    
+                    let relative_name = append_to_relative_name(
+                        rns_chunk[parent_relative_name_idx].as_ref(),
+                        &file.name,
+                    );
+    
+                    let pathinfo = match (file.size, file.sha1_checksum, file.mime_type.as_str()) {
+                        (Some(size), Some(sha1), _) => Some(PathInfo::File(crate::FileInfo {
+                            relative_name,
+                            size,
+                            modified: file.modified_time,
+                            hash: Some(sha1),
+                        })),
+                        (_, _, "application/vnd.google-apps.folder") => {
+                            Some(PathInfo::Dir(crate::DirectoryInfo { relative_name }))
+                        }
+                        (_, _, _) => {
+                            // Skip types we cannot cateogorize into file / folder
+                            // FIXME: Do something for Google docs here
+                            None
+                        }
+                    };
+    
+                    if let Some(pathinfo) = pathinfo {
+                        res.push(pathinfo);
+                    }
+                }
+
+                Ok::<_, crate::Error>(res)
+            };
+            
+            fts.push(ft);
+        }
+
+        let mut stream = futures::stream::iter(fts)
+            .buffer_unordered(crate::CONCURRENT_FUTURES);
+
+        let mut ret = Vec::new();
+        while let Some(res) = stream.next().await {
+            if let Ok(res) = res {
+                ret.extend(res);
             }
         }
 

@@ -217,7 +217,7 @@ impl FileRepository for LocalBackend {
 
         let mut src = Box::pin(src.compat());
         tokio::io::copy(&mut src, &mut file).await?;
-        drop(file);
+        file.sync_all().await.unwrap();
 
         Ok(())
     }
