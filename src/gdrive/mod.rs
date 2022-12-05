@@ -55,7 +55,6 @@ impl std::ops::Deref for DriveApiGuard<'_> {
 impl GDriveBackend {
     pub fn new(credential: GoogleCredential) -> Self {
         let client = HttpClient::builder()
-            .max_connections_per_host(10)
             .build()
             .unwrap();
 

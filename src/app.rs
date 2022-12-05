@@ -8,13 +8,14 @@
 //! In the following, we often speak of "relative names". By this, we mean a string of the form
 //! abc/def/ceg
 //! i.e. a slash separated path, that does not contain dots. In particular, it does not start with a dot.
-
 use futures::StreamExt;
 
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use tokio::runtime::{Runtime, self};
 use tokio::task::spawn_blocking;
 
 use crate::backend::FileRepository;
+use crate::progress::{ProgressReporter, AsyncReadWithProgress};
 use crate::{db, App, Error, PathInfo, append_to_relative_name};
 use crate::{db::TrackedFile, FileChange};
 use std::collections::HashMap;
@@ -344,42 +345,84 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         changes: Vec<FileChange>,
         track: bool,
     ) -> crate::Result<()> {
-        let fts = changes.into_iter().map(|change| async {
-            println!("{}...", change.relative_name());
+        let mut fts = Vec::new();
 
-            match change {
-                FileChange::New(info) | FileChange::Modified(info) => {
-                    // For now, we just download the entire file into memory.
-                    // There are worse things...
-                    let fileinfo = if let PathInfo::File(info) = from.info(&info.relative_name).await? {
-                        info
-                    } else {
-                        return Err(Error::NotAFile(info.relative_name));
-                    };
+        let multi = MultiProgress::new();
+        let style = ProgressStyle::with_template(
+                "{bar:20.cyan/blue} {bytes}/{total_bytes} : {msg}",
+            ).unwrap()
+            .progress_chars("##-");
 
-                    let (reader, len) = from.read_file(&info.relative_name).await?;
-                    to.write_file(&info.relative_name, reader, len).await?;
-                    to.set_modified_time(&info.relative_name, fileinfo.modified).await?;
+        struct ReportProgressToProgressBar {
+            multi: MultiProgress,
+            pb: ProgressBar
+        }
 
-                    if track {
-                        self.track_current_version(&info.relative_name).await?;
+        impl ProgressReporter for ReportProgressToProgressBar {
+            fn report(&self, x: usize) {
+                self.pb.set_position(x as u64);
+            }
+
+            fn finish(&self) {
+                self.multi.remove(&self.pb);
+            }
+        }
+
+        for change in changes {
+            let multi = multi.clone();
+            let style = style.clone();
+            let ft = async move {
+                    match change {
+                    FileChange::New(info) | FileChange::Modified(info) => {
+                        // For now, we just download the entire file into memory.
+                        // There are worse things...
+                        let fileinfo = if let PathInfo::File(info) = from.info(&info.relative_name).await? {
+                            info
+                        } else {
+                            return Err(Error::NotAFile(info.relative_name));
+                        };
+
+                        let (reader, len) = from.read_file(&info.relative_name).await?;
+
+                        // Yay, progress reporting
+                        let pb = ProgressBar::new(len)
+                            .with_style(style)
+                            .with_message(info.relative_name.clone());
+
+                        let pb = multi.add(pb);
+
+                        let reporter = ReportProgressToProgressBar {
+                            multi, pb
+                        };
+
+                        let reader_with_progress = AsyncReadWithProgress::new(reader, reporter);
+
+                        to.write_file(&info.relative_name, reader_with_progress, len).await?;
+                        to.set_modified_time(&info.relative_name, fileinfo.modified).await?;
+
+                        if track {
+                            self.track_current_version(&info.relative_name).await?;
+                        }
+                    }
+                    FileChange::Deleted {
+                        relative_name
+                    } => {
+                        to.delete_file(&relative_name).await?;
+
+                        if track {
+                            self.db.delete_tracked_file(&relative_name)?;
+                        }
                     }
                 }
-                FileChange::Deleted {
-                    relative_name
-                } => {
-                    to.delete_file(&relative_name).await?;
 
-                    if track {
-                        self.db.delete_tracked_file(&relative_name)?;
-                    }
-                }
+                Ok(())
             };
 
-            Ok(())
-        });
+            fts.push(ft);
+        }
 
-        let _x = futures::stream::iter(fts).buffer_unordered(10).count().await;
+        // Wait for all of the futures to finish
+        futures::stream::iter(fts).buffer_unordered(20).count().await;
 
         Ok(())
     }

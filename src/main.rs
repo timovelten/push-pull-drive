@@ -7,6 +7,7 @@ mod fileinfo;
 mod gdrive;
 mod paths;
 mod util;
+mod progress;
 
 use crate::{app::DefaultApp, local::LocalBackend};
 use clap::{Parser, Subcommand};
