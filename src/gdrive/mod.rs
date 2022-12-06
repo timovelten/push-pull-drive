@@ -79,7 +79,7 @@ impl GDriveBackend {
             .unwrap();
 
         Self {
-            sem: Arc::new(Semaphore::new(6)),
+            sem: Arc::new(Semaphore::new(8)),
             credential: Arc::new(credential),
             client,
             id_cache: Default::default(),
@@ -253,6 +253,7 @@ impl FileRepository for GDriveBackend {
         let drive_api = self.make_drive_api().await?;
 
         let (inner, len) = drive_api.files_get_alt_media(&id, None).await?;
+        
         // This is still open! We need to ensure that the connections to Google stays below
         // the limit we set out in the beginning. Otherwise, what is the point
         // of doing this at all.

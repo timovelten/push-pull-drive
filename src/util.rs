@@ -1,5 +1,6 @@
 use std::fmt::Write;
 
+use http::Request;
 use time::OffsetDateTime;
 
 pub fn u8_slice_to_hex_string(slice: &[u8]) -> String {
@@ -13,6 +14,28 @@ pub fn u8_slice_to_hex_string(slice: &[u8]) -> String {
 
 pub fn datetime_to_filetime(time: OffsetDateTime) -> filetime::FileTime {
     filetime::FileTime::from_unix_time(time.unix_timestamp(), time.nanosecond())
+}
+
+pub fn clone_request<T: Clone>(req: &Request<T>) -> Request<T> {
+    if req.extensions().len() != 0 {
+        panic!("cloning requests with extensions is unsupported")
+    }
+
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let version = req.version().clone();
+    let headers = req.headers().clone();
+    let body = req.body().clone();
+
+    let mut ret = Request::builder()
+        .method(method)
+        .uri(uri)
+        .version(version)
+        .body(body)
+        .unwrap();
+
+    *ret.headers_mut() = headers;
+    ret
 }
 
 #[allow(dead_code)]

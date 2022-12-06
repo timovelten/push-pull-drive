@@ -242,6 +242,8 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         // do not really care about order
         let mut next_directories = vec![self.cwd.clone()];
 
+        println!("Retrieving files...");
+
         while next_directories.len() > 0 {
             let files = repo.read_dirs(next_directories).await?;
             next_directories = Vec::new();
@@ -439,8 +441,12 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
 
         // Wait for all of the futures to finish
         let mut fts_stream = futures::stream::iter(fts).buffer_unordered(crate::CONCURRENT_FUTURES);
-        while let Some(_) = fts_stream.next().await {
+        while let Some(x) = fts_stream.next().await {
             overall_progress.inc(1);
+
+            if let Err(err) = x {
+                println!("A request failed {:?}", err);
+            }
         }
             
         Ok(())

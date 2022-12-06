@@ -1,15 +1,20 @@
+use std::time::Duration;
 use std::{fmt::Display, str::FromStr};
+
+use crate::util::clone_request;
+use crate::Error;
 
 use super::extensions::RequestBuilderExt;
 use super::extensions::ResponseExt;
 use super::extensions::UrlExt;
-use futures::{AsyncReadExt, AsyncRead};
-use http::Request;
-use isahc::{HttpClient, AsyncReadResponseExt};
+use futures::{AsyncRead, AsyncReadExt};
+use http::{Request, Response};
+use isahc::AsyncBody;
+use isahc::{AsyncReadResponseExt, HttpClient};
 use oauth2::AccessToken;
-use serde::de;
-use serde::Deserialize;
+use rand::Rng;
 use serde::Serialize;
+use serde::{de, Deserialize};
 use time::OffsetDateTime;
 use url::Url;
 
@@ -88,6 +93,76 @@ impl DriveApi {
         Self { client, token }
     }
 
+    async fn send_retry<B: Clone + Into<AsyncBody>>(
+        &self,
+        req: Request<B>,
+    ) -> crate::Result<Response<AsyncBody>> {
+        const MAXIMUM_DELAY: Duration = Duration::from_secs(32);
+
+        let mut delay = Duration::from_secs(1);
+        loop {
+            let resp = self.client.send_async(clone_request(&req)).await;
+
+            let (err, should_retry): (crate::Error, bool) = match resp {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        return Ok(resp);
+                    }
+
+                    // Otherwise, try to make sense of the error we got
+                    let (_, mut body) = resp.into_parts();
+
+                    // This may fail, but we do not care
+                    let mut body_str = String::new();
+                    let _ = body.read_to_string(&mut body_str).await;
+
+                    let should_retry = match status.as_u16() {
+                        403 => {
+                            // We are potentially being rate limited, find out if we are.
+                            let rate_limited = serde_json::from_str::<serde_json::Value>(&body_str)
+                                .ok()
+                                .as_ref()
+                                .and_then(|x| x.get("error"))
+                                .and_then(|x| x.get("errors"))
+                                .and_then(|x| x.as_array())
+                                .and_then(|x| x.get(0))
+                                .and_then(|x| x.get("reason"))
+                                .and_then(|x| x.as_str())
+                                .map(|x| x == "userRateLimitExceeded")
+                                .unwrap_or(false);
+
+                            if rate_limited {
+                                println!("We were just rate limited, {:?}", req.uri());
+                            }
+
+                            rate_limited
+                        }
+                        // Otherwise, do not retry client errors
+                        400..=499 => false,
+                        // ...but everything else
+                        _ => true,
+                    };
+                    let res = Error::HttpStatusError {
+                        status: status.as_u16(),
+                        resp: body_str,
+                    };
+
+                    (res, should_retry)
+                }
+                Err(err) => (err.into(), true),
+            };
+
+            if !should_retry || delay >= MAXIMUM_DELAY {
+                return Err(err);
+            }
+
+            let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..=1000));
+            tokio::time::sleep(delay + jitter).await;
+            delay *= 2;
+        }
+    }
+
     /// Note: you should probably always add the query parameter ... and trashed = false
     pub async fn file_list(
         &self,
@@ -109,7 +184,11 @@ impl DriveApi {
             .bearer_auth(self.token.secret())
             .body(())?;
 
-        Ok(self.client.send_async(req).await?.json_error_for_status()?.json().await?)
+        Ok(self
+            .send_retry(req)
+            .await?
+            .json()
+            .await?)
     }
 
     /// Wrap file_list and keep reading until nextPageToken is None. Return the end result.
@@ -142,26 +221,29 @@ impl DriveApi {
             .bearer_auth(self.token.secret())
             .body(())?;
 
-        Ok(self.client.send_async(req).await?.json_error_for_status()?.json().await?)
+        Ok(self
+            .send_retry(req)
+            .await?
+            .json()
+            .await?)
     }
 
     pub async fn files_get_alt_media(
         &self,
         id: &str,
-        bytes_range: Option<(u64, u64)>
+        bytes_range: Option<(u64, u64)>,
     ) -> crate::Result<(isahc::AsyncBody, u64)> {
         let range_header = if let Some((_, _)) = bytes_range {
-            todo!("make the output of this work with content length (I think right now it does not)")
+            todo!(
+                "make the output of this work with content length (I think right now it does not)"
+            )
         } else {
             "bytes=0-".to_string()
         };
 
         let url = Url::parse(&format!("https://www.googleapis.com/drive/v3/files/{id}"))
             .unwrap()
-            .with_query_pairs(&[
-                Some(("acknowledgeAbuse", "true")),
-                Some(("alt", "media"))
-            ]);
+            .with_query_pairs(&[Some(("acknowledgeAbuse", "true")), Some(("alt", "media"))]);
 
         let req = Request::get(url.to_string())
             // We include a range header in any case, so that google always includes a content range
@@ -171,19 +253,36 @@ impl DriveApi {
             .bearer_auth(self.token.secret())
             .body(())?;
 
-        let resp = self.client.send_async(req).await?.json_error_for_status()?;
-    
-        let len = resp.headers().get(http::header::CONTENT_RANGE)
-                .and_then(|range| {
-                    // Try and parse the Content-Range header
-                    let (_, x) = range.to_str().unwrap().split_once('/')?;
-                    x.parse::<u64>().ok()
-                })
-                .or_else(|| {
-                    // Otherwise, last ditch effort: try and use content length
-                    resp.body().len()
-                })
-                .unwrap_or_else(|| panic!("google sent a file and we have no way of knowing how long it is: {}", id));
+        let resp = self.send_retry(req).await;
+
+        // Including a range header does come with a problem: If the file has 0 bytes,
+        // google (more or less correctly) responds with a 416 Range not satisfiable.
+        // We just swallow that error if it happens.
+        if let Err(crate::Error::HttpStatusError { status: 416, resp: _ }) = &resp {
+            let empty_body = AsyncBody::from(Vec::new());
+            return Ok((empty_body, 0));
+        }
+
+        let resp = resp?;
+ 
+        let len = resp
+            .headers()
+            .get(http::header::CONTENT_RANGE)
+            .and_then(|range| {
+                // Try and parse the Content-Range header
+                let (_, x) = range.to_str().unwrap().split_once('/')?;
+                x.parse::<u64>().ok()
+            })
+            .or_else(|| {
+                // Otherwise, last ditch effort: try and use content length
+                resp.body().len()
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "google sent a file and we have no way of knowing how long it is: {}",
+                    id
+                )
+            });
 
         Ok((resp.into_body(), len))
     }
@@ -195,7 +294,7 @@ impl DriveApi {
             .bearer_auth(self.token.secret())
             .body(())?;
 
-        self.client.send_async(req).await?.json_error_for_status()?;
+        self.send_retry(req).await?;
 
         Ok(())
     }
@@ -207,14 +306,18 @@ impl DriveApi {
             .bearer_auth(self.token.secret())
             .json_body(&create_request)?;
 
-        Ok(self.client.send_async(req).await?.json_error_for_status()?.json().await?)
+        Ok(self
+            .send_retry(req)
+            .await?
+            .json()
+            .await?)
     }
 
     pub async fn files_create_upload<R: AsyncRead + Send>(
         &self,
         create_request: FilesReq,
         src: R,
-        len: u64
+        len: u64,
     ) -> crate::Result<FileId> {
         let url =
             Url::parse("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable")
@@ -224,17 +327,23 @@ impl DriveApi {
             .bearer_auth(self.token.secret())
             .json_body(&create_request)?;
 
-        let resp = self.client.send_async(req).await?.json_error_for_status()?;
+        let resp = self.send_retry(req).await?;
 
         let resumable_session_url = resp.headers().get("Location").unwrap().to_str().unwrap();
 
         self.upload(resumable_session_url, src, len).await
     }
 
-    pub async fn files_update_upload<R: AsyncRead + Send>(&self, id: &str, src: R, len: u64) -> crate::Result<FileId> {
+    pub async fn files_update_upload<R: AsyncRead + Send>(
+        &self,
+        id: &str,
+        src: R,
+        len: u64,
+    ) -> crate::Result<FileId> {
         let url = Url::parse(&format!(
             "https://www.googleapis.com/upload/drive/v3/files/{id}?uploadType=resumable"
-        )).unwrap();
+        ))
+        .unwrap();
 
         let req = Request::patch(url.to_string())
             // Note that we could send a non empty object here, but for now,
@@ -243,7 +352,7 @@ impl DriveApi {
             .bearer_auth(self.token.secret())
             .body("{}")?;
 
-        let resp = self.client.send_async(req).await?.json_error_for_status()?;
+        let resp = self.send_retry(req).await?;
 
         let resumable_session_url = resp.headers().get("Location").unwrap().to_str().unwrap();
 
@@ -257,9 +366,11 @@ impl DriveApi {
             .bearer_auth(self.token.secret())
             .json_body(&update_req)?;
 
-        let file_id: FileId = self.client.send_async(req).await?
-            .json_error_for_status()?
-            .json().await?;
+        let file_id: FileId = self
+            .send_retry(req)
+            .await?
+            .json()
+            .await?;
 
         debug_assert_eq!(&file_id.id, id);
 
@@ -268,7 +379,12 @@ impl DriveApi {
 
     // Try and read everything from the reader. Try to not but it into memory.
     // At this point, it's already seekable, so we do not have to do that.
-    async fn upload<R: AsyncRead + Send>(&self, resumable_session_url: &str, src: R, len: u64) -> crate::Result<FileId> {
+    async fn upload<R: AsyncRead + Send>(
+        &self,
+        resumable_session_url: &str,
+        src: R,
+        len: u64,
+    ) -> crate::Result<FileId> {
         // I have no idea what I'm doing here. I should probably read that blog
         // post "Pin and suffering" again (great title btw)
         let mut src = Box::pin(src);
@@ -276,14 +392,14 @@ impl DriveApi {
         let mut buf = vec![0u8; Self::CHUNKSIZE].into_boxed_slice();
         let mut offset = 0;
 
-        let mut bytes_sent = 0;        
+        let mut bytes_sent = 0;
         let id: FileId = loop {
             // It could happen, that we still have data to send from the previous iteration.
             // This is possible, because google might not consume everything we send,
             // i.e. indicate with the range header that it has not consumed the entire bytes.
             // We carry over the remaining bytes into the next iteration and send them again
             // along with new data, if possible.
-            let read =  src.read(&mut buf[offset..]).await?;
+            let read = src.read(&mut buf[offset..]).await?;
             let send_buffer = &buf[..offset + read];
 
             let range_header = &format!(
@@ -297,14 +413,17 @@ impl DriveApi {
                 .header(http::header::CONTENT_RANGE, range_header)
                 .body(send_buffer)?;
 
-            let mut resp = self.client.send_async(req).await?
+            let mut resp = self
+                .client
+                .send_async(req)
+                .await?
                 // FIXME: This should be retried instead of just failing, but leave it like this for now
                 .json_error_for_status()?;
 
             match resp.status().as_u16() {
                 // Success. We are done, extract the field and return it
                 200..=299 => break resp.json().await?,
-                
+
                 // Not yet finished
                 308 => {
                     if let Some(range) = resp.headers().get(http::header::RANGE) {
@@ -335,7 +454,7 @@ impl DriveApi {
                         // not overwritten, perhaps by setting offset to its maximum?
                     }
                 }
-                x => panic!("unexpected status code {}", x)
+                x => panic!("unexpected status code {}", x),
             }
         };
 
