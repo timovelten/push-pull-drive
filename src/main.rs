@@ -11,6 +11,7 @@ mod progress;
 
 use crate::{app::DefaultApp, local::LocalBackend};
 use clap::{Parser, Subcommand};
+use env_logger::{Builder, Target};
 use gdrive::{FatAccessToken, GDriveBackend, GoogleCredential};
 use oauth2::{AccessToken, ClientId, ClientSecret, RefreshToken};
 use std::{
@@ -46,6 +47,10 @@ const CONCURRENT_FUTURES: usize = 10;
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 struct Cli {
+    /// A path to a log file. Can be "-" to log to stdout. Logging to terminal is not recommended,
+    /// because it currently (more or less) breaks the various progress bars we show.
+    #[arg(long)]
+    log: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -95,6 +100,23 @@ enum Backends {
 //  - otherwise print a link to the web interface of google drive so the user may fix it himself.
 fn main() {
     let cli = Cli::parse();
+
+    if let Some(path) = cli.log {
+        let target = if path == "-" {
+            Target::Stdout
+        } else {
+            let f: Box<File> = File::create(path)
+                .expect("could not open log file")
+                .into();
+            Target::Pipe(f)
+        };
+
+        Builder::new()
+            .target(target)
+            .filter_level(log::LevelFilter::Info)
+            .init();
+    }
+
     match handle_command(cli.command) {
         Ok(_) => {}
         Err(err) => println!("{} [{:?}]", err, err),

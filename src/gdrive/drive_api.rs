@@ -7,7 +7,6 @@ use crate::Error;
 
 use super::extensions::RequestBuilderExt;
 use super::extensions::UrlExt;
-use bytes::Bytes;
 use futures::{AsyncRead, AsyncReadExt, TryStreamExt};
 use http::Request;
 use oauth2::AccessToken;
@@ -135,7 +134,7 @@ impl DriveApi {
                                 .unwrap_or(false);
 
                             if rate_limited {
-                                println!("We were just rate limited, {:?}", req.uri());
+                                log::warn!("Received a 403 userRateLimitExceeded, retrying (current delay: {:?})", delay);
                             }
 
                             rate_limited
@@ -245,7 +244,7 @@ impl DriveApi {
             // the response will almost always be gzip encoded)
             .header(http::header::RANGE, range_header)
             .bearer_auth(self.token.secret())
-            .body(Bytes::new())?;
+            .body(EMPTY_BODY)?;
 
         let resp = self.send_retry(req).await;
 

@@ -291,7 +291,6 @@ mod tests {
             std::fs::create_dir_all(&dir_path).unwrap();
 
             let path = dir_path.join(filename);
-            println!("{:?}", path);
 
             let mut f = OpenOptions::new()
                 .write(true)
