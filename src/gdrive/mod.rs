@@ -214,7 +214,7 @@ impl GDriveBackend {
 
 #[async_trait]
 impl FileRepository for GDriveBackend {
-    type Reader = SemaphoreGuarded<isahc::AsyncBody>;
+    type Reader = Box<dyn AsyncRead + Unpin + Send>;
 
     async fn read_dir(&self, relative_name: &str) -> crate::Result<Vec<crate::PathInfo>> {
         let id = self.get_drive_id(relative_name).await?;
@@ -258,7 +258,7 @@ impl FileRepository for GDriveBackend {
         // of doing this at all.
         let permit = drive_api.into_permit();
 
-        Ok((SemaphoreGuarded { permit, inner }, len))
+        Ok((Box::new(SemaphoreGuarded { permit, inner }), len))
     }
 
     async fn write_file<R: AsyncRead + Send>(&self, relative_name: &str, src: R, len: u64) -> crate::Result<()> {
