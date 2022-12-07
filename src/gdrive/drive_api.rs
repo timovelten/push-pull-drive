@@ -1,3 +1,4 @@
+use std::io::ErrorKind;
 use std::time::Duration;
 use std::{fmt::Display, str::FromStr};
 
@@ -6,12 +7,12 @@ use crate::Error;
 
 use super::extensions::RequestBuilderExt;
 use super::extensions::UrlExt;
-use futures::{AsyncRead, AsyncReadExt};
-use http::{Request, Response};
-use isahc::AsyncBody;
-use isahc::{AsyncReadResponseExt, HttpClient};
+use bytes::Bytes;
+use futures::{AsyncRead, AsyncReadExt, TryStreamExt};
+use http::Request;
 use oauth2::AccessToken;
 use rand::Rng;
+use reqwest::Body;
 use serde::Serialize;
 use serde::{de, Deserialize};
 use time::OffsetDateTime;
@@ -23,6 +24,8 @@ use url::Url;
 
 // See https://stackoverflow.com/questions/44301748/how-can-i-deserialize-an-optional-field-with-custom-functions-using-serde
 // for why we need the [serde(default)]
+
+const EMPTY_BODY: &'static [u8] = &[];
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -80,7 +83,7 @@ pub struct FilesReq {
 /// need to be passed to each function here in any case. It should not be kept
 /// around and is generally extremely short lived.
 pub struct DriveApi {
-    client: HttpClient,
+    client: reqwest::Client,
     token: AccessToken,
 }
 
@@ -88,19 +91,20 @@ impl DriveApi {
     // Chunksize of 20 MiB seems like a reasonable choice.
     const CHUNKSIZE: usize = (256 * 1024 * 4) * 20;
 
-    pub fn new(client: HttpClient, token: AccessToken) -> Self {
+    pub fn new(client: reqwest::Client, token: AccessToken) -> Self {
         Self { client, token }
     }
 
-    async fn send_retry<B: Clone + Into<AsyncBody>>(
+    async fn send_retry<B: Clone + Into<Body>>(
         &self,
         req: Request<B>,
-    ) -> crate::Result<Response<AsyncBody>> {
+    ) -> crate::Result<reqwest::Response> {
         const MAXIMUM_DELAY: Duration = Duration::from_secs(32);
 
         let mut delay = Duration::from_secs(1);
         loop {
-            let resp = self.client.send_async(clone_request(&req)).await;
+            let converted_req: reqwest::Request = clone_request(&req).try_into().unwrap();
+            let resp = self.client.execute(converted_req).await;
 
             let (err, should_retry): (crate::Error, bool) = match resp {
                 Ok(resp) => {
@@ -113,11 +117,7 @@ impl DriveApi {
                     }
 
                     // Otherwise, try to make sense of the error we got
-                    let (_, mut body) = resp.into_parts();
-
-                    // This may fail, but we do not care
-                    let mut body_str = String::new();
-                    let _ = body.read_to_string(&mut body_str).await;
+                    let body_str = resp.text().await.unwrap_or_else(|_| String::new());
 
                     let should_retry = match status.as_u16() {
                         403 => {
@@ -184,13 +184,9 @@ impl DriveApi {
 
         let req = Request::get(url.to_string())
             .bearer_auth(self.token.secret())
-            .body(())?;
+            .body(EMPTY_BODY)?;
 
-        Ok(self
-            .send_retry(req)
-            .await?
-            .json()
-            .await?)
+        Ok(self.send_retry(req).await?.json().await?)
     }
 
     /// Wrap file_list and keep reading until nextPageToken is None. Return the end result.
@@ -221,20 +217,16 @@ impl DriveApi {
 
         let req = Request::get(url.to_string())
             .bearer_auth(self.token.secret())
-            .body(())?;
+            .body(EMPTY_BODY)?;
 
-        Ok(self
-            .send_retry(req)
-            .await?
-            .json()
-            .await?)
+        Ok(self.send_retry(req).await?.json().await?)
     }
 
     pub async fn files_get_alt_media(
         &self,
         id: &str,
         bytes_range: Option<(u64, u64)>,
-    ) -> crate::Result<(isahc::AsyncBody, u64)> {
+    ) -> crate::Result<(Box<dyn AsyncRead + Unpin + Send>, u64)> {
         let range_header = if let Some((_, _)) = bytes_range {
             todo!(
                 "make the output of this work with content length (I think right now it does not)"
@@ -253,20 +245,23 @@ impl DriveApi {
             // the response will almost always be gzip encoded)
             .header(http::header::RANGE, range_header)
             .bearer_auth(self.token.secret())
-            .body(())?;
+            .body(Bytes::new())?;
 
         let resp = self.send_retry(req).await;
 
         // Including a range header does come with a problem: If the file has 0 bytes,
         // google (more or less correctly) responds with a 416 Range not satisfiable.
         // We just swallow that error if it happens.
-        if let Err(crate::Error::HttpStatusError { status: 416, resp: _ }) = &resp {
-            let empty_body = AsyncBody::from(Vec::new());
-            return Ok((empty_body, 0));
+        if let Err(crate::Error::HttpStatusError {
+            status: 416,
+            resp: _,
+        }) = &resp
+        {
+            return Ok((Box::new(futures::io::empty()), 0));
         }
 
         let resp = resp?;
- 
+
         let len = resp
             .headers()
             .get(http::header::CONTENT_RANGE)
@@ -277,7 +272,7 @@ impl DriveApi {
             })
             .or_else(|| {
                 // Otherwise, last ditch effort: try and use content length
-                resp.body().len()
+                resp.content_length()
             })
             .unwrap_or_else(|| {
                 panic!(
@@ -286,7 +281,12 @@ impl DriveApi {
                 )
             });
 
-        Ok((resp.into_body(), len))
+        let body_async_read = resp
+            .bytes_stream()
+            .map_err(|err| std::io::Error::new(ErrorKind::Other, err))
+            .into_async_read();
+
+        Ok((Box::new(body_async_read), len))
     }
 
     pub async fn files_delete(&self, id: &str) -> crate::Result<()> {
@@ -294,7 +294,7 @@ impl DriveApi {
 
         let req = Request::delete(url.to_string())
             .bearer_auth(self.token.secret())
-            .body(())?;
+            .body(EMPTY_BODY)?;
 
         self.send_retry(req).await?;
 
@@ -308,11 +308,7 @@ impl DriveApi {
             .bearer_auth(self.token.secret())
             .json_body(&create_request)?;
 
-        Ok(self
-            .send_retry(req)
-            .await?
-            .json()
-            .await?)
+        Ok(self.send_retry(req).await?.json().await?)
     }
 
     pub async fn files_create_upload<R: AsyncRead + Send>(
@@ -368,11 +364,7 @@ impl DriveApi {
             .bearer_auth(self.token.secret())
             .json_body(&update_req)?;
 
-        let file_id: FileId = self
-            .send_retry(req)
-            .await?
-            .json()
-            .await?;
+        let file_id: FileId = self.send_retry(req).await?.json().await?;
 
         debug_assert_eq!(&file_id.id, id);
 
@@ -413,15 +405,12 @@ impl DriveApi {
 
             let req = Request::put(resumable_session_url)
                 .header(http::header::CONTENT_RANGE, range_header)
-                .body(send_buffer)?;
+                .body(send_buffer.to_vec())?;
 
             // Note how the retrying will end up cloning the body
             // contained in this request. But the "body" is just a *reference* to an array,
             // and cloning a reference is cheap.
-            let mut resp = self
-                .send_retry(req)
-                .await?;
-
+            let resp = self.send_retry(req).await?;
             match resp.status().as_u16() {
                 // Success. We are done, extract the field and return it
                 200..=299 => break resp.json().await?,

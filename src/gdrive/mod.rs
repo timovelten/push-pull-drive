@@ -7,7 +7,6 @@ use async_recursion::async_recursion;
 use async_trait::async_trait;
 pub use credential::{FatAccessToken, GoogleCredential};
 use futures::{AsyncRead, StreamExt};
-use isahc::{HttpClient};
 use pin_project::pin_project;
 use tokio::sync::{Semaphore, OwnedSemaphorePermit};
 
@@ -28,7 +27,7 @@ pub struct GDriveBackend {
     /// the limit seemed to be somewhere below 10.
     sem: Arc<tokio::sync::Semaphore>,
 
-    client: HttpClient,
+    client: reqwest::Client,
 
     /// Google drive does not use paths. Instead, it identifies files using ids.
     /// For example, there is no specific API to list all of the files in a directory (by path).
@@ -73,7 +72,7 @@ impl <T> AsyncRead for SemaphoreGuarded<T> where T: AsyncRead {
 
 impl GDriveBackend {
     pub fn new(credential: GoogleCredential) -> Self {
-        let client = HttpClient::builder()
+        let client = reqwest::Client::builder()
             .build()
             .unwrap();
 
