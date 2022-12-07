@@ -106,7 +106,9 @@ impl DriveApi {
             let (err, should_retry): (crate::Error, bool) = match resp {
                 Ok(resp) => {
                     let status = resp.status();
-                    if status.is_success() {
+
+                    // If we get any status in the range 0 - 300, we return
+                    if !status.is_client_error() && !status.is_server_error() {
                         return Ok(resp);
                     }
 
@@ -413,12 +415,12 @@ impl DriveApi {
                 .header(http::header::CONTENT_RANGE, range_header)
                 .body(send_buffer)?;
 
+            // Note how the retrying will end up cloning the body
+            // contained in this request. But the "body" is just a *reference* to an array,
+            // and cloning a reference is cheap.
             let mut resp = self
-                .client
-                .send_async(req)
-                .await?
-                // FIXME: This should be retried instead of just failing, but leave it like this for now
-                .json_error_for_status()?;
+                .send_retry(req)
+                .await?;
 
             match resp.status().as_u16() {
                 // Success. We are done, extract the field and return it
