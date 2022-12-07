@@ -133,10 +133,6 @@ impl DriveApi {
                                 .map(|x| x == "userRateLimitExceeded")
                                 .unwrap_or(false);
 
-                            if rate_limited {
-                                log::warn!("Received a 403 userRateLimitExceeded, retrying (current delay: {:?})", delay);
-                            }
-
                             rate_limited
                         }
                         // Otherwise, do not retry client errors
@@ -149,14 +145,20 @@ impl DriveApi {
                         resp: body_str,
                     };
 
+                    log::warn!("A request ({:?} {:?}) failed with status {:?}.", req.method(), req.uri(), status);
+
                     (res, should_retry)
                 }
-                Err(err) => (err.into(), true),
+                Err(err) => {
+                    (err.into(), true)
+                }
             };
 
             if !should_retry || delay >= MAXIMUM_DELAY {
                 return Err(err);
             }
+
+            log::warn!("Retrying request ({:?} {:?})", req.method(), req.uri());
 
             let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..=1000));
             tokio::time::sleep(delay + jitter).await;
