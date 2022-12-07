@@ -390,7 +390,7 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
             let style = style.clone();
             let ft = async move {
                 match change {
-                    FileChange::New(fileinfo) | FileChange::Modified(fileinfo) => {
+                    FileChange::New(mut fileinfo) | FileChange::Modified(mut fileinfo) => {
                         let (reader, len) = from.read_file(&fileinfo.relative_name).await?;
 
                         // Yay, progress reporting
@@ -405,13 +405,17 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
                         };
 
                         let reader_with_progress = AsyncReadWithProgress::new(reader, reporter);
-
                         to.write_file(&fileinfo.relative_name, reader_with_progress, len).await?;
 
-                        // FIXME: Add a Sanity check, and verify that fileinfo.size == len. 
-                        // Our fileinfo might be outdated (because downloading takes long)
-                        // if the file we downloaded has a different size than we expected, re-download
-                        // the fileinfo.
+                        // The fileinfo may be some time out of time (it was retrieved before 
+                        // downloading started, and downloading could potentially take a long time). 
+                        // If the length is different from what we think it should be,
+                        // redownload the info, we will use it in a second.
+                        if len != fileinfo.size {
+                            if let Ok(PathInfo::File(new_fileinfo)) = from.info(&fileinfo.relative_name).await {
+                                fileinfo = new_fileinfo;
+                            }
+                        }
 
                         to.set_modified_time(&fileinfo.relative_name, fileinfo.modified).await?;
 
