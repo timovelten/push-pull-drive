@@ -5,7 +5,6 @@ use crate::util::clone_request;
 use crate::Error;
 
 use super::extensions::RequestBuilderExt;
-use super::extensions::ResponseExt;
 use super::extensions::UrlExt;
 use futures::{AsyncRead, AsyncReadExt};
 use http::{Request, Response};
