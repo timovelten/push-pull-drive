@@ -1157,7 +1157,7 @@ dependencies = [
  "isahc",
  "lazy_static",
  "oauth2",
- "pin-utils",
+ "pin-project",
  "rand",
  "reqwest",
  "rusqlite",

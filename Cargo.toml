@@ -25,10 +25,10 @@ async-trait = "0.1.59"
 async-recursion = "1.0.0"
 tokio-util = { version = "0.7.4", features = ["compat"] }
 futures = "0.3.25"
-pin-utils = "0.1.0"
 indicatif = "0.17.2"
 reqwest = { version = "0.11.13", features = ["stream", "json"] }
 rand = "0.8.5"
+pin-project = "1.0.12"
 
 [dev-dependencies]
 tempfile = "3.3.0"

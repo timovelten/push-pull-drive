@@ -8,6 +8,7 @@ use async_trait::async_trait;
 pub use credential::{FatAccessToken, GoogleCredential};
 use futures::{AsyncRead, StreamExt};
 use isahc::{HttpClient};
+use pin_project::pin_project;
 use tokio::sync::{Semaphore, OwnedSemaphorePermit};
 
 use crate::{
@@ -39,16 +40,14 @@ pub struct GDriveBackend {
     credential: Arc<GoogleCredential>,
 }
 
+#[pin_project]
 pub struct SemaphoreGuarded<T> {
     permit: OwnedSemaphorePermit,
+    #[pin]
     inner: T,
 }
 
 impl <T> SemaphoreGuarded<T> {
-    // SAFTEY: Refer to the pin_utils documentation. This struct does not implement drop, does
-    // not implement Unpin and is not repr(packed).
-    pin_utils::unsafe_pinned!(inner: T);
-
     fn into_permit(self) -> OwnedSemaphorePermit {
         self.permit
     }
@@ -68,7 +67,7 @@ impl <T> AsyncRead for SemaphoreGuarded<T> where T: AsyncRead {
             cx: &mut std::task::Context<'_>,
             buf: &mut [u8],
         ) -> std::task::Poll<std::io::Result<usize>> {
-        self.inner().as_mut().poll_read(cx, buf)
+        self.project().inner.as_mut().poll_read(cx, buf)
     }
 }
 

@@ -106,7 +106,8 @@ impl DriveApi {
                 Ok(resp) => {
                     let status = resp.status();
 
-                    // If we get any status in the range 0 - 300, we return
+                    // If we got anything except an actual, confirmed error we return the result
+                    // for the client to deal with.
                     if !status.is_client_error() && !status.is_server_error() {
                         return Ok(resp);
                     }
