@@ -12,7 +12,7 @@ use tokio::sync::{Semaphore, OwnedSemaphorePermit};
 
 use crate::{
     append_to_relative_name, backend::FileRepository, gdrive::drive_api::DriveApi,
-    split_relative_name, DirectoryInfo, Error, FileInfo, PathInfo,
+    pop_relative_name, DirectoryInfo, Error, FileInfo, PathInfo,
 };
 use std::{
     collections::HashMap,
@@ -26,6 +26,10 @@ pub struct GDriveBackend {
     /// Google does not really like concurrent connections. In my personal testing,
     /// the limit seemed to be somewhere below 10.
     sem: Arc<tokio::sync::Semaphore>,
+
+    /// There is a nasty race condition when using mkdirall, and this is the best way I can think of
+    /// to not have this problem
+    mkdir_lock: tokio::sync::Mutex<()>,
 
     client: reqwest::Client,
 
@@ -78,6 +82,7 @@ impl GDriveBackend {
 
         Self {
             sem: Arc::new(Semaphore::new(8)),
+            mkdir_lock: tokio::sync::Mutex::new(()),
             credential: Arc::new(credential),
             client,
             id_cache: Default::default(),
@@ -127,7 +132,7 @@ impl GDriveBackend {
         }
         
         // If not, find our parent, get its id, list its contents. We should be in that list.
-        let (parent_relative_name, _) = split_relative_name(relative_name);
+        let (parent_relative_name, _) = pop_relative_name(relative_name);
         let parent_id =
             self.get_drive_id_advanced(parent_relative_name, use_cache, only_folders).await?;
 
@@ -171,24 +176,16 @@ impl GDriveBackend {
         self.get_drive_id_advanced(relative_name, true, false).await
     }
 
-    /// Creates the given relative name and returns its id. If this path
-    /// already exists and is the path of a file (and not a folder) this returns
-    /// `Error::NotAFolder`.
     #[async_recursion]
-    async fn mkdir_all(&self, relative_name: &str) -> crate::Result<String> {
-        // Base case: root does not need to be created
-        if relative_name == "" {
-            return self.get_drive_id(relative_name).await;
-        }
-
+    async fn mkdir_all_impl(&self, relative_name: &str) -> crate::Result<String> {
         // Base case: If this already exists, just return its id
         match self.get_drive_id_advanced(relative_name, true, true).await {
             Ok(id) => return Ok(id),
             Err(Error::NotFound(_)) => {
                 // Path does not yet exist, so we find our parent and create a new folder there.
-                let (parent, name) = split_relative_name(relative_name);
+                let (parent, name) = pop_relative_name(relative_name);
 
-                let parent_id = self.mkdir_all(parent).await?;
+                let parent_id = self.mkdir_all_impl(parent).await?;
                 let req = drive_api::FilesReq {
                     name: Some(name.to_string()),
                     mime_type: Some("application/vnd.google-apps.folder".to_string()),
@@ -205,6 +202,18 @@ impl GDriveBackend {
             Err(Error::NotAFolder(rel)) => return Err(Error::NotAFolder(rel)),
             Err(err) => return Err(err),
         }
+    }
+
+    /// Creates the given relative name and returns its id. If this path
+    /// already exists and is the path of a file (and not a folder) this returns
+    /// `Error::NotAFolder`.
+    async fn mkdir_all(&self, relative_name: &str) -> crate::Result<String> {
+        if relative_name == "" {
+            return self.get_drive_id("").await;
+        }
+        
+        let _lock = self.mkdir_lock.lock().await;
+        self.mkdir_all_impl(relative_name).await
     }
 }
 
@@ -234,7 +243,7 @@ impl FileRepository for GDriveBackend {
             }
             Err(Error::NotFound(_)) => {
                 // We need to create the file. For that, we need to place it in the right path
-                let (parent, filename) = split_relative_name(relative_name);
+                let (parent, filename) = pop_relative_name(relative_name);
                 let parent_id = self.mkdir_all(parent).await?;
 
                 let id = self

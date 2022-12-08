@@ -1,3 +1,4 @@
+use std::backtrace;
 use std::io::ErrorKind;
 use std::time::Duration;
 use std::{fmt::Display, str::FromStr};
@@ -385,34 +386,42 @@ impl DriveApi {
         let mut src = Box::pin(src);
 
         let mut buf = vec![0u8; Self::CHUNKSIZE].into_boxed_slice();
-        let mut offset = 0;
+        let mut buf_len = 0;
 
-        let mut bytes_sent = 0;
+        let mut resend = 0;
+        let mut cursor = 0;
         let id: FileId = loop {
-            // It could happen, that we still have data to send from the previous iteration.
-            // This is possible, because google might not consume everything we send,
-            // i.e. indicate with the range header that it has not consumed the entire bytes.
-            // We carry over the remaining bytes into the next iteration and send them again
-            // along with new data, if possible.
-            let read = src.read(&mut buf[offset..]).await?;
-            let send_buffer = &buf[..offset + read];
+            if resend == 0 {
+                buf_len = 0;
+                while buf_len < Self::CHUNKSIZE {
+                    let just_read = src.read(&mut buf[buf_len..]).await?;
+                    if just_read == 0 {
+                        break;
+                    }
 
-            let range_header = &format!(
-                "bytes {}-{}/{}",
-                bytes_sent,
-                bytes_sent + send_buffer.len() - 1,
-                len
-            );
+                    buf_len += just_read;
+                }
+            }
+            let send_buffer = &buf[0..buf_len];
 
-            let req = Request::put(resumable_session_url)
-                .header(http::header::CONTENT_RANGE, range_header)
-                .header(http::header::CONTENT_LENGTH, send_buffer.len())
-                .body(send_buffer.to_vec())?;
+            let mut req = Request::put(resumable_session_url)
+                .header(http::header::CONTENT_LENGTH, send_buffer.len());
+            if send_buffer.len() > 0 {
+                let range_header = &format!(
+                    "bytes {}-{}/{}",
+                    cursor,
+                    cursor + send_buffer.len() - 1,
+                    len
+                );
+
+                req = req.header(http::header::CONTENT_RANGE, range_header);
+            }
+            let req = req.body(send_buffer.to_vec())?;
 
             // Note how the retrying will end up cloning the body
             // contained in this request. But the "body" is just a *reference* to an array,
             // and cloning a reference is cheap.
-            let resp = self.send_retry(req).await?;
+            let resp = self.client.execute(req.try_into().unwrap()).await?;
             match resp.status().as_u16() {
                 // Success. We are done, extract the field and return it
                 200..=299 => break resp.json().await?,
@@ -423,21 +432,13 @@ impl DriveApi {
                         let (from, to) = parse_range_header(range.to_str().unwrap());
                         assert_eq!(from, 0, "range header indicates that remote has not receveived the beginning of a file but has received later parts");
 
-                        let bytes_received = 1 + to - bytes_sent;
-                        bytes_sent += bytes_received;
+                        let bytes_received = 1 + to - cursor;
 
-                        if bytes_received < buf.len() {
-                            // FIXME: This path is very cold and completely untested
-
-                            // If remote has not processed the whole data, carry this over into the
-                            // next iteration...
-                            buf.copy_within(0..bytes_received, 0);
-
-                            //...but we also have to care to not overwrite this data with fresh data
-                            offset = bytes_received;
+                        if bytes_received < send_buffer.len() {
+                            resend += 1;
                         } else {
-                            // Remote has processed everything we sent
-                            offset = 0;
+                            cursor += bytes_received;
+                            resend = 0;
                         }
                     } else {
                         // Remote has received no bytes. Loop...
@@ -446,7 +447,7 @@ impl DriveApi {
                         // FIXME: Retry here, but be careful: We must ensure that the old bytes are
                         // not overwritten, perhaps by setting offset to its maximum?
                     }
-                }
+                },
                 x => panic!("unexpected status code {}", x),
             }
         };
