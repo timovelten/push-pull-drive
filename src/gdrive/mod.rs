@@ -99,7 +99,6 @@ impl GDriveBackend {
     /// of the object Self, since it is assumed that this object is generally short lived.
     /// If only_folders is set, this returns the Error::NotAFolder if *something* exists at the given
     /// relative path, but it is not a folder.
-    /// FIXME: Handroll this recursion to avoid async_recursion
     #[async_recursion]
     async fn get_drive_id_advanced(
         &self,
@@ -107,6 +106,9 @@ impl GDriveBackend {
         use_cache: bool,
         only_folders: bool,
     ) -> crate::Result<String> {
+        // Trust me: It's not worth it to do this non-recursively, even if we then could
+        // avoid the heap allocation thats caused by async_recursion.
+
         // Check if its cached
         if use_cache {
             if let Some(x) = self.id_cache.get(relative_name) {
@@ -162,12 +164,7 @@ impl GDriveBackend {
             }
         }
 
-        if let Some(ret) = ret {
-            self.id_cache.update(relative_name, &ret);
-            Ok(ret)
-        } else {
-            Err(Error::NotFound(relative_name.to_string()))
-        }
+        ret.ok_or_else(|| Error::NotFound(relative_name.to_string()))
     }
 
     async fn get_drive_id(&self, relative_name: &str) -> crate::Result<String> {
@@ -214,37 +211,6 @@ impl GDriveBackend {
 #[async_trait]
 impl FileRepository for GDriveBackend {
     type Reader = Box<dyn AsyncRead + Unpin + Send>;
-
-    async fn read_dir(&self, relative_name: &str) -> crate::Result<Vec<crate::PathInfo>> {
-        let id = self.get_drive_id(relative_name).await?;
-
-        let files = self
-            .make_drive_api().await?
-            .file_list_all(&format!("'{id}' in parents and trashed=false")).await?;
-        let ret = files
-            .into_iter()
-            .filter_map(|x| {
-                let rel = append_to_relative_name(relative_name, &x.name);
-                match (x.size, x.sha1_checksum, x.mime_type.as_str()) {
-                    (Some(size), Some(sha1), _) => Some(PathInfo::File(crate::FileInfo {
-                        relative_name: rel,
-                        size,
-                        modified: x.modified_time,
-                        hash: Some(sha1),
-                    })),
-                    (_, _, "application/vnd.google-apps.folder") => {
-                        Some(PathInfo::Dir(crate::DirectoryInfo { relative_name: rel }))
-                    }
-                    (_, _, _) => {
-                        // Skip types we cannot cateogorize into file / folder
-                        None
-                    }
-                }
-            })
-            .collect::<Vec<_>>();
-
-        Ok(ret)
-    }
 
     async fn read_file(&self, relative_name: &str) -> crate::Result<(Self::Reader, u64)> {
         let id = self.get_drive_id(relative_name).await?;

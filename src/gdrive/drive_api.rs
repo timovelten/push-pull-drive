@@ -406,6 +406,7 @@ impl DriveApi {
 
             let req = Request::put(resumable_session_url)
                 .header(http::header::CONTENT_RANGE, range_header)
+                .header(http::header::CONTENT_LENGTH, send_buffer.len())
                 .body(send_buffer.to_vec())?;
 
             // Note how the retrying will end up cloning the body
