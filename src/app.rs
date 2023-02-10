@@ -17,8 +17,9 @@ use tokio::task::spawn_blocking;
 use crate::backend::FileRepository;
 use crate::progress::{ProgressReporter, AsyncReadWithProgress};
 use crate::util::PathListExt;
-use crate::{db, App, Error, PathInfo, append_to_relative_name};
+use crate::{db, App, Error, PathInfo, append_to_relative_name, pop_relative_name};
 use crate::{db::TrackedFile, FileChange};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -57,7 +58,7 @@ impl<L: FileRepository, R: FileRepository> App for DefaultApp<L, R> {
 
     fn status_cmd(&self, ignore_index: bool) -> crate::Result<()> {
         let status = self.rt.block_on(async {
-            self.status(&self.local, ignore_index).await
+            self.status(&self.local, ignore_index, &[self.cwd.clone()]).await
         })?;
         self.print_status(&status);
 
@@ -66,7 +67,7 @@ impl<L: FileRepository, R: FileRepository> App for DefaultApp<L, R> {
 
     fn remote_status_cmd(&self, ignore_index: bool) -> crate::Result<()> {
         let status = self.rt.block_on(async {
-            self.status(&self.remote, ignore_index).await
+            self.status(&self.remote, ignore_index, &[self.cwd.clone()]).await
         })?;
         self.print_status(&status);
 
@@ -219,30 +220,31 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         }
     }
 
-    /// Determine how the files in the given repo have changed from the index we have in
-    /// our database. If ignore_index is given, this will effectively list all files in the repo
-    /// as new.
-    async fn status<T: FileRepository>(
+    /// Generates a StatusReport for directory `dir`, where `dir` is a relative name.
+    async fn status_of_dir<T: FileRepository>(
         &self,
         repo: &T,
-        ignore_index: bool
+        ignore_index: bool,
+        dir: &str
     ) -> crate::Result<StatusReport> {
         let mut ret: Vec<FileChange> = Vec::new();
 
         let tfs = self
             .db
-            .get_all_tracked_files(&self.cwd)?
+            .get_all_tracked_files(dir)?
             .into_iter()
             .map(|tf| (tf.relative_name.to_owned(), tf))
             .collect::<HashMap<_, _>>();
 
-        println!("Retrieving files...");
-        let all_files_in_repo = repo.read_dir_all(&self.cwd).await?;
+        let all_files_in_repo = repo.read_dir_all(dir).await?;
         
         for file in &all_files_in_repo {
             if let PathInfo::File(info) = file {
-                let tf = (!ignore_index).then(|| tfs.get(&info.relative_name))
-                    .flatten();
+                let tf = if !ignore_index {
+                    tfs.get(&info.relative_name)
+                } else {
+                    None
+                };
 
                 if let Some(tf) =  tf {
                     // File in repo has changed
@@ -266,6 +268,22 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         Ok(StatusReport::new(ret))
     }
 
+    async fn status<T: FileRepository>(
+        &self,
+        repo: &T,
+        ignore_index: bool,
+        dirs: &[String]
+    ) -> crate::Result<StatusReport> {
+        let mut report = StatusReport::new(vec![]);
+
+        for dir in dirs {
+            let partial_report = self.status_of_dir(repo, ignore_index, dir).await?;
+            report = report.merge_with(partial_report);
+        }
+        
+        return Ok(report);
+    }
+
     fn push_pull_cmd_helper<
         A: FileRepository,
         B: FileRepository,
@@ -278,8 +296,8 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         mut resolver: F,
     ) -> crate::Result<()> {
         // Query the changes in from. We
-        let from_status: StatusReport = self.rt.block_on(self.status(from, ignore_index))?;
-        let to_status: StatusReport = self.rt.block_on(self.status(to, ignore_index))?;
+        let from_status: StatusReport = self.rt.block_on(self.status(from, ignore_index, &[self.cwd.clone()]))?;
+        let to_status: StatusReport = self.rt.block_on(self.status(to, ignore_index, &from_status.dirs()))?;
 
         // We could probably save this allocation, but realistically, what would that accomplish.
         let mut to_be_commited = Vec::new();
@@ -446,8 +464,16 @@ struct StatusReport {
 }
 
 impl StatusReport {
+    fn cmp_func(this: &FileChange, other: &FileChange) -> Ordering {
+        this.relative_name().cmp(&other.relative_name())
+    }
+
+    fn search_func(this: &FileChange, look_for: &str) -> Ordering {
+        this.relative_name().as_str().cmp(look_for)
+    }
+
     pub fn new(mut v: Vec<FileChange>) -> Self {
-        v.sort_by(|x, y| x.relative_name().cmp(&y.relative_name()));
+        v.sort_by(Self::cmp_func);
 
         Self {
             inner: v
@@ -464,9 +490,96 @@ impl StatusReport {
 
     pub fn get<S: AsRef<str>>(&self, relative_name: S) -> Option<&FileChange> {
         let rel_name = relative_name.as_ref();
-        let idx = self.inner.binary_search_by(|x| x.relative_name().as_str().cmp(rel_name))
+        let idx = self.inner.binary_search_by(|x| Self::search_func(x, rel_name))
             .ok()?;
         Some(&self.inner[idx])
     }
+
+    /// Returns the relative names of the directories contained in this StatusReport
+    pub fn dirs(&self) -> Vec<String> {
+        let mut ret: Vec<String> = Vec::new();
+
+        for ch in self.inner() {
+            let (dir, _) = pop_relative_name(&ch.relative_name());
+            let mut add = true;
+            if let Some(s) = ret.last() {
+                if s == dir {
+                    add = false;
+                }
+            }
+
+            if add {
+                ret.push(dir.to_owned());
+            }
+        }
+
+        ret
+    }
+
+    pub fn merge_with(self, other: StatusReport) -> StatusReport {
+        // Merging two sorted lists...that should be linear. Lets see if I can do it..
+        let mut vec1 = self.into_inner().into_iter().peekable();
+        let mut vec2 = other.into_inner().into_iter().peekable();
+
+        let mut res = Vec::new();
+        loop {
+            let next1 = vec1.peek();
+            let next2 = vec2.peek();
+            match (next1, next2) {
+                (Some(f), Some(g)) => {
+                    let order = Self::cmp_func(f, g);
+                    match order {
+                        Ordering::Equal | Ordering::Less => res.push(vec1.next().unwrap()),
+                        Ordering::Greater => res.push(vec2.next().unwrap()),
+                    }
+                },
+                (Some(_), None) => res.push(vec1.next().unwrap()),
+                (None, Some(_)) => res.push(vec2.next().unwrap()),
+                (None, None) => break,
+            }
+        }
+
+        return StatusReport { inner: res }
+    }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_status_report_merging() {
+        let report1 = StatusReport::new(
+            vec![
+                FileChange::Deleted { relative_name: "dir/a/b/c".to_owned() },
+                FileChange::Deleted { relative_name: "dir/a/a/b".to_owned() },
+                FileChange::Deleted { relative_name: "dir/a/c/d".to_owned() },
+            ]
+        );
+
+        let report2 = StatusReport::new(
+            vec![
+                FileChange::Deleted { relative_name: "z/a/b/c".to_owned() },
+                FileChange::Deleted { relative_name: "zz/a/b/c".to_owned() },
+                FileChange::Deleted { relative_name: "dir/a/b/b".to_owned() },
+                FileChange::Deleted { relative_name: "dir/a/a/a".to_owned() },
+            ]
+        );
+
+        let merged = report1.merge_with(report2).into_inner()
+            .into_iter()
+            .map(|x| x.relative_name().clone())
+            .collect::<Vec<_>>();
+
+        // Is it sorted?
+        let mut sorted = true;
+        for i in 1..merged.len() {
+            if merged[i - 1].cmp(&merged[i]) == Ordering::Greater {
+                sorted = false;
+                break;
+            }
+        }
+
+        assert!(sorted)
+    }
+}
