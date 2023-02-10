@@ -3,6 +3,8 @@ use std::fmt::Write;
 use http::Request;
 use time::OffsetDateTime;
 
+use crate::PathInfo;
+
 pub fn u8_slice_to_hex_string(slice: &[u8]) -> String {
     let mut ret = String::with_capacity(slice.len() * 2);
     for b in slice {
@@ -51,6 +53,29 @@ mod tests {
 
     #[test]
     fn verify_hex_lowercase() {
-        assert_eq!(u8_slice_to_hex_string(&[0xde, 0xad, 0xca, 0xfe, 0x1a, 0x2b, 0x3c, 0x4d]), "deadcafe1a2b3c4d")
+        assert_eq!(
+            u8_slice_to_hex_string(&[0xde, 0xad, 0xca, 0xfe, 0x1a, 0x2b, 0x3c, 0x4d]),
+            "deadcafe1a2b3c4d"
+        )
+    }
+}
+
+pub trait PathListExt {
+    fn sort_by_relative_name(&mut self);
+    fn get_by_relative_name(&self, relative_name: &str) -> Option<&PathInfo>;
+    fn contains_relative_name(&self, relative_name: &str) -> bool {
+        self.get_by_relative_name(relative_name).is_some()
+    }
+}
+
+impl PathListExt for Vec<PathInfo> {
+    fn sort_by_relative_name(&mut self) {
+        self.sort_by(|x, y| x.relative_name().cmp(y.relative_name()))
+    }
+
+    fn get_by_relative_name(&self, relative_name: &str) -> Option<&PathInfo> {
+        self.binary_search_by(|x| x.relative_name().cmp(relative_name))
+            .ok()
+            .map(|i| &self[i])
     }
 }

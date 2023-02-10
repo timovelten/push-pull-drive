@@ -1,4 +1,3 @@
-use std::backtrace;
 use std::io::ErrorKind;
 use std::time::Duration;
 use std::{fmt::Display, str::FromStr};

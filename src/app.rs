@@ -16,10 +16,10 @@ use tokio::task::spawn_blocking;
 
 use crate::backend::FileRepository;
 use crate::progress::{ProgressReporter, AsyncReadWithProgress};
+use crate::util::PathListExt;
 use crate::{db, App, Error, PathInfo, append_to_relative_name};
 use crate::{db::TrackedFile, FileChange};
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::io::Write;
 
 pub struct DefaultApp<L, R> {
@@ -55,28 +55,28 @@ impl<L: FileRepository, R: FileRepository> App for DefaultApp<L, R> {
         Err(Error::AlreadyInitialized)
     }
 
-    fn status_cmd(&self) -> crate::Result<()> {
+    fn status_cmd(&self, ignore_index: bool) -> crate::Result<()> {
         let status = self.rt.block_on(async {
-            self.status(&self.local, false).await
+            self.status(&self.local, ignore_index).await
         })?;
         self.print_status(&status);
 
         Ok(())
     }
 
-    fn remote_status_cmd(&self) -> crate::Result<()> {
+    fn remote_status_cmd(&self, ignore_index: bool) -> crate::Result<()> {
         let status = self.rt.block_on(async {
-            self.status(&self.remote, false).await
+            self.status(&self.remote, ignore_index).await
         })?;
         self.print_status(&status);
 
         Ok(())
     }
 
-    fn pull_cmd(&self, yes: bool) -> crate::Result<()> {
-        self.push_pull_cmd_helper(&self.remote, &self.local, yes, |theirs, ours| {
+    fn pull_cmd(&self, ignore_index: bool, yes: bool) -> crate::Result<()> {
+        self.push_pull_cmd_helper(&self.remote, &self.local, ignore_index, |theirs, ours| {
             // If our file was deleted, we put there whatever remote has done ever since
-            if ours.is_deleted() {
+            if ours.is_deleted() || yes {
                 return true;
             }
             
@@ -101,11 +101,11 @@ impl<L: FileRepository, R: FileRepository> App for DefaultApp<L, R> {
         })
     }
 
-    fn push_cmd(&self, yes: bool) -> crate::Result<()> {
-        self.push_pull_cmd_helper(&self.local, &self.remote, yes, |ours, theirs| {
+    fn push_cmd(&self, ignore_index: bool, yes: bool) -> crate::Result<()> {
+        self.push_pull_cmd_helper(&self.local, &self.remote, ignore_index, |ours, theirs| {
             // If the file was deleted remotely, there isn't really a conflict; we can just push our file and
             // be done.
-            if theirs.is_deleted() {
+            if theirs.is_deleted() || yes {
                 return true;
             }
 
@@ -236,50 +236,30 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
             .map(|tf| (tf.relative_name.to_owned(), tf))
             .collect::<HashMap<_, _>>();
 
-        let mut all_files_in_repo = HashSet::new();
-
-        // Walking the file structure is really not that complicated, since we
-        // do not really care about order
-        let mut next_directories = vec![self.cwd.clone()];
-
         println!("Retrieving files...");
-
-        while next_directories.len() > 0 {
-            let files = repo.read_dirs(next_directories).await?;
-            next_directories = Vec::new();
-
-            for path_info in files {
-                match path_info {
-                    PathInfo::Dir(dir) => next_directories.push(dir.relative_name),
-                    PathInfo::File(info) => {
-                        all_files_in_repo.insert(info.relative_name.clone());
-
-                        let tf = if !ignore_index {
-                            tfs.get(&info.relative_name)
-                        } else {
-                            None
-                        };
-
-                        if let Some(tf) =  tf {
-                            debug_assert_eq!(tf.relative_name, info.relative_name);
+        let all_files_in_repo = repo.read_dir_all(&self.cwd).await?;
         
-                            // This file exists in the remote, and we track it. So check if it was modified.
-                            if info.is_newer_than(&tf.clone().into()) {
-                                ret.push(FileChange::Modified(info));
-                            }
-                        } else {
-                            // Remote file is new
-                            ret.push(FileChange::New(info));
-                        }
+        for file in &all_files_in_repo {
+            if let PathInfo::File(info) = file {
+                let tf = (!ignore_index).then(|| tfs.get(&info.relative_name))
+                    .flatten();
+
+                if let Some(tf) =  tf {
+                    // File in repo has changed
+                    if info.is_newer_than(&tf.clone().into()) {
+                        ret.push(FileChange::Modified(info.clone()));
                     }
+                } else {
+                    // File in repo is untracked, i.e. new
+                    ret.push(FileChange::New(info.clone()));
                 }
             }
         }
 
         // Finally, use the list of files we built to determine which of tracked files were deleted
         for (_, tf) in tfs {
-            if !all_files_in_repo.contains(&tf.relative_name) {
-                ret.push(FileChange::Deleted { relative_name: tf.relative_name.clone() });
+            if !all_files_in_repo.contains_relative_name(&tf.relative_name) {
+                ret.push(FileChange::Deleted { relative_name: tf.relative_name });
             }
         }
 
@@ -294,22 +274,12 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
         &self,
         from: &A,
         to: &B,
-        yes: bool,
+        ignore_index: bool,
         mut resolver: F,
     ) -> crate::Result<()> {
         // Query the changes in from. We
-        let from_status = self.rt.block_on(async {
-            self.status(from, false).await
-        })?;
-
-        // If the user wants to not check for conflicts, we do not even need the remote status
-        let to_status = if yes {
-            StatusReport::new(Vec::new())
-        } else {
-            self.rt.block_on(async {
-                self.status(to, false).await
-            })?
-        };
+        let from_status: StatusReport = self.rt.block_on(self.status(from, ignore_index))?;
+        let to_status: StatusReport = self.rt.block_on(self.status(to, ignore_index))?;
 
         // We could probably save this allocation, but realistically, what would that accomplish.
         let mut to_be_commited = Vec::new();

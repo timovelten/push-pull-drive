@@ -63,13 +63,29 @@ enum Commands {
         backend: Backends,
     },
     /// Show status of local files
-    Status,
+    Status {
+        #[arg(long)]
+        ignore_index: bool
+    },
     /// Show status of remote files
-    RemoteStatus,
+    RemoteStatus {
+        #[arg(long)]
+        ignore_index: bool,
+    },
     /// Pull modified / new remote files and deletions into the local state
-    Pull,
+    Pull {
+        #[arg(long)]
+        ignore_index: bool,
+        #[arg(long)]
+        yes: bool
+    },
     /// Push local modified / new files and deletions to the remote
-    Push,
+    Push {
+        #[arg(long)]
+        ignore_index: bool,
+        #[arg(long)]
+        yes: bool
+    },
     RemoteLs {
         path: Option<String>,
     },
@@ -125,10 +141,10 @@ fn main() {
 
 trait App {
     fn init_cmd(&self, b: Backends) -> crate::Result<()>;
-    fn status_cmd(&self) -> crate::Result<()>;
-    fn remote_status_cmd(&self) -> crate::Result<()>;
-    fn pull_cmd(&self, yes: bool) -> crate::Result<()>;
-    fn push_cmd(&self, yes: bool) -> crate::Result<()>;
+    fn status_cmd(&self, ignore_index: bool) -> crate::Result<()>;
+    fn remote_status_cmd(&self, ignore_index: bool) -> crate::Result<()>;
+    fn pull_cmd(&self, ignore_index: bool, yes: bool) -> crate::Result<()>;
+    fn push_cmd(&self, ignore_index: bool, yes: bool) -> crate::Result<()>;
     fn remote_ls(&self, path: Option<String>) -> crate::Result<()>;
 }
 
@@ -141,10 +157,10 @@ fn handle_command(cmd: Commands) -> crate::Result<()> {
 
     match cmd {
         Commands::Init { backend } => app.init_cmd(backend)?,
-        Commands::Pull => app.pull_cmd(false)?,
-        Commands::Push => app.push_cmd(false)?,
-        Commands::Status => app.status_cmd()?,
-        Commands::RemoteStatus => app.remote_status_cmd()?,
+        Commands::Pull { ignore_index, yes } => app.pull_cmd(ignore_index, yes)?,
+        Commands::Push { ignore_index, yes } => app.push_cmd(ignore_index, yes)?,
+        Commands::Status { ignore_index } => app.status_cmd(ignore_index)?,
+        Commands::RemoteStatus { ignore_index } => app.remote_status_cmd(ignore_index)?,
         Commands::RemoteLs { path } => app.remote_ls(path)?,
     };
 
@@ -355,23 +371,23 @@ impl App for UninitializedApp {
         Ok(())
     }
 
-    fn status_cmd(&self) -> crate::Result<()> {
-        Err(Error::NoConfigFound)
-    }
-
-    fn remote_status_cmd(&self) -> crate::Result<()> {
-        Err(Error::NoConfigFound)
-    }
-
-    fn pull_cmd(&self, _yes: bool) -> crate::Result<()> {
-        Err(Error::NoConfigFound)
-    }
-
-    fn push_cmd(&self, _yes: bool) -> crate::Result<()> {
-        Err(Error::NoConfigFound)
-    }
-
     fn remote_ls(&self, _s: Option<String>) -> crate::Result<()> {
+        Err(Error::NoConfigFound)
+    }
+
+    fn status_cmd(&self, _ignore_index: bool) -> crate::Result<()> {
+        Err(Error::NoConfigFound)
+    }
+
+    fn remote_status_cmd(&self, _ignore_index: bool) -> crate::Result<()> {
+        Err(Error::NoConfigFound)
+    }
+
+    fn pull_cmd(&self, _ignore_index: bool, _yes: bool) -> crate::Result<()> {
+        Err(Error::NoConfigFound)
+    }
+
+    fn push_cmd(&self, _ignore_index: bool, _yes: bool) -> crate::Result<()> {
         Err(Error::NoConfigFound)
     }
 }
