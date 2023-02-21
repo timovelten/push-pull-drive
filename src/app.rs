@@ -276,9 +276,22 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
     ) -> crate::Result<StatusReport> {
         let mut report = StatusReport::new(vec![]);
 
+        let mut all_not_found = true;
+
         for dir in dirs {
-            let partial_report = self.status_of_dir(repo, ignore_index, dir).await?;
-            report = report.merge_with(partial_report);
+            let partial_report = self.status_of_dir(repo, ignore_index, dir).await;
+            match partial_report {
+                Ok(partial_report) => {
+                    report = report.merge_with(partial_report);
+                    all_not_found = false;
+                }
+                Err(Error::NotFound(_)) => {},
+                Err(err) => return Err(err)
+            };
+        }
+
+        if all_not_found {
+            return Err(Error::NotFound(format!("all directories passed to status do not exist. {:?}", dirs)));
         }
         
         return Ok(report);
@@ -297,7 +310,11 @@ impl<L: FileRepository, R: FileRepository> DefaultApp<L, R> {
     ) -> crate::Result<()> {
         // Query the changes in from. We
         let from_status: StatusReport = self.rt.block_on(self.status(from, ignore_index, &[self.cwd.clone()]))?;
-        let to_status: StatusReport = self.rt.block_on(self.status(to, ignore_index, &from_status.dirs()))?;
+        let to_status: StatusReport = match self.rt.block_on(self.status(to, ignore_index, &from_status.dirs())) {
+            Ok(status) => status,
+            Err(Error::NotFound(_)) => StatusReport::new(vec![]),
+            Err(err) => return Err(err)
+        };
 
         // We could probably save this allocation, but realistically, what would that accomplish.
         let mut to_be_commited = Vec::new();
