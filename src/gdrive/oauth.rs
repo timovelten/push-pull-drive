@@ -52,7 +52,7 @@ pub fn sign_in(client: BasicClient) -> crate::Result<(FatAccessToken, RefreshTok
         .url();
 
     println!(
-        "Open this URL in tour browser\n\n{}\n",
+        "Open this URL in your browser\n\n{}\n",
         authorize_url.to_string()
     );
 

@@ -57,6 +57,8 @@ pub struct FileInfo {
     pub relative_name: String,
     pub size: u64,
     pub modified: time::OffsetDateTime,
+    /// TODO: Document that we explicitly do not specify at this point if this is md5 or something
+    /// else. How (and if at all) this value is interpreted is up to the backend.
     pub hash: Option<HashValue>,
 }
 
@@ -68,6 +70,7 @@ pub struct DirectoryInfo {
 impl FileInfo {
     pub fn is_newer_than(&self, other: &Self) -> bool {
         // TODO: What if hash is lower cased hex?
+        // FIXME TODO: The hash == down there is wrong???
         let ret = self.size != other.size
             || self.modified > other.modified
             // Note that we do not have to explicitly verify that other is_some()
