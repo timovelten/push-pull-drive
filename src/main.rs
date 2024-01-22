@@ -1,13 +1,13 @@
 mod app;
 mod backend;
-mod local;
 mod db;
 mod error;
 mod fileinfo;
 mod gdrive;
+mod local;
 mod paths;
-mod util;
 mod progress;
+mod util;
 
 use crate::{app::DefaultApp, local::LocalBackend};
 use clap::{Parser, Subcommand};
@@ -65,7 +65,7 @@ enum Commands {
     /// Show status of local files
     Status {
         #[arg(long)]
-        ignore_index: bool
+        ignore_index: bool,
     },
     /// Show status of remote files
     RemoteStatus {
@@ -77,14 +77,14 @@ enum Commands {
         #[arg(long)]
         ignore_index: bool,
         #[arg(long)]
-        yes: bool
+        yes: bool,
     },
     /// Push local modified / new files and deletions to the remote
     Push {
         #[arg(long)]
         ignore_index: bool,
         #[arg(long)]
-        yes: bool
+        yes: bool,
     },
     RemoteLs {
         path: Option<String>,
@@ -122,9 +122,7 @@ fn main() {
         let target = if path == "-" {
             Target::Stdout
         } else {
-            let f: Box<File> = File::create(path)
-                .expect("could not open log file")
-                .into();
+            let f: Box<File> = File::create(path).expect("could not open log file").into();
             Target::Pipe(f)
         };
 

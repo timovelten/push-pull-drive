@@ -1,14 +1,14 @@
 mod credential;
 mod drive_api;
-pub mod oauth;
 mod extensions;
+pub mod oauth;
 
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 pub use credential::{FatAccessToken, GoogleCredential};
 use futures::{AsyncRead, StreamExt};
 use pin_project::pin_project;
-use tokio::sync::{Semaphore, OwnedSemaphorePermit};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     append_to_relative_name, backend::FileRepository, gdrive::drive_api::DriveApi,
@@ -16,7 +16,7 @@ use crate::{
 };
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex}
+    sync::{Arc, Mutex},
 };
 
 use self::drive_api::FilesReq;
@@ -50,13 +50,13 @@ pub struct SemaphoreGuarded<T> {
     inner: T,
 }
 
-impl <T> SemaphoreGuarded<T> {
+impl<T> SemaphoreGuarded<T> {
     fn into_permit(self) -> OwnedSemaphorePermit {
         self.permit
     }
 }
 
-impl <T> std::ops::Deref for SemaphoreGuarded<T> {
+impl<T> std::ops::Deref for SemaphoreGuarded<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -64,21 +64,22 @@ impl <T> std::ops::Deref for SemaphoreGuarded<T> {
     }
 }
 
-impl <T> AsyncRead for SemaphoreGuarded<T> where T: AsyncRead {
+impl<T> AsyncRead for SemaphoreGuarded<T>
+where
+    T: AsyncRead,
+{
     fn poll_read(
-            self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &mut [u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
         self.project().inner.as_mut().poll_read(cx, buf)
     }
 }
 
 impl GDriveBackend {
     pub fn new(credential: GoogleCredential) -> Self {
-        let client = reqwest::Client::builder()
-            .build()
-            .unwrap();
+        let client = reqwest::Client::builder().build().unwrap();
 
         Self {
             sem: Arc::new(Semaphore::new(8)),
@@ -90,12 +91,9 @@ impl GDriveBackend {
     }
 
     async fn make_drive_api(&self) -> crate::Result<SemaphoreGuarded<DriveApi>> {
-        let permit = self.sem.clone().acquire_owned().await.unwrap(); 
-        let inner = DriveApi::new(
-            self.client.clone(),
-            self.credential.get_or_refresh_token()?,
-        );
-        
+        let permit = self.sem.clone().acquire_owned().await.unwrap();
+        let inner = DriveApi::new(self.client.clone(), self.credential.get_or_refresh_token()?);
+
         Ok(SemaphoreGuarded { permit, inner })
     }
 
@@ -130,11 +128,12 @@ impl GDriveBackend {
             self.id_cache.update(relative_name, &f.id);
             return Ok(f.id);
         }
-        
+
         // If not, find our parent, get its id, list its contents. We should be in that list.
         let (parent_relative_name, _) = pop_relative_name(relative_name);
-        let parent_id =
-            self.get_drive_id_advanced(parent_relative_name, use_cache, only_folders).await?;
+        let parent_id = self
+            .get_drive_id_advanced(parent_relative_name, use_cache, only_folders)
+            .await?;
 
         // It would be possible here to only list the folders first, and check if
         // we are looking for a folder. This would only really be worth it when one assumes that
@@ -211,7 +210,7 @@ impl GDriveBackend {
         if relative_name == "" {
             return self.get_drive_id("").await;
         }
-        
+
         let _lock = self.mkdir_lock.lock().await;
         self.mkdir_all_impl(relative_name).await
     }
@@ -226,7 +225,7 @@ impl FileRepository for GDriveBackend {
         let drive_api = self.make_drive_api().await?;
 
         let (inner, len) = drive_api.files_get_alt_media(&id, None).await?;
-        
+
         // This is still open! We need to ensure that the connections to Google stays below
         // the limit we set out in the beginning. Otherwise, what is the point
         // of doing this at all.
@@ -235,11 +234,19 @@ impl FileRepository for GDriveBackend {
         Ok((Box::new(SemaphoreGuarded { permit, inner }), len))
     }
 
-    async fn write_file<R: AsyncRead + Send>(&self, relative_name: &str, src: R, len: u64) -> crate::Result<()> {
+    async fn write_file<R: AsyncRead + Send>(
+        &self,
+        relative_name: &str,
+        src: R,
+        len: u64,
+    ) -> crate::Result<()> {
         match self.get_drive_id(relative_name).await {
             Ok(id) => {
                 // The file already exists, update it...
-                self.make_drive_api().await?.files_update_upload(&id, src, len).await?;
+                self.make_drive_api()
+                    .await?
+                    .files_update_upload(&id, src, len)
+                    .await?;
             }
             Err(Error::NotFound(_)) => {
                 // We need to create the file. For that, we need to place it in the right path
@@ -256,8 +263,9 @@ impl FileRepository for GDriveBackend {
                             ..Default::default()
                         },
                         src,
-                        len
-                    ).await?
+                        len,
+                    )
+                    .await?
                     .id;
 
                 self.id_cache.update(relative_name, &id);
@@ -285,13 +293,16 @@ impl FileRepository for GDriveBackend {
     ) -> crate::Result<()> {
         let id = self.get_drive_id(relative_name).await?;
 
-        self.make_drive_api().await?.files_update(
-            &id,
-            FilesReq {
-                modified_time: Some(modtime),
-                ..Default::default()
-            },
-        ).await?;
+        self.make_drive_api()
+            .await?
+            .files_update(
+                &id,
+                FilesReq {
+                    modified_time: Some(modtime),
+                    ..Default::default()
+                },
+            )
+            .await?;
 
         Ok(())
     }
@@ -334,33 +345,33 @@ impl FileRepository for GDriveBackend {
                 for i in 0..rns_chunk.len() {
                     ids.insert(i, self.get_drive_id(rns_chunk[i].as_ref()).await?);
                 }
-    
+
                 let mut q = ids
                     .iter()
                     .map(|id| format!("'{id}' in parents"))
                     .collect::<Vec<String>>()
                     .join(" or ");
-    
+
                 q = format!("({q}) and trashed = false");
-    
+
                 let files = self.make_drive_api().await?.file_list_all(&q).await?;
-    
+
                 for file in files {
                     let parent_id = match file.parents {
                         Some([x]) => x,
                         _ => panic!("unexpectedly got file without parents"),
                     };
-    
+
                     let parent_relative_name_idx = ids
                         .iter()
                         .position(|id| id == &parent_id)
                         .expect("failed to find path of parent");
-    
+
                     let relative_name = append_to_relative_name(
                         rns_chunk[parent_relative_name_idx].as_ref(),
                         &file.name,
                     );
-    
+
                     let pathinfo = match (file.size, file.sha1_checksum, file.mime_type.as_str()) {
                         (Some(size), Some(sha1), _) => Some(PathInfo::File(crate::FileInfo {
                             relative_name,
@@ -377,7 +388,7 @@ impl FileRepository for GDriveBackend {
                             None
                         }
                     };
-    
+
                     if let Some(pathinfo) = pathinfo {
                         res.push(pathinfo);
                     }
@@ -385,12 +396,11 @@ impl FileRepository for GDriveBackend {
 
                 Ok::<_, crate::Error>(res)
             };
-            
+
             fts.push(ft);
         }
 
-        let mut stream = futures::stream::iter(fts)
-            .buffer_unordered(crate::CONCURRENT_FUTURES);
+        let mut stream = futures::stream::iter(fts).buffer_unordered(crate::CONCURRENT_FUTURES);
 
         let mut ret = Vec::new();
         while let Some(res) = stream.next().await {
