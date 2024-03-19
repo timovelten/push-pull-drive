@@ -3,12 +3,13 @@ use std::time::Duration;
 use std::{fmt::Display, str::FromStr};
 
 use crate::util::clone_request;
-use crate::Error;
 
 use super::extensions::RequestBuilderExt;
 use super::extensions::UrlExt;
+use super::Error;
+use anyhow::{anyhow, Context};
 use futures::{AsyncRead, AsyncReadExt, TryStreamExt};
-use http::Request;
+use http::{Request, StatusCode};
 use oauth2::AccessToken;
 use rand::Rng;
 use reqwest::Body;
@@ -24,7 +25,7 @@ use url::Url;
 // See https://stackoverflow.com/questions/44301748/how-can-i-deserialize-an-optional-field-with-custom-functions-using-serde
 // for why we need the [serde(default)]
 
-const EMPTY_BODY: &'static [u8] = &[];
+const EMPTY_BODY: &[u8] = &[];
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +52,15 @@ pub struct FileId {
 impl File {
     pub fn is_folder(&self) -> bool {
         self.size.is_none() && self.mime_type == "application/vnd.google-apps.folder"
+    }
+
+    /// Convert the hexadecimal checksum sent by google to its bytes. Note that this returns an empty vector
+    /// if it is missing.
+    pub fn sha1_checksum_as_bytes(&self) -> Vec<u8> {
+        self.sha1_checksum
+            .as_ref()
+            .map(|sha1| hex::decode(sha1).expect("sha1checksum should be valid hex"))
+            .unwrap_or_default()
     }
 }
 
@@ -97,7 +107,7 @@ impl DriveApi {
     async fn send_retry<B: Clone + Into<Body>>(
         &self,
         req: Request<B>,
-    ) -> crate::Result<reqwest::Response> {
+    ) -> anyhow::Result<reqwest::Response> {
         const MAXIMUM_DELAY: Duration = Duration::from_secs(32);
 
         let mut delay = Duration::from_secs(1);
@@ -105,7 +115,7 @@ impl DriveApi {
             let converted_req: reqwest::Request = clone_request(&req).try_into().unwrap();
             let resp = self.client.execute(converted_req).await;
 
-            let (err, should_retry): (crate::Error, bool) = match resp {
+            let (err, should_retry): (_, bool) = match resp {
                 Ok(resp) => {
                     let status = resp.status();
 
@@ -127,7 +137,7 @@ impl DriveApi {
                                 .and_then(|x| x.get("error"))
                                 .and_then(|x| x.get("errors"))
                                 .and_then(|x| x.as_array())
-                                .and_then(|x| x.get(0))
+                                .and_then(|x| x.first())
                                 .and_then(|x| x.get("reason"))
                                 .and_then(|x| x.as_str())
                                 .map(|x| x == "userRateLimitExceeded")
@@ -140,22 +150,19 @@ impl DriveApi {
                         // ...but everything else
                         _ => true,
                     };
-                    let res = Error::HttpStatusError {
-                        status: status.as_u16(),
-                        resp: body_str,
+                    let err = Error::HttpRequestFailed {
+                        method: req.method().clone(),
+                        uri: req.uri().clone(),
+                        code: status,
                     };
-
-                    log::warn!("A request ({:?} {:?}) failed with status {:?}.", req.method(), req.uri(), status);
-
-                    (res, should_retry)
+                    log::warn!("{err}");
+                    (anyhow!(err), should_retry)
                 }
-                Err(err) => {
-                    (err.into(), true)
-                }
+                Err(err) => (anyhow!(err), true),
             };
 
             if !should_retry || delay >= MAXIMUM_DELAY {
-                return Err(err);
+                return Err(err).with_context(|| "Maximum number of retries or time exceeded");
             }
 
             log::warn!("Retrying request ({:?} {:?})", req.method(), req.uri());
@@ -171,7 +178,7 @@ impl DriveApi {
         &self,
         q: &str,
         next_page_token: Option<&str>,
-    ) -> crate::Result<FilesListResp> {
+    ) -> anyhow::Result<FilesListResp> {
         // Our response type is hardcoded anyways, and we almost always use the same
         // fields anyway. So we just hardcode it here and move one.
         let url = Url::parse("https://www.googleapis.com/drive/v3/files").unwrap()
@@ -191,7 +198,7 @@ impl DriveApi {
     }
 
     /// Wrap file_list and keep reading until nextPageToken is None. Return the end result.
-    pub async fn file_list_all(&self, q: &str) -> crate::Result<Vec<File>> {
+    pub async fn file_list_all(&self, q: &str) -> anyhow::Result<Vec<File>> {
         let mut ret = Vec::new();
 
         let mut next_token = "".to_string();
@@ -208,7 +215,7 @@ impl DriveApi {
         Ok(ret)
     }
 
-    pub async fn files_get(&self, id: &str) -> crate::Result<File> {
+    pub async fn files_get(&self, id: &str) -> anyhow::Result<File> {
         let url = Url::parse(&format!("https://www.googleapis.com/drive/v3/files/{id}"))
             .unwrap()
             .with_query_pairs(&[(
@@ -227,7 +234,7 @@ impl DriveApi {
         &self,
         id: &str,
         bytes_range: Option<(u64, u64)>,
-    ) -> crate::Result<(Box<dyn AsyncRead + Unpin + Send>, u64)> {
+    ) -> anyhow::Result<(Box<dyn AsyncRead + Unpin + Send>, u64)> {
         let range_header = if let Some((_, _)) = bytes_range {
             todo!(
                 "make the output of this work with content length (I think right now it does not)"
@@ -248,20 +255,21 @@ impl DriveApi {
             .bearer_auth(self.token.secret())
             .body(EMPTY_BODY)?;
 
-        let resp = self.send_retry(req).await;
-
         // Including a range header does come with a problem: If the file has 0 bytes,
         // google (more or less correctly) responds with a 416 Range not satisfiable.
         // We just swallow that error if it happens.
-        if let Err(crate::Error::HttpStatusError {
-            status: 416,
-            resp: _,
-        }) = &resp
-        {
-            return Ok((Box::new(futures::io::empty()), 0));
-        }
-
-        let resp = resp?;
+        let resp = match self.send_retry(req).await {
+            Ok(resp) => resp,
+            Err(err) => match err.downcast_ref::<Error>() {
+                Some(Error::HttpRequestFailed {
+                    code: StatusCode::RANGE_NOT_SATISFIABLE,
+                    ..
+                }) => {
+                    return Ok((Box::new(futures::io::empty()), 0));
+                }
+                _ => return Err(err),
+            },
+        };
 
         let len = resp
             .headers()
@@ -290,7 +298,7 @@ impl DriveApi {
         Ok((Box::new(body_async_read), len))
     }
 
-    pub async fn files_delete(&self, id: &str) -> crate::Result<()> {
+    pub async fn files_delete(&self, id: &str) -> anyhow::Result<()> {
         let url = Url::parse(&format!("https://www.googleapis.com/drive/v3/files/{id}")).unwrap();
 
         let req = Request::delete(url.to_string())
@@ -302,7 +310,7 @@ impl DriveApi {
         Ok(())
     }
 
-    pub async fn files_create(&self, create_request: FilesReq) -> crate::Result<FileId> {
+    pub async fn files_create(&self, create_request: FilesReq) -> anyhow::Result<FileId> {
         let url = Url::parse("https://www.googleapis.com/drive/v3/files").unwrap();
 
         let req = Request::post(url.to_string())
@@ -317,7 +325,7 @@ impl DriveApi {
         create_request: FilesReq,
         src: R,
         len: u64,
-    ) -> crate::Result<FileId> {
+    ) -> anyhow::Result<FileId> {
         let url =
             Url::parse("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable")
                 .unwrap();
@@ -338,7 +346,7 @@ impl DriveApi {
         id: &str,
         src: R,
         len: u64,
-    ) -> crate::Result<FileId> {
+    ) -> anyhow::Result<FileId> {
         let url = Url::parse(&format!(
             "https://www.googleapis.com/upload/drive/v3/files/{id}?uploadType=resumable"
         ))
@@ -358,7 +366,7 @@ impl DriveApi {
         self.upload(resumable_session_url, src, len).await
     }
 
-    pub async fn files_update(&self, id: &str, update_req: FilesReq) -> crate::Result<()> {
+    pub async fn files_update(&self, id: &str, update_req: FilesReq) -> anyhow::Result<()> {
         let url = Url::parse(&format!("https://www.googleapis.com/drive/v3/files/{id}")).unwrap();
 
         let req = Request::patch(url.to_string())
@@ -379,7 +387,7 @@ impl DriveApi {
         resumable_session_url: &str,
         src: R,
         len: u64,
-    ) -> crate::Result<FileId> {
+    ) -> anyhow::Result<FileId> {
         // I have no idea what I'm doing here. I should probably read that blog
         // post "Pin and suffering" again (great title btw)
         let mut src = Box::pin(src);
@@ -405,7 +413,7 @@ impl DriveApi {
 
             let mut req = Request::put(resumable_session_url)
                 .header(http::header::CONTENT_LENGTH, send_buffer.len());
-            if send_buffer.len() > 0 {
+            if !send_buffer.is_empty() {
                 let range_header = &format!(
                     "bytes {}-{}/{}",
                     cursor,
@@ -446,7 +454,7 @@ impl DriveApi {
                         // FIXME: Retry here, but be careful: We must ensure that the old bytes are
                         // not overwritten, perhaps by setting offset to its maximum?
                     }
-                },
+                }
                 x => panic!("unexpected status code {}", x),
             }
         };

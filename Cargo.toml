@@ -7,12 +7,10 @@ edition = "2021"
 
 [dependencies]
 thiserror = "1.0"
-lazy_static = "1.4.0"
 sha1 = "0.10.5"
-filetime = "0.2.18"
 clap = { version = "4.0.23", features = ["derive"] }
-rusqlite = { version = "0.28.0", features = ["bundled", "time"] }
-time = { version = "0.3.17", features = ["serde-well-known"] }
+rusqlite = { version = "0.30.0", features = ["bundled", "time"] }
+time = { version = "0.3.31", features = ["serde-well-known"] }
 url = "2.3.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -20,16 +18,20 @@ oauth2 = { version = "4.3.0" }
 serde_urlencoded = "0.7.1"
 http = "0.2.8"
 tokio = { version = "1.22.0", features = ["full"] }
-async-trait = "0.1.59"
 async-recursion = "1.0.0"
 tokio-util = { version = "0.7.4", features = ["compat"] }
 futures = "0.3.25"
-indicatif = "0.17.2"
 reqwest = { version = "0.11.13", features = ["stream", "json"] }
 rand = "0.8.5"
-pin-project = "1.0.12"
+pin-project-lite = "0.2.13"
 log = "0.4.0"
 env_logger = "0.10.0"
+prodash = { version = "28.0.0", features = ["render-line", "render-line-crossterm"] }
+itertools = "0.12.1"
+ahash = "0.8.7"
+anyhow = "1.0.81"
+hex = "0.4.3"
+const_format = "0.2.32"
 
 [dev-dependencies]
 tempfile = "3.3.0"

@@ -3,9 +3,10 @@ use std::{
     net::TcpListener,
 };
 
+use anyhow::bail;
 use oauth2::{
-    basic::BasicClient, AuthorizationCode, CsrfToken, PkceCodeChallenge, RedirectUrl,
-    RefreshToken, Scope, TokenResponse,
+    basic::BasicClient, AuthorizationCode, CsrfToken, PkceCodeChallenge, RedirectUrl, RefreshToken,
+    Scope, TokenResponse,
 };
 use oauth2::{reqwest::http_client, AuthUrl, ClientId, ClientSecret, RevocationUrl, TokenUrl};
 use time::OffsetDateTime;
@@ -13,7 +14,7 @@ use url::Url;
 
 use super::FatAccessToken;
 
-/// oauth2 BasicClient with Google's AuthUrl, TokenUrl and RevocationUrl set. 
+/// oauth2 BasicClient with Google's AuthUrl, TokenUrl and RevocationUrl set.
 pub fn new_google_oauth_client(client_id: ClientId, client_secret: ClientSecret) -> BasicClient {
     let client = BasicClient::new(
         client_id,
@@ -51,10 +52,7 @@ pub fn sign_in(client: BasicClient) -> crate::Result<(FatAccessToken, RefreshTok
         .add_extra_param("access_type", "offline")
         .url();
 
-    println!(
-        "Open this URL in your browser\n\n{}\n",
-        authorize_url.to_string()
-    );
+    println!("Open this URL in your browser\n\n{}\n", authorize_url);
 
     let (code, ret_csrf_token) = listen_for_code(listener).unwrap();
 
@@ -73,57 +71,46 @@ pub fn sign_in(client: BasicClient) -> crate::Result<(FatAccessToken, RefreshTok
 
     let fat_token = FatAccessToken {
         access_token: token_response.access_token().clone(),
-        expires: now + token_response.expires_in().expect("no expires_in field")
+        expires: now
+            + token_response
+                .expires_in()
+                .expect("token should have expires_in field"),
     };
-    
+
     Ok((fat_token, token_response.refresh_token().unwrap().clone()))
 }
 
-fn listen_for_code(listener: TcpListener) -> Option<(AuthorizationCode, CsrfToken)> {
-    for stream in listener.incoming() {
-        if let Ok(mut stream) = stream {
-            let mut reader = BufReader::new(&stream);
+fn listen_for_code(listener: TcpListener) -> anyhow::Result<(AuthorizationCode, CsrfToken)> {
+    let Some(mut stream) = listener
+        .incoming()
+        .flatten() // Take only okay streams
+        .next()
+    else {
+        bail!("Expected exactly one incoming connection, but received none.")
+    };
 
-            let mut request_line = String::new();
-            reader.read_line(&mut request_line).unwrap();
+    let mut reader = BufReader::new(&stream);
 
-            // First part ot the request line is the HTTP Verb, we ignore that
-            let request_url = request_line.split_ascii_whitespace().nth(1).unwrap();
-            let url = Url::parse(&format!("http://localhost{request_url}")).unwrap();
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line).unwrap();
 
-            let code_pair = url
-                .query_pairs()
-                .find(|pair| {
-                    let &(ref key, _) = pair;
-                    key == "code"
-                })
-                .unwrap();
+    // First part ot the request line is the HTTP Verb, we ignore that
+    let request_url = request_line.split_ascii_whitespace().nth(1).unwrap();
+    let url = Url::parse(&format!("http://localhost{request_url}")).unwrap();
 
-            let (_, value) = code_pair;
-            let ret_code = AuthorizationCode::new(value.into_owned());
+    let (_, code) = url.query_pairs().find(|(key, _)| key == "code").unwrap();
+    let ret_code = AuthorizationCode::new(code.into_owned());
 
-            let state_pair = url
-                .query_pairs()
-                .find(|pair| {
-                    let &(ref key, _) = pair;
-                    key == "state"
-                })
-                .unwrap();
+    let (_, state) = url.query_pairs().find(|(key, _)| key == "state").unwrap();
+    let ret_state = CsrfToken::new(state.into_owned());
 
-            let (_, value) = state_pair;
-            let ret_state = CsrfToken::new(value.into_owned());
+    let message = "Go back to your terminal :)";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}",
+        message.len(),
+        message
+    );
+    stream.write_all(response.as_bytes()).unwrap();
 
-            let message = "Go back to your terminal :)";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}",
-                message.len(),
-                message
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-
-            return Some((ret_code, ret_state));
-        }
-    }
-
-    None
+    Ok((ret_code, ret_state))
 }

@@ -1,22 +1,26 @@
-use std::{task::Poll, pin::Pin};
+//! Contains functionality to track the progress of an AsyncRead operation.
+use std::{pin::Pin, task::Poll};
 
-use pin_project::pin_project;
 use futures::AsyncRead;
+use pin_project_lite::pin_project;
 
-pub trait ProgressReporter: Send {
-    fn report(&self, bytes: usize);
-    fn finish(&self);
+#[derive(Copy, Clone, Debug)]
+pub enum AsyncReadProgress {
+    Starting,
+    InProgress { bytes: usize },
+    Finished { bytes: usize },
 }
 
-#[pin_project]
-pub struct AsyncReadWithProgress<R, P> {
-    reporter: P,
-    #[pin]
-    inner: R,
-    cursor: usize,
+pin_project! {
+    pub struct AsyncReadWithProgress<R, P> {
+        reporter: P,
+        #[pin]
+        inner: R,
+        cursor: usize,
+    }
 }
 
-impl <R: AsyncRead, P: ProgressReporter> AsyncReadWithProgress<R, P> {
+impl<R: AsyncRead, P: FnMut(AsyncReadProgress)> AsyncReadWithProgress<R, P> {
     pub fn new(reader: R, reporter: P) -> Self {
         Self {
             reporter,
@@ -26,24 +30,28 @@ impl <R: AsyncRead, P: ProgressReporter> AsyncReadWithProgress<R, P> {
     }
 }
 
-impl <R: AsyncRead, P: ProgressReporter> AsyncRead for AsyncReadWithProgress<R, P> {
+impl<R: AsyncRead, P: FnMut(AsyncReadProgress)> AsyncRead for AsyncReadWithProgress<R, P> {
     fn poll_read(
-            self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &mut [u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
-        if buf.len() == 0 {
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
 
         let this = self.project();
+
+        (this.reporter)(AsyncReadProgress::Starting);
 
         match this.inner.poll_read(cx, buf) {
             // By convention, returning 0 here means either EOF or that the buffer
             // has length 0. The case where the buffer has length zero was handled above,
             // so this means EOF.
             Poll::Ready(Ok(0)) => {
-                this.reporter.finish();
+                (this.reporter)(AsyncReadProgress::Finished {
+                    bytes: *this.cursor,
+                });
                 Poll::Ready(Ok(0))
             }
             Poll::Ready(Ok(num_bytes_read)) => {
@@ -52,12 +60,12 @@ impl <R: AsyncRead, P: ProgressReporter> AsyncRead for AsyncReadWithProgress<R, 
                 // data has certainly already processed the data they received previously (in our case:
                 // successfully uploaded this data)
                 let old_cursor = *this.cursor;
-                *this.cursor +=  num_bytes_read;
-                this.reporter.report(old_cursor);
+                *this.cursor += num_bytes_read;
+                (this.reporter)(AsyncReadProgress::InProgress { bytes: old_cursor });
 
                 Poll::Ready(Ok(num_bytes_read))
-            },
-            other => other
+            }
+            other => other,
         }
     }
 }

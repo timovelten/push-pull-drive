@@ -9,7 +9,7 @@ impl UrlExt for Url {
     fn with_query_pairs<T: Serialize + ?Sized>(mut self, query: &T) -> Self {
         let mut pairs = self.query_pairs_mut();
         let serializer = serde_urlencoded::Serializer::new(&mut pairs);
-        
+
         if let Err(err) = query.serialize(serializer) {
             todo!("handle serialization error {:?}", err);
         }
@@ -31,7 +31,10 @@ impl RequestBuilderExt for http::request::Builder {
         self.header(http::header::AUTHORIZATION, format!("Bearer {}", token))
     }
 
-    fn json_body<T: ?Sized + Serialize>(mut self, value: &T) -> crate::Result<http::Request<Vec<u8>>> {
+    fn json_body<T: ?Sized + Serialize>(
+        mut self,
+        value: &T,
+    ) -> crate::Result<http::Request<Vec<u8>>> {
         self = self.header(http::header::CONTENT_TYPE, "application/json");
         Ok(self.body(serde_json::to_vec(value)?)?)
     }

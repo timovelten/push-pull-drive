@@ -1,47 +1,239 @@
+pub mod config;
+pub mod file_hasher;
+pub use config::*;
+
 use crate::{
-    backend::FileRepository,
+    file_repository::{FileRepository, RemoteRepository},
     paths,
-    util::{datetime_to_filetime, u8_slice_to_hex_string},
-    DirectoryInfo, Error, FileInfo, PathInfo,
+    util::SemaphoreGuarded,
+    DirectoryInfo, FileInfo, PathInfo,
 };
-use async_trait::async_trait;
 use futures::AsyncRead;
-use sha1::{Digest, Sha1};
-use std::{fs::File, path::PathBuf, sync::Arc};
+use std::{
+    collections::VecDeque,
+    fs::File,
+    io::{ErrorKind, Seek},
+    path::PathBuf,
+    sync::Arc,
+};
 use time::OffsetDateTime;
-use tokio::task::spawn_blocking;
+use tokio::{fs::File as TokioFile, sync::SemaphorePermit};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task::spawn_blocking,
+};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
+use self::file_hasher::{FileHasher, Sha1Hasher};
+use crate::file_repository::Error as FileRepositoryError;
+use crate::file_repository::Result as FileRepositoryResult;
+
+const CONCURRENCY_LIMIT: usize = 24;
+
 #[derive(Debug, Clone)]
-pub struct LocalBackend {
-    inner: Arc<InnerLocalBackend>,
+pub struct LocalBackend<H = Sha1Hasher> {
+    config: Arc<Config>,
+    permits: Arc<Semaphore>,
+    hasher: H,
 }
+
 #[derive(Debug, Clone)]
-struct InnerLocalBackend {
+pub struct Config {
     /// A path on the local file system. Note that although from this type definition
     /// it may look like we support non-valid-unicode paths, this is not the case
     /// and will panic at runtime.
-    root_path: PathBuf,
+    pub root_path: PathBuf,
 
     /// A list of relative_name prefixes. Any file or folder with a relative name that matches
-    /// these prefixes will not be emitted by read_dir. It is also not possible to download
-    /// or upload to there, which will produce an error.
-    /// info() will also throw an error when asked about these files.
-    ignore_prefixes: Vec<String>,
+    /// these prefixes will not be emitted by read_dir. If asked explicitly about these files,
+    /// this implementation will return an error `Error::NotAllowed(_)`
+    pub ignore_prefixes: Vec<String>,
+
+    /// Whether we should calculate hashes of files. Calculating hashes is not particularly cheap
+    /// as we can't really cache the result in any meaniningful way.
+    pub calculate_hashes: bool,
 }
 
-impl LocalBackend {
-    pub fn new(root_path: PathBuf, ignore_prefixes: Vec<String>) -> Self {
+impl Default for Config {
+    fn default() -> Self {
         Self {
-            inner: Arc::new(InnerLocalBackend {
-                root_path,
-                ignore_prefixes,
-            }),
+            root_path: Default::default(),
+            ignore_prefixes: Default::default(),
+            calculate_hashes: true,
         }
     }
 }
 
-impl InnerLocalBackend {
+impl<H: FileHasher + Default> LocalBackend<H> {
+    pub fn from_config(config: Config) -> Self {
+        Self::new(config, Default::default())
+    }
+}
+
+impl<H: FileHasher> LocalBackend<H> {
+    pub fn new(config: Config, hasher: H) -> Self {
+        Self {
+            config: Arc::new(config),
+            permits: Arc::new(Semaphore::new(CONCURRENCY_LIMIT)),
+            hasher,
+        }
+    }
+
+    async fn aquire_owned_permit(&self) -> OwnedSemaphorePermit {
+        self.permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("Semaphore should not be closed")
+    }
+
+    async fn aquire_permit(&self) -> SemaphorePermit {
+        self.permits
+            .acquire()
+            .await
+            .expect("Semaphore should not be closed")
+    }
+
+    /// cpath is still needed because it is returned as part of the metadata. Otherwise, it is ignored.
+    fn read_file_impl_for_open_file(
+        &self,
+        cpath: String,
+        mut file: File,
+    ) -> FileRepositoryResult<(PathInfo, File)> {
+        let metadata = file.metadata().map_err(|err| map_io_error(err, &cpath))?;
+        let res = if metadata.is_file() {
+            let hash = if self.config.calculate_hashes {
+                // FIXME: This is (kind of?) CPU bound work that we will execute on a spawn_blocking
+                //      tokio thread. That might honestly not be great. On the other hand, we limit concurrency
+                //      anyways so we definitely should not end up with 500 threads doing nothing but running
+                //      SHA1 so this is probably fine.
+                file.rewind().map_err(as_other_error)?;
+                self.hasher
+                    .hash(&mut file)
+                    .map_err(|err| map_io_error(err, &cpath))?
+            } else {
+                Vec::new()
+            };
+
+            let info = FileInfo {
+                cpath,
+                size: metadata.len(),
+                modified: metadata
+                    .modified()
+                    .expect("system should have modification times")
+                    .into(),
+                hash,
+            };
+
+            file.rewind().map_err(as_other_error)?;
+            (PathInfo::File(info), file)
+        } else {
+            (
+                PathInfo::Dir(DirectoryInfo {
+                    cpath: cpath.to_owned(),
+                }),
+                file,
+            )
+        };
+
+        Ok(res)
+    }
+
+    fn read_file_impl(&self, cpath: String) -> FileRepositoryResult<(PathInfo, File)> {
+        if self.config.is_ignored(&cpath) {
+            return Err(FileRepositoryError::NotAllowed {
+                cpath: cpath.to_owned(),
+            });
+        }
+        let local_path = self.config.get_local_path_from_relative_name(&cpath);
+
+        // Open it, to avoid the time-of-check-time-of-use race condition. Note that
+        // one can actually open directories.
+        let file = File::open(local_path).map_err(|err| map_io_error(err, &cpath))?;
+        self.read_file_impl_for_open_file(cpath, file)
+    }
+
+    fn read_dir_impl(
+        &self,
+        cpath: String,
+        up_to_depth: u32,
+    ) -> FileRepositoryResult<Vec<PathInfo>> {
+        let mut ret = Vec::new();
+
+        // Who doesn't love implementing BFS?!
+        let mut queue = VecDeque::new();
+        queue.push_front((0, cpath));
+        // Note that we do NOT add the root directory to ret here.
+        while let Some((depth, cpath)) = queue.pop_back() {
+            let local_path = self.config.get_local_path_from_relative_name(&cpath);
+
+            // List the children and queue them up if they are directories
+            // TODO: We should ignore some errors here (permissions)
+            let children = local_path
+                .read_dir()
+                .map_err(|err| map_io_error(err, &cpath))?;
+
+            // Check this down here, so that we still throw an appropriate error for depth = 0
+            // if the requested path does not exist.
+            // The files we are about read will have depth + 1, and we add them to
+            // the ret list right here...
+            if depth + 1 > up_to_depth {
+                continue;
+            }
+
+            for child in children {
+                let child_name_os = child.unwrap().file_name();
+                let child_name = child_name_os
+                    .to_str()
+                    .ok_or_else(|| {
+                        format!("The file {child_name_os:?} in {local_path:?} has a non-utf8 name")
+                    })
+                    .expect("Filenames should be valid utf8");
+                let child_cpath = paths::append_to_relative_name(&cpath, child_name);
+
+                let info = match self.read_file_impl(child_cpath) {
+                    Ok((info, _)) => info,
+                    Err(FileRepositoryError::NotAllowed { .. }) => continue,
+                    Err(err) => return Err(err),
+                };
+
+                if let PathInfo::Dir(DirectoryInfo { cpath }) = &info {
+                    queue.push_front((depth + 1, cpath.clone()));
+                }
+
+                ret.push(info);
+            }
+        }
+
+        Ok(ret)
+    }
+}
+
+fn map_io_error(err: std::io::Error, cpath: &str) -> FileRepositoryError {
+    if cpath.is_empty() {
+        return as_other_error(err);
+    }
+
+    let res = match err.kind() {
+        ErrorKind::NotFound => FileRepositoryError::NotFound {
+            cpath: cpath.to_owned(),
+        },
+        ErrorKind::PermissionDenied => FileRepositoryError::NotAllowed {
+            cpath: cpath.to_owned(),
+        },
+        _ => return as_other_error(err),
+    };
+
+    println!("Mapping {err:?} to {res:?}");
+
+    res
+}
+
+fn as_other_error(err: std::io::Error) -> FileRepositoryError {
+    return FileRepositoryError::Other(err.into());
+}
+
+impl Config {
     fn get_local_path_from_relative_name(&self, relative_name: &str) -> PathBuf {
         self.root_path.join(relative_name)
     }
@@ -55,198 +247,144 @@ impl InnerLocalBackend {
 
         false
     }
-
-    fn info_block(&self, relative_name: &str) -> crate::Result<PathInfo> {
-        if self.is_ignored(relative_name) {
-            return Err(Error::NotFound(relative_name.to_string()));
-        }
-
-        let relative_name = relative_name.to_owned();
-
-        let local_path = self.get_local_path_from_relative_name(&relative_name);
-        let metadata = local_path.metadata()?;
-
-        if metadata.is_file() {
-            // Calculate the files SHA1 Hash
-            let mut file = File::open(&local_path)?;
-
-            let mut hasher = Sha1::new();
-            std::io::copy(&mut file, &mut hasher)?;
-            let hash = Some(u8_slice_to_hex_string(&hasher.finalize()));
-
-            let info = FileInfo {
-                relative_name,
-                size: metadata.len(),
-                modified: metadata
-                    .modified()
-                    .expect("system has modification times")
-                    .into(),
-                hash,
-            };
-
-            Ok(PathInfo::File(info))
-        } else {
-            Ok(PathInfo::Dir(DirectoryInfo { relative_name }))
-        }
-    }
-
-    fn read_dir_block(&self, relative_name: &str) -> crate::Result<Vec<PathInfo>> {
-        let local_path = self.get_local_path_from_relative_name(relative_name);
-
-        let mut ret = vec![];
-
-        let iter = match local_path.read_dir() {
-            Ok(x) => x,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Error::NotFound(relative_name.into()))
-            }
-            Err(err) => {
-                return Err(Error::IoError(err));
-            }
-        };
-
-        for f in iter {
-            let f = f.map_err(|e| (e, "while listing folder contents of"))?;
-
-            let name_osstr = f.file_name();
-            let name = name_osstr
-                .to_str()
-                .ok_or(Error::PathContainsInvalidUnicode)?;
-
-            // Note that if relative name is a valid relative name, so will this be
-            let f_relative_name = paths::append_to_relative_name(relative_name, name);
-
-            // TODO: Possibly make it so that we can just call info on the file and still get a useful
-            // answer (we then would only have to check if a file is ignored inside of info)
-            if self.is_ignored(&f_relative_name) {
-                continue;
-            }
-
-            let info = self.info_block(&f_relative_name)?;
-
-            ret.push(info)
-        }
-
-        Ok(ret)
-    }
-
-    fn delete_file_block(&self, relative_name: &str) -> crate::Result<()> {
-        let local_path = self.get_local_path_from_relative_name(relative_name);
-        std::fs::remove_file(local_path)?;
-
-        Ok(())
-    }
-
-    fn set_modified_time_block(
-        &self,
-        relative_name: &str,
-        modtime: OffsetDateTime,
-    ) -> crate::Result<()> {
-        let local_path = self.get_local_path_from_relative_name(relative_name);
-        filetime::set_file_mtime(local_path, datetime_to_filetime(modtime))?;
-
-        Ok(())
-    }
-
-    fn read_dirs_block(&self, dirs_relative_name: Vec<String>) -> crate::Result<Vec<PathInfo>> {
-        let mut ret = Vec::new();
-        for relative_name in dirs_relative_name {
-            ret.extend(self.read_dir_block(relative_name.as_ref())?)
-        }
-        Ok(ret)
-    }
 }
 
-#[async_trait]
-impl FileRepository for LocalBackend {
-    type Reader = Compat<tokio::fs::File>;
+impl<H: FileHasher> FileRepository for LocalBackend<H> {
+    type Reader = SemaphoreGuarded<Compat<TokioFile>>;
 
-    async fn info(&self, relative_name: &str) -> crate::Result<PathInfo> {
-        let inner = self.inner.clone();
-        let relative_name = relative_name.to_string();
-        spawn_blocking(move || inner.info_block(&relative_name))
+    async fn read_file(&self, cpath: &str) -> FileRepositoryResult<(FileInfo, Self::Reader)> {
+        let permit = self.aquire_owned_permit().await;
+        let me = self.clone();
+        let cp = cpath.to_owned();
+        let (PathInfo::File(info), file) = spawn_blocking(move || me.read_file_impl(cp))
             .await
-            .unwrap()
-    }
+            .unwrap()?
+        else {
+            return Err(FileRepositoryError::NotAFile {
+                cpath: cpath.to_owned(),
+            });
+        };
 
-    async fn read_dir(&self, relative_name: &str) -> crate::Result<Vec<PathInfo>> {
-        let inner = self.inner.clone();
-        let relative_name = relative_name.to_string();
-        spawn_blocking(move || inner.read_dir_block(&relative_name))
-            .await
-            .unwrap()
-    }
+        let reader = SemaphoreGuarded {
+            permit,
+            inner: TokioFile::from_std(file).compat(),
+        };
 
-    async fn read_file(&self, relative_name: &str) -> crate::Result<(Self::Reader, u64)> {
-        if self.inner.is_ignored(relative_name) {
-            return Err(Error::NotFound(relative_name.to_owned()));
-        }
-
-        let local_path = self.inner.get_local_path_from_relative_name(relative_name);
-
-        let f = tokio::fs::File::open(local_path).await?;
-        let len = f.metadata().await?.len();
-        Ok((f.compat(), len))
+        Ok((info, reader))
     }
 
     async fn write_file<R: AsyncRead + Send>(
         &self,
-        relative_name: &str,
+        cpath: &str,
+        modified_time: Option<time::OffsetDateTime>,
         src: R,
         _len: u64,
-    ) -> crate::Result<()> {
-        if self.inner.is_ignored(relative_name) {
-            return Err(Error::NotAllowed(relative_name.to_owned()));
+    ) -> FileRepositoryResult<FileInfo> {
+        let _permit = self.aquire_permit().await;
+        if self.config.is_ignored(cpath) {
+            return Err(FileRepositoryError::NotAllowed {
+                cpath: cpath.to_owned(),
+            });
         }
+        let local_path = self.config.get_local_path_from_relative_name(cpath);
 
-        let local_path = self.inner.get_local_path_from_relative_name(relative_name);
-
-        let mut dir = local_path.clone();
+        let mut dir = local_path.to_owned();
         dir.pop();
 
         // Make sure the directories exist..
-        std::fs::create_dir_all(dir)?;
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(as_other_error)?;
 
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .read(true)
             .truncate(true)
             .open(&local_path)
-            .await?;
+            .await
+            .map_err(|err| map_io_error(err, &cpath))?;
 
         let mut src = Box::pin(src.compat());
-        tokio::io::copy(&mut src, &mut file).await?;
+        tokio::io::copy(&mut src, &mut file)
+            .await
+            .map_err(as_other_error)?;
         file.sync_all().await.unwrap();
+
+        // Finally, we need to set the modified time, and return the files metadata (if the caller wanted us too).
+        // To do so, go back to std-land.
+        let file = file.into_std().await;
+        let me = self.clone();
+        let cp = cpath.to_owned();
+        let (PathInfo::File(info), _) = spawn_blocking(move || {
+            if let Some(modified_time) = modified_time {
+                file.set_modified(modified_time.into())
+                    .map_err(as_other_error)?;
+            }
+            me.read_file_impl_for_open_file(cp, file)
+        })
+        .await
+        .unwrap()?
+        else {
+            unreachable!()
+        };
+
+        Ok(info)
+    }
+
+    async fn delete_file(&self, cpath: &str) -> FileRepositoryResult<()> {
+        let _permit = self.aquire_permit().await;
+
+        let local_path = self.config.get_local_path_from_relative_name(cpath);
+        tokio::fs::remove_file(local_path)
+            .await
+            .map_err(move |err| map_io_error(err, cpath))?;
 
         Ok(())
     }
 
-    async fn delete_file(&self, relative_name: &str) -> crate::Result<()> {
-        let inner = self.inner.clone();
-        let relative_name = relative_name.to_string();
-        spawn_blocking(move || inner.delete_file_block(&relative_name))
-            .await
-            .unwrap()
-    }
-
     async fn set_modified_time(
         &self,
-        relative_name: &str,
+        cpath: &str,
         modtime: OffsetDateTime,
-    ) -> crate::Result<()> {
-        let inner = self.inner.clone();
-        let relative_name = relative_name.to_string();
-        spawn_blocking(move || inner.set_modified_time_block(&relative_name, modtime))
+    ) -> FileRepositoryResult<()> {
+        let _permit = self.aquire_permit().await;
+
+        let cpath = cpath.to_owned();
+        let local_path = self.config.get_local_path_from_relative_name(&cpath);
+        spawn_blocking(move || {
+            let f = File::open(local_path).map_err(|err| map_io_error(err, &cpath))?;
+            f.set_modified(modtime.into()).map_err(as_other_error)?;
+
+            Ok::<_, FileRepositoryError>(())
+        })
+        .await
+        .unwrap()?;
+
+        Ok(())
+    }
+
+    async fn read_dir(&self, cpath: &str, up_to_depth: u32) -> FileRepositoryResult<Vec<PathInfo>> {
+        let cpath = cpath.to_owned();
+        let me = self.clone();
+        spawn_blocking(move || me.read_dir_impl(cpath, up_to_depth))
             .await
             .unwrap()
     }
 
-    async fn read_dirs(&self, dirs_relative_name: Vec<String>) -> crate::Result<Vec<PathInfo>> {
-        let inner = self.inner.clone();
-        spawn_blocking(move || inner.read_dirs_block(dirs_relative_name))
+    async fn get_metadata(&self, cpath: &str) -> FileRepositoryResult<PathInfo> {
+        let me = self.clone();
+        let cpath = cpath.to_owned();
+        let (info, _) = spawn_blocking(move || me.read_file_impl(cpath))
             .await
-            .unwrap()
+            .unwrap()?;
+
+        Ok(info)
     }
+}
+
+impl RemoteRepository for LocalBackend<Sha1Hasher> {
+    type Hasher = Sha1Hasher;
 }
 
 #[cfg(test)]
@@ -254,37 +392,44 @@ mod tests {
     use futures::io::Cursor;
 
     use super::*;
-    use std::{fs::OpenOptions, io::Write, path::Path};
+    use std::{any::Any, fs::OpenOptions, io::Write, path::Path};
 
-    #[tokio::test]
-    async fn test_read_dir() {
+    fn setup_read_dir_test() -> (LocalBackend, Vec<&'static str>, Vec<&'static str>, impl Any) {
         let tmp = tempfile::tempdir().unwrap();
-        let b = LocalBackend::new(tmp.path().to_owned(), vec!["ignored".into()]);
-
-        assert!(b.read_dir("").await.unwrap().is_empty());
-        assert!(matches!(
-            b.read_dir("does-not-exist").await,
-            Err(Error::NotFound(_))
-        ));
+        let config = Config {
+            root_path: tmp.path().to_owned(),
+            ignore_prefixes: vec!["ignored".into()],
+            ..Default::default()
+        };
+        let b = LocalBackend::<Sha1Hasher>::from_config(config);
 
         let mut files = vec![
-            ("", "file-1.txt"),
-            ("", "file-2.txt"),
-            ("", "file-3.txt"),
-            ("subdir", "this-is-a-filename-that-may-or-may-not-be-a-little-longer-than-the-the-other-filenames-because-that-is-really-something-we-should-try-at-some-point.txt"),
-            ("subdir", "another-file-but-shorter.bin"),
-            ("anothersubdir", "somefile.exe"),
-            ("anothersubdir/d1/d2/d3", "ignored")
+            "file-1.txt",
+            "file-2.txt",
+            "file-3.txt",
+            "subdir/this-is-a-filename-that-may-or-may-not-be-a-little-longer-than-the-the-other-filenames-because-that-is-really-something-we-should-try-at-some-point.txt",
+            "subdir/another-file-but-shorter.bin",
+            "anothersubdir/somefile.exe",
+            "anothersubdir/d1/d2/d3/ignored"
         ];
+        let mut directories = vec![
+            "subdir",
+            "anothersubdir",
+            "anothersubdir/d1",
+            "anothersubdir/d1/d2",
+            "anothersubdir/d1/d2/d3",
+        ];
+        directories.sort();
         files.sort();
 
         let files_should_be = files.clone();
 
-        files.push(("ignored/subdir", "f1"));
-        files.push(("ignored", "f2"));
+        files.push("ignored/subdir/f1");
+        files.push("ignored/f2");
 
         // Create this directory structure
-        for (dir, filename) in files {
+        for path in files {
+            let (dir, filename) = paths::pop_cpath(path);
             let dir_path = Path::new(tmp.path()).join(dir);
 
             std::fs::create_dir_all(&dir_path).unwrap();
@@ -300,37 +445,68 @@ mod tests {
             write!(f, "Just some data").unwrap();
         }
 
+        (b, files_should_be, directories, tmp)
+    }
+
+    #[tokio::test]
+    async fn test_read_dir_depth_1() {
+        let (b, files_should_be, dirs_should_be, _drop_later) = setup_read_dir_test();
+
         // Now read it with read_dir (this should really be done recursively,
         // but the recursive function definition is kind of verbose)
-        let mut retrieved_directory_structure = vec![];
+        let mut retrieved_files = vec![];
+        let mut retrieved_directories = vec![];
 
         let mut next_directories = vec!["".to_owned()];
         while let Some(relative_name) = next_directories.pop() {
-            for info in b.read_dir(&relative_name).await.unwrap() {
+            for info in b.read_dir(&relative_name, 1).await.unwrap() {
                 match info {
-                    PathInfo::Dir(d) => next_directories.push(d.relative_name),
-                    PathInfo::File(info) => {
-                        let (dir, name) = info.dir_and_name();
-                        retrieved_directory_structure.push((dir.to_owned(), name.to_owned()));
+                    PathInfo::Dir(d) => {
+                        next_directories.push(d.cpath.to_owned());
+                        retrieved_directories.push(d.cpath);
                     }
+                    PathInfo::File(info) => retrieved_files.push(info.cpath.to_owned()),
                 }
             }
         }
 
-        retrieved_directory_structure.sort();
+        retrieved_files.sort();
+        retrieved_directories.sort();
 
-        assert_eq!(retrieved_directory_structure.len(), files_should_be.len());
+        assert_eq!(retrieved_files, files_should_be);
+        assert_eq!(retrieved_directories, dirs_should_be);
+    }
 
-        for i in 0..files_should_be.len() {
-            assert!(retrieved_directory_structure[i].0 == files_should_be[i].0);
-            assert!(retrieved_directory_structure[i].1 == files_should_be[i].1);
+    #[tokio::test]
+    async fn test_read_dir_max_depth() {
+        let (b, files_should_be, dirs_should_be, _drop_later) = setup_read_dir_test();
+
+        let retrieved = b.read_dir("", u32::MAX).await.unwrap();
+
+        let mut retrieved_files = vec![];
+        let mut retrieved_dirs = vec![];
+        for info in retrieved {
+            match info {
+                PathInfo::Dir(DirectoryInfo { cpath }) => retrieved_dirs.push(cpath),
+                PathInfo::File(FileInfo { cpath, .. }) => retrieved_files.push(cpath),
+            }
         }
+        retrieved_dirs.sort();
+        retrieved_files.sort();
+
+        assert_eq!(retrieved_files, files_should_be);
+        assert_eq!(retrieved_dirs, dirs_should_be);
     }
 
     #[tokio::test]
     async fn test_read_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let b = LocalBackend::new(tmp.path().to_owned(), Vec::new());
+        let config = Config {
+            root_path: tmp.path().to_owned(),
+            ignore_prefixes: Vec::new(),
+            ..Default::default()
+        };
+        let b = LocalBackend::<Sha1Hasher>::from_config(config);
 
         let test_bytes = (0..1_000_000u64).map(|x| x as u8).collect::<Vec<_>>();
 
@@ -350,35 +526,46 @@ mod tests {
         f.write_all(&test_bytes).unwrap();
         drop(f);
 
-        let (mut reader, len) = b.read_file(relative_name).await.unwrap();
-        assert_eq!(test_bytes.len() as u64, len);
+        let (info, mut reader) = b.read_file(relative_name).await.unwrap();
+        assert_eq!(test_bytes.len() as u64, info.size);
 
         let mut file_bytes = Vec::new();
         futures::io::copy(&mut reader, &mut file_bytes)
             .await
             .unwrap();
         assert_eq!(file_bytes, test_bytes);
+    }
 
-        let b = LocalBackend::new(tmp.path().to_owned(), vec!["dir/subdir".into()]);
-        let res = b.read_file(relative_name).await;
-        assert!(
-            matches!(res, Err(Error::NotFound(_))),
-            "should be not found but got {:?}",
-            res
-        );
+    #[tokio::test]
+    async fn read_file_ignores_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = LocalBackend::<Sha1Hasher>::from_config(Config {
+            root_path: tmp.path().to_owned(),
+            ignore_prefixes: vec!["dir/subdir".into()],
+            ..Default::default()
+        });
+        let res = b.read_file("dir/subdir/a/b/somefile").await;
+
+        let error = res.unwrap_err();
+        assert!(matches!(error, FileRepositoryError::NotAllowed { .. }));
     }
 
     #[tokio::test]
     async fn test_write_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let b = LocalBackend::new(tmp.path().to_owned(), vec!["dir/we/ignore".into()]);
+        let b: LocalBackend<Sha1Hasher> = LocalBackend::from_config(Config {
+            root_path: tmp.path().to_owned(),
+            ignore_prefixes: vec!["dir/we/ignore".into()],
+            ..Default::default()
+        });
         let test_bytes = (0..1_000_000u64).map(|x| x as u8).collect::<Vec<_>>();
 
         // Test if we can write to ignored locations
         let x = b
-            .write_file("dir/we/ignore/subdir/test", futures::io::empty(), 0)
+            .write_file("dir/we/ignore/subdir/test", None, futures::io::empty(), 0)
             .await;
-        assert!(matches!(x, Err(Error::NotAllowed(_))));
+        let error = x.unwrap_err();
+        assert!(matches!(error, FileRepositoryError::NotAllowed { .. }));
 
         // Now write an actual file
         let relative_name = "dir/that-does-not-exist/somefile";
@@ -387,6 +574,7 @@ mod tests {
         let modtime_should_be = OffsetDateTime::now_utc();
         b.write_file(
             "dir/that-does-not-exist/somefile",
+            None,
             Cursor::new(&test_bytes),
             test_bytes.len() as u64,
         )
@@ -407,5 +595,79 @@ mod tests {
 
         let modtime = OffsetDateTime::from(f.metadata().unwrap().modified().unwrap());
         assert_eq!(modtime, modtime_should_be);
+    }
+
+    #[tokio::test]
+    async fn write_file_ignores_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b: LocalBackend<Sha1Hasher> = LocalBackend::from_config(Config {
+            root_path: tmp.path().to_owned(),
+            ignore_prefixes: vec!["dir/subdir".into()],
+            ..Default::default()
+        });
+
+        let res = b
+            .write_file("dir/subdir/test", None, futures::io::empty(), 0)
+            .await;
+        let error = res.unwrap_err();
+        assert!(matches!(error, FileRepositoryError::NotAllowed { .. }));
+    }
+
+    #[tokio::test]
+    async fn info_ignores_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = LocalBackend::<Sha1Hasher>::from_config(Config {
+            root_path: tmp.path().to_owned(),
+            ignore_prefixes: vec!["dir/subdir".into()],
+            ..Default::default()
+        });
+
+        // Create the file manually to really test it..
+        let ignored_dir = tmp.path().join("dir/subdir");
+        let ignored_file_path = ignored_dir.join("test");
+        println!("File is at {:?}", ignored_file_path);
+        std::fs::create_dir_all(&ignored_dir).unwrap();
+        let mut f = File::options()
+            .write(true)
+            .create(true)
+            .open(ignored_file_path)
+            .unwrap();
+        write!(f, "test").unwrap();
+        drop(f);
+
+        let res = b.get_metadata("dir/subdir/test").await;
+        let err = res.unwrap_err();
+        assert!(matches!(err, FileRepositoryError::NotAllowed { .. }));
+    }
+
+    #[tokio::test]
+    async fn hashes_can_be_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = LocalBackend::<Sha1Hasher>::from_config(Config {
+            root_path: tmp.path().to_owned(),
+            ignore_prefixes: vec!["dir/subdir".into()],
+            calculate_hashes: false,
+        });
+
+        let mut cursor = Cursor::new(vec![0xde, 0xad]);
+        b.write_file("test", None, &mut cursor, 2).await.unwrap();
+
+        let info = b.get_metadata("test").await.unwrap();
+        match info {
+            PathInfo::File(file_info) => assert!(file_info.hash.is_empty()),
+            _ => panic!("Expected a file"),
+        };
+    }
+
+    #[tokio::test]
+    async fn read_dir_errors_on_not_exist() {
+        let b = LocalBackend::<Sha1Hasher>::from_config(Default::default());
+        let res = b.read_dir("should-not-exist", 0).await;
+        assert!(matches!(
+            res.unwrap_err(),
+            FileRepositoryError::NotFound {
+                cpath
+            } if cpath == "should-not-exist"
+        ));
     }
 }

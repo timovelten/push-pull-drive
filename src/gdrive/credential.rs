@@ -1,13 +1,10 @@
 use std::sync::Mutex;
 
+use anyhow::anyhow;
 use oauth2::reqwest::http_client;
-use oauth2::{
-    basic::BasicClient, AccessToken,
-    RefreshToken, TokenResponse
-};
+use oauth2::{basic::BasicClient, AccessToken, RefreshToken, TokenResponse};
+use time::ext::NumericalDuration;
 use time::OffsetDateTime;
-
-use crate::Error;
 
 #[derive(Debug, Clone)]
 pub struct FatAccessToken {
@@ -18,7 +15,7 @@ pub struct FatAccessToken {
 impl FatAccessToken {
     fn needs_to_be_refreshed(&self) -> bool {
         let now = OffsetDateTime::now_utc();
-        self.expires - now < time::Duration::SECOND * 60
+        self.expires - now < 60.seconds()
     }
 
     fn is_expired(&self) -> bool {
@@ -29,7 +26,7 @@ impl FatAccessToken {
 
 #[derive(Debug)]
 pub struct GoogleCredential {
-    inner: Mutex<GoogleCredentialImpl>
+    inner: Mutex<GoogleCredentialImpl>,
 }
 
 impl GoogleCredential {
@@ -46,10 +43,12 @@ impl GoogleCredential {
             callback: Box::new(new_token_callback),
         };
 
-        GoogleCredential { inner: Mutex::new(inner) }
+        GoogleCredential {
+            inner: Mutex::new(inner),
+        }
     }
 
-    pub fn get_or_refresh_token(&self) -> crate::Result<AccessToken> {
+    pub fn get_or_refresh_token(&self) -> anyhow::Result<AccessToken> {
         self.inner.lock().unwrap().get_or_refresh_token()
     }
 }
@@ -76,7 +75,8 @@ impl std::fmt::Debug for GoogleCredentialImpl {
         f.debug_struct("GoogleCredential")
             .field("client", &self.client)
             .field("refresh_token", &self.refresh_token)
-            .field("token", &self.token).finish()
+            .field("token", &self.token)
+            .finish()
     }
 }
 
@@ -100,31 +100,34 @@ impl GoogleCredentialImpl {
         }
     }
 
-    pub fn get_or_refresh_token(&mut self) -> crate::Result<AccessToken> {
+    pub fn get_or_refresh_token(&mut self) -> anyhow::Result<AccessToken> {
         if self.needs_to_be_refreshed() {
             self.refresh_token()?;
         }
 
         Ok(self
             .get_token()
-            .expect("token refresh succeeded but got no new token (or token is already expired)"))
+            .expect("there should be a token after successful refresh"))
     }
 
-    pub fn refresh_token(&mut self) -> crate::Result<()> {
+    pub fn refresh_token(&mut self) -> anyhow::Result<()> {
         let now = OffsetDateTime::now_utc();
         let token_response = self
             .client
             .exchange_refresh_token(&self.refresh_token)
             .request(http_client)
-            .map_err(|e| Error::GoogleAuthError(Box::new(e)))?;
+            .map_err(|e| anyhow!(e))?;
 
         let fat_token = FatAccessToken {
             access_token: token_response.access_token().clone(),
-            expires: now + token_response.expires_in().expect("no expires_in field")
+            expires: now
+                + token_response
+                    .expires_in()
+                    .expect("expires_in field exists"),
         };
 
         self.token = Some(fat_token.clone());
-        
+
         (self.callback)(fat_token);
 
         Ok(())
@@ -141,14 +144,14 @@ mod tests {
 
         let f1 = FatAccessToken {
             access_token: token.clone(),
-            expires: OffsetDateTime::now_utc() - time::Duration::SECOND
+            expires: OffsetDateTime::now_utc() - time::Duration::SECOND,
         };
 
         assert!(f1.is_expired());
 
         let f2 = FatAccessToken {
             access_token: token.clone(),
-            expires: OffsetDateTime::now_utc() + 5 * time::Duration::SECOND
+            expires: OffsetDateTime::now_utc() + 5 * time::Duration::SECOND,
         };
 
         assert!(!f2.is_expired());
@@ -160,21 +163,21 @@ mod tests {
 
         let f0 = FatAccessToken {
             access_token: token.clone(),
-            expires: OffsetDateTime::now_utc() - 50 * time::Duration::DAY
+            expires: OffsetDateTime::now_utc() - 50 * time::Duration::DAY,
         };
-        
+
         assert!(f0.needs_to_be_refreshed());
 
         let f1 = FatAccessToken {
             access_token: token.clone(),
-            expires: OffsetDateTime::now_utc() + 50 * time::Duration::SECOND
+            expires: OffsetDateTime::now_utc() + 50 * time::Duration::SECOND,
         };
 
         assert!(f1.needs_to_be_refreshed());
 
         let f1 = FatAccessToken {
             access_token: token.clone(),
-            expires: OffsetDateTime::now_utc() + 100 * time::Duration::SECOND
+            expires: OffsetDateTime::now_utc() + 100 * time::Duration::SECOND,
         };
         assert!(!f1.needs_to_be_refreshed());
     }
