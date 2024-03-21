@@ -36,11 +36,24 @@ pub struct File {
     #[serde(with = "time::serde::rfc3339")]
     pub modified_time: OffsetDateTime,
 
-    #[serde(default)]
-    #[serde(deserialize_with = "optional_from_str")]
-    pub size: Option<u64>,
-    pub sha1_checksum: Option<String>,
+    /// Careful: Not all folders have parents. For instance, the 'root' folder does not have a parent
+    /// (and possibly others, I'm not quite sure)
     pub parents: Option<[String; 1]>,
+
+    pub more: Option<MoreFileFields>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(untagged)]
+pub enum MoreFileFields {
+    #[serde(rename_all = "camelCase")]
+    BinaryFile {
+        head_revision_id: String,
+        sha1_checksum: String,
+        size: u64,
+    },
+    #[serde(rename_all = "camelCase")]
+    Sized { size: u64 },
 }
 
 #[derive(Deserialize, Debug)]
@@ -51,16 +64,7 @@ pub struct FileId {
 
 impl File {
     pub fn is_folder(&self) -> bool {
-        self.size.is_none() && self.mime_type == "application/vnd.google-apps.folder"
-    }
-
-    /// Convert the hexadecimal checksum sent by google to its bytes. Note that this returns an empty vector
-    /// if it is missing.
-    pub fn sha1_checksum_as_bytes(&self) -> Vec<u8> {
-        self.sha1_checksum
-            .as_ref()
-            .map(|sha1| hex::decode(sha1).expect("sha1checksum should be valid hex"))
-            .unwrap_or_default()
+        self.mime_type == "application/vnd.google-apps.folder"
     }
 }
 
@@ -220,7 +224,7 @@ impl DriveApi {
             .unwrap()
             .with_query_pairs(&[(
                 "fields",
-                "id,name,mimeType,size,sha1Checksum,modifiedTime,parents",
+                "id,name,mimeType,sha1Checksum,modifiedTime,parents,headRevisionId,size",
             )]);
 
         let req = Request::get(url.to_string())
@@ -233,69 +237,35 @@ impl DriveApi {
     pub async fn files_get_alt_media(
         &self,
         id: &str,
-        bytes_range: Option<(u64, u64)>,
-    ) -> anyhow::Result<(Box<dyn AsyncRead + Unpin + Send>, u64)> {
-        let range_header = if let Some((_, _)) = bytes_range {
-            todo!(
-                "make the output of this work with content length (I think right now it does not)"
-            )
+        revision_id: Option<&str>,
+    ) -> anyhow::Result<Box<dyn AsyncRead + Unpin + Send>> {
+        let url = if let Some(revision_id) = revision_id {
+            format!("https://www.googleapis.com/drive/v3/files/{id}/revision/{revision_id}")
         } else {
-            "bytes=0-".to_string()
+            format!("https://www.googleapis.com/drive/v3/files/{id}")
         };
 
-        let url = Url::parse(&format!("https://www.googleapis.com/drive/v3/files/{id}"))
+        let url = Url::parse(&url)
             .unwrap()
             .with_query_pairs(&[Some(("acknowledgeAbuse", "true")), Some(("alt", "media"))]);
 
+        // At some point, we included a a range header in the request, so that Google sends a Content-Range
+        // header from which we can know the (uncompressed) size of the body before downloading it.
+        // That is kind of flaky, because a) the spec allows them to send the content in multiple parts,
+        // which we would probably have to deal with and b) if the file has zero bytes, the range header
+        // bytes=0- results in 416 Content Range Not Satisfiable (which we had to work around...)
         let req = Request::get(url.to_string())
-            // We include a range header in any case, so that google always includes a content range
-            // response, from which we can know the files length (content-length is unrealiable because
-            // the response will almost always be gzip encoded)
-            .header(http::header::RANGE, range_header)
             .bearer_auth(self.token.secret())
             .body(EMPTY_BODY)?;
 
-        // Including a range header does come with a problem: If the file has 0 bytes,
-        // google (more or less correctly) responds with a 416 Range not satisfiable.
-        // We just swallow that error if it happens.
-        let resp = match self.send_retry(req).await {
-            Ok(resp) => resp,
-            Err(err) => match err.downcast_ref::<Error>() {
-                Some(Error::HttpRequestFailed {
-                    code: StatusCode::RANGE_NOT_SATISFIABLE,
-                    ..
-                }) => {
-                    return Ok((Box::new(futures::io::empty()), 0));
-                }
-                _ => return Err(err),
-            },
-        };
+        let resp = self.send_retry(req).await?;
 
-        let len = resp
-            .headers()
-            .get(http::header::CONTENT_RANGE)
-            .and_then(|range| {
-                // Try and parse the Content-Range header
-                let (_, x) = range.to_str().unwrap().split_once('/')?;
-                x.parse::<u64>().ok()
-            })
-            .or_else(|| {
-                // Otherwise, last ditch effort: try and use content length
-                resp.content_length()
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "google sent a file and we have no way of knowing how long it is: {}",
-                    id
-                )
-            });
-
-        let body_async_read = resp
+        let ret = resp
             .bytes_stream()
             .map_err(|err| std::io::Error::new(ErrorKind::Other, err))
             .into_async_read();
 
-        Ok((Box::new(body_async_read), len))
+        Ok(Box::new(ret))
     }
 
     pub async fn files_delete(&self, id: &str) -> anyhow::Result<()> {

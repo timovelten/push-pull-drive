@@ -5,13 +5,20 @@ mod credential;
 mod drive_api;
 mod extensions;
 pub mod oauth;
+use anyhow::Context;
 use anyhow::{anyhow, bail};
 pub use config::*;
+use futures::stream::FuturesUnordered;
+use itertools::Itertools;
+use rusqlite::ffi::SQLITE_CANTOPEN_CONVPATH;
 
+use crate::gdrive::drive_api::MoreFileFields;
+use crate::DirectoryInfo;
 use crate::Result;
 use async_recursion::async_recursion;
 pub use credential::{FatAccessToken, GoogleCredential};
 use futures::AsyncRead;
+use std::collections::VecDeque;
 use std::fmt::Write;
 use thiserror::Error;
 use tokio::{sync::Semaphore, task::block_in_place};
@@ -67,6 +74,92 @@ pub struct GDriveBackend {
     credential: Arc<GoogleCredential>,
 }
 
+impl FileRepository for GDriveBackend {
+    type Reader = Box<dyn AsyncRead + Send + Unpin>;
+
+    async fn read_dir(&self, cpath: &str, up_to_depth: u32) -> FileRepositoryResult<Vec<PathInfo>> {
+        const BATCH_SIZE: usize = 12;
+
+        // Another day, another (sort-of) BFS!
+        let mut ret = Vec::new();
+
+        let id = self.get_drive_id(cpath).await.unwrap();
+        let mut queue = vec![(
+            id,
+            DirectoryInfo {
+                cpath: cpath.to_owned(),
+            },
+        )];
+
+        for depth in 0..up_to_depth {
+            // Invariant: At this point, all directories in the queue are directories of depth `depth`
+            // and depth <= up_to_depth.
+            if queue.is_empty() {
+                break;
+            }
+
+            let mut next_queue = Vec::new();
+
+            // Take up to BATCH_SIZE directories, and explore them using a single API call.
+            // But: We can make several of these API calls concurrently, so let's do that :)
+            for chunk in queue.chunks(BATCH_SIZE) {
+                let next = self
+                    .read_dirs(chunk)
+                    .await
+                    .map_err(|err| FileRepositoryError::Other(err))?;
+
+                for (next_id, next_info) in next {
+                    if let PathInfo::Dir(info) = &next_info {
+                        next_queue.push((next_id, info.clone()));
+                    }
+                    ret.push(next_info);
+                }
+            }
+
+            queue = next_queue;
+        }
+
+        Ok(ret)
+    }
+
+    async fn get_metadata(&self, cpath: &str) -> FileRepositoryResult<PathInfo> {
+        todo!()
+    }
+
+    async fn read_file(
+        &self,
+        relative_name: &str,
+    ) -> FileRepositoryResult<(FileInfo, Self::Reader)> {
+        todo!()
+    }
+
+    async fn write_file<R: crate::file_repository::AsyncReader>(
+        &self,
+        cpath: &str,
+        modified_time: Option<time::OffsetDateTime>,
+        src: R,
+        len: u64,
+    ) -> FileRepositoryResult<FileInfo> {
+        todo!()
+    }
+
+    async fn delete_file(&self, cpath: &str) -> FileRepositoryResult<()> {
+        todo!()
+    }
+
+    async fn set_modified_time(
+        &self,
+        relative_name: &str,
+        modtime: time::OffsetDateTime,
+    ) -> FileRepositoryResult<()> {
+        todo!()
+    }
+}
+
+impl RemoteRepository for GDriveBackend {
+    type Hasher = Sha1Hasher;
+}
+
 impl GDriveBackend {
     pub fn new(credential: GoogleCredential) -> Self {
         let client = reqwest::Client::builder().build().unwrap();
@@ -103,15 +196,18 @@ impl GDriveBackend {
         // Trust me: It's not worth it to do this non-recursively, even if we then could
         // avoid the heap allocation thats caused by async_recursion.
 
-        // Check if its cached
         if use_cache {
             if let Some(x) = self.id_cache.get(cpath) {
                 return Ok(x.clone());
             }
         }
 
-        // Are we looking for root? root also has an Id and we need to find it,
-        // because we use these ids to determine paths in read dirs.
+        // In Google Drive, the root folder has an actual id (e.g. 0AGqh_9UFaLFoUk9PVA) and the "virtual" id
+        // 'root' by which it can be accessed almost anywhere. Unfortunately, we need the actual id,
+        // since the 'parents' field of a file contains the actual id (and not 'root'). We use this
+        // behavior in the read_dir function, that concurrently fetches multiple directory contents
+        // in a single request.
+        // See also: https://developers.google.com/drive/api/guides/folder
         if cpath.is_empty() {
             let f = self.make_drive_api().await?.files_get("root").await?;
             debug_assert_eq!(f.parents, None);
@@ -212,35 +308,22 @@ impl GDriveBackend {
         self.mkdir_all_impl(relative_name).await
     }
 
-    /// Implementation of read_dirs. Note that in this version, the number
-    /// of directories should be "small". The directories passed to this function
-    /// are all concatenated and passed as a query string directly to the google drive
-    /// API, which does enforce a size limit.
-    async fn read_dirs_impl<I: IntoIterator<Item = String>>(
+    async fn read_dirs(
         &self,
-        dirs: I,
-    ) -> anyhow::Result<Vec<PathInfo>> {
+        targets: &[(String, DirectoryInfo)],
+    ) -> anyhow::Result<Vec<(String, PathInfo)>> {
         let mut ret = Vec::new();
-
-        let ids = {
-            let mut map = ahash::HashMap::default();
-            for relative_name in dirs {
-                let id = self.get_drive_id(&relative_name).await?;
-                map.insert(id, relative_name);
-            }
-            map
-        };
 
         // Build the google drive query string that looks for children of those ids.
         let query = {
             // Query string is of the form
             // trashed = false and ('abc' in parents or 'cdf' in parents)
             let mut q = String::from("trashed = false and (");
-            for (i, id) in ids.keys().enumerate() {
+            for (i, (id, cpath)) in targets.iter().enumerate() {
                 if i > 0 {
                     write!(q, " or ").unwrap();
                 }
-                write!(q, "'{id}' in parents").unwrap();
+                write!(q, "'{}' in parents", id).unwrap();
             }
             // Don't forget the closing brace
             write!(q, ")").unwrap();
@@ -257,31 +340,35 @@ impl GDriveBackend {
                 .as_ref()
                 .expect("Google drive files we request have a parent")[0];
 
-            let parent_relative_name = &ids[parent_id];
-            let relative_name = append_to_relative_name(parent_relative_name, &file.name);
+            let parent_cpath = targets
+                .iter()
+                .find(|(id, _)| false)
+                .map(|(_, info)| &info.cpath)
+                .with_context(|| format!("List of targets is {targets:?} and we recevied a file with parent id {parent_id:?}"))
+                .expect("Every file we receive should have a parent we know of");
 
-            let pathinfo = match (file.size, file.mime_type.as_str()) {
-                (Some(size), _) => Some(PathInfo::File(crate::FileInfo {
-                    cpath: relative_name,
+            // cpath of the file `file`
+            let cpath = append_to_relative_name(parent_cpath, &file.name);
+
+            let info = match file.more {
+                Some(MoreFileFields::BinaryFile {
+                    head_revision_id,
+                    sha1_checksum,
+                    size,
+                }) => PathInfo::File(FileInfo {
+                    cpath,
                     size,
                     modified: file.modified_time,
-                    hash: file.sha1_checksum_as_bytes(),
-                })),
-                (_, "application/vnd.google-apps.folder") => {
-                    Some(PathInfo::Dir(crate::DirectoryInfo {
-                        cpath: relative_name,
-                    }))
-                }
-                (_, _) => {
-                    // Skip types we cannot cateogorize into file / folder
-                    // FIXME: Do something for Google docs here
-                    None
+                    hash: hex::decode(sha1_checksum).expect("sha1checksum should be valid hex"),
+                }),
+                None if file.is_folder() => PathInfo::Dir(crate::DirectoryInfo { cpath }),
+                _ => {
+                    // TODO: We are most likely dealing with a Google docs file here. Skip those for now.
+                    continue;
                 }
             };
 
-            if let Some(pathinfo) = pathinfo {
-                ret.push(pathinfo);
-            }
+            ret.push((file.id, info));
         }
 
         Ok(ret)
@@ -311,51 +398,6 @@ impl GDriveBackend {
 
         Ok(())
     }
-}
-
-impl FileRepository for GDriveBackend {
-    type Reader = Box<dyn AsyncRead + Send + Unpin>;
-
-    async fn read_dir(&self, cpath: &str, depth: u32) -> FileRepositoryResult<Vec<PathInfo>> {
-        todo!()
-    }
-
-    async fn get_metadata(&self, cpath: &str) -> FileRepositoryResult<PathInfo> {
-        todo!()
-    }
-
-    async fn read_file(
-        &self,
-        relative_name: &str,
-    ) -> FileRepositoryResult<(FileInfo, Self::Reader)> {
-        todo!()
-    }
-
-    async fn write_file<R: crate::file_repository::AsyncReader>(
-        &self,
-        cpath: &str,
-        modified_time: Option<time::OffsetDateTime>,
-        src: R,
-        len: u64,
-    ) -> FileRepositoryResult<FileInfo> {
-        todo!()
-    }
-
-    async fn delete_file(&self, cpath: &str) -> FileRepositoryResult<()> {
-        todo!()
-    }
-
-    async fn set_modified_time(
-        &self,
-        relative_name: &str,
-        modtime: time::OffsetDateTime,
-    ) -> FileRepositoryResult<()> {
-        todo!()
-    }
-}
-
-impl RemoteRepository for GDriveBackend {
-    type Hasher = Sha1Hasher;
 }
 
 #[derive(Default, Debug)]
