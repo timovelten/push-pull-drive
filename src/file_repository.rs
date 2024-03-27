@@ -5,16 +5,17 @@ use thiserror::Error;
 use time::OffsetDateTime;
 
 #[derive(Debug, Error)]
-#[allow(clippy::enum_variant_names)]
 pub enum Error {
     #[error("{cpath} was not found")]
     NotFound { cpath: String },
     #[error("{cpath} not allowed")]
     NotAllowed { cpath: String },
-    #[error("the object at the specified path is not a file {cpath}")]
-    NotAFile { cpath: String },
-    #[error("the object at is not a folder {cpath}")]
-    NotAFolder { cpath: String },
+    #[error("Expected a non-directory, got a directory. {cpath}.")]
+    IsADirectory { cpath: String },
+    #[error("Expected a directory, got something else. {cpath}.")]
+    NotADirectory { cpath: String },
+    #[error("Something else modified files and invalidated our state.")]
+    ConcurrentModification,
     #[error(transparent)]
     Other(anyhow::Error),
 }
@@ -29,20 +30,37 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub trait FileRepository: Debug + Send + Sync {
     type Reader: AsyncReader;
 
-    /// Return all files and folders contained in the directory at cpath. If cpath is not a directory,
-    /// this returns Err(Error::NotADirectory(_)).
-    /// depth specifies up to which depth children of the directory at cpath are returned (usually this involes recursion).
-    /// If depth is 0, this returns an empty list. If depth is 1, this returns the immediate children of
-    /// the directory at cpath. If depth is u32::MAX_VALUE, this returns all children.
+    /// Return all files and folders contained in the directory at `cpath` up to the specified `depth`. Note that if called
+    /// with `depth` 0, this should return an empty list. With `depth` 1, this returns all the immediate children (but not the directory itself!).
+    /// Use `u32::MAX` as `depth` to return all files and subfolders.
+    ///
+    /// # Errors
+    /// - If `cpath` is a file this returns the error [`Error::NotADirectory`].
     async fn read_dir(&self, cpath: &str, depth: u32) -> Result<Vec<PathInfo>>;
 
     async fn get_metadata(&self, cpath: &str) -> Result<PathInfo>;
 
-    /// Read file with the given relative name. Return a reader and the file
-    /// size in bytes.
+    /// Read file with the given relative name. Return a reader and the file size in bytes.
+    ///
+    /// # Errors
+    ///
+    /// - If the file at cpath is a directory, this returns [`Error::IsADirectory`]
+    /// - If a subpath of `cpath` is a file, this returns either [`Error::NotADirectory`] or [`Error::NotFound`] (up to the implementation).
     async fn read_file(&self, relative_name: &str) -> Result<(FileInfo, Self::Reader)>;
 
-    /// Read the given `src` reader to completion and write its contents to the given relative name.
+    /// Read the given `src` reader to completion and write its contents to the given cpath name. Do note the following behavior (which more or less mimicks the behavior
+    // of `mkdir -p cpath_dir` and then writing the file on Linux):
+    ///
+    /// - If a file exists at cpath, then it is overwritten by the contents of src.
+    /// - If cpath is of the form base/filename AND base is the cpath of a directory, a file named filename is created
+    ///    with the contents src inside of that directory.
+    ///
+    /// # Errors
+    ///
+    /// - If cpath is a directory, this returns [`Error::IsADirectory`]. Consider deleting the directory in this case and trying again. Also
+    ///   see [`Self::delete_orphaned_directory`]. This particular case is very important. We rely on this behavior in push_pull.
+    /// - If a subpath os `cpath` is a file itself, this returns either [`Error::NotADirectory`] or [`Error::NotFound`] (up to the implementation).
+    /// - If the directory part of `cpath` does not exist, this returns [`Error::NotFound`].
     async fn write_file<R: AsyncReader>(
         &self,
         cpath: &str,
@@ -51,9 +69,27 @@ pub trait FileRepository: Debug + Send + Sync {
         len: u64,
     ) -> Result<FileInfo>;
 
+    /// Delete a file or a folder at `cpath` (including all subfolders, if necessary).
     async fn delete_file(&self, cpath: &str) -> Result<()>;
 
     async fn set_modified_time(&self, relative_name: &str, modtime: OffsetDateTime) -> Result<()>;
+
+    /// Deletes a directory at cpath (and all subdirectories it contains) if it contains no files. See [`Self::delete_file`].
+    async fn delete_orphaned_directory(&self, cpath: &str) -> Result<bool> {
+        let files_in_folder = self
+            .read_dir(cpath, u32::MAX)
+            .await?
+            .into_iter()
+            .filter(|d| matches!(d, PathInfo::File(_)))
+            .count();
+
+        if files_in_folder == 0 {
+            self.delete_file(cpath).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
 }
 
 pub trait RemoteRepository: FileRepository {

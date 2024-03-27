@@ -14,7 +14,7 @@ pub struct StatusArgs {
 
 pub async fn local_status(ctx: &impl Context, args: StatusArgs) -> anyhow::Result<()> {
     let ctx = ctx.get();
-    let report = status_of_dir(
+    let (_, report) = status_of_dir(
         ctx.tracked_files_or_ignore(args.ignore_index),
         ctx.local(),
         ctx.wd(),
@@ -28,7 +28,7 @@ pub async fn local_status(ctx: &impl Context, args: StatusArgs) -> anyhow::Resul
 
 pub async fn remote_status(ctx: &impl Context, args: StatusArgs) -> anyhow::Result<()> {
     let ctx = ctx.get();
-    let report = status_of_dir(
+    let (_, report) = status_of_dir(
         ctx.tracked_files_or_ignore(args.ignore_index),
         ctx.remote(),
         ctx.wd(),
@@ -40,12 +40,15 @@ pub async fn remote_status(ctx: &impl Context, args: StatusArgs) -> anyhow::Resu
     Ok(())
 }
 
+/// Return a list of all files in that directory, and how they have changed from the index.
+/// Note that if the target directory does not exist, this simply returns two empty vectors (and NOT
+/// an error.)
 pub(super) async fn status_of_dir(
     db: &(impl TrackedFilesRepository + ?Sized),
     repo: &impl FileRepository,
     dir: &str,
     side: Side,
-) -> anyhow::Result<Vec<FileChange>> {
+) -> anyhow::Result<(Vec<PathInfo>, Vec<FileChange>)> {
     let mut ret: Vec<FileChange> = Vec::new();
     log::debug!("Determining status directory {dir}");
 
@@ -58,9 +61,15 @@ pub(super) async fn status_of_dir(
         .map(|info: FileInfo| (info.cpath.clone(), info))
         .collect::<HashMap<_, _>>();
 
-    log::debug!("{:?}", all_tracked_files);
+    // Swallow NotFound errors...
+    let all_files_in_repo = match repo.read_dir(dir, u32::MAX).await {
+        Ok(res) => res,
+        Err(crate::file_repository::Error::NotFound { cpath }) if cpath == dir => {
+            return Ok(Default::default())
+        }
+        Err(err) => return Err(err.into()),
+    };
 
-    let all_files_in_repo = repo.read_dir(dir, u32::MAX).await?;
     for file in &all_files_in_repo {
         if let PathInfo::File(info) = file {
             let tracked_file = all_tracked_files.remove(&info.cpath);
@@ -84,7 +93,7 @@ pub(super) async fn status_of_dir(
         ret.push(FileChange::Deleted { cpath: info.cpath })
     }
 
-    Ok(ret)
+    Ok((all_files_in_repo, ret))
 }
 
 /// Determine if we should a file 'changed' based on an old, and a current `FileInfo`

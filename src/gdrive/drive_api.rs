@@ -13,8 +13,8 @@ use http::{Request, StatusCode};
 use oauth2::AccessToken;
 use rand::Rng;
 use reqwest::Body;
-use serde::Serialize;
 use serde::{de, Deserialize};
+use serde::{Deserializer, Serialize};
 use time::OffsetDateTime;
 use url::Url;
 
@@ -40,20 +40,25 @@ pub struct File {
     /// (and possibly others, I'm not quite sure)
     pub parents: Option<[String; 1]>,
 
+    #[serde(flatten)]
     pub more: Option<MoreFileFields>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
 #[serde(untagged)]
 pub enum MoreFileFields {
     #[serde(rename_all = "camelCase")]
     BinaryFile {
         head_revision_id: String,
         sha1_checksum: String,
+        #[serde(deserialize_with = "from_str")]
         size: u64,
     },
     #[serde(rename_all = "camelCase")]
-    Sized { size: u64 },
+    Sized {
+        #[serde(deserialize_with = "from_str")]
+        size: u64,
+    },
 }
 
 #[derive(Deserialize, Debug)]
@@ -187,7 +192,7 @@ impl DriveApi {
         // fields anyway. So we just hardcode it here and move one.
         let url = Url::parse("https://www.googleapis.com/drive/v3/files").unwrap()
             .with_query_pairs(&[
-                Some(("fields", "nextPageToken,files/id,files/name,files/mimeType,files/size,files/sha1Checksum,files/modifiedTime,files/parents")),
+                Some(("fields", "nextPageToken,files/id,files/name,files/mimeType,files/size,files/sha1Checksum,files/modifiedTime,files/parents,files/headRevisionId")),
                 Some(("pageSize", "1000")),
                 // Google does not complain about empty q paramter. Besides, it's never empty in practice
                 Some(("q", q)),
@@ -198,7 +203,8 @@ impl DriveApi {
             .bearer_auth(self.token.secret())
             .body(EMPTY_BODY)?;
 
-        Ok(self.send_retry(req).await?.json().await?)
+        let resp = self.send_retry(req).await?;
+        Ok(resp.json().await?)
     }
 
     /// Wrap file_list and keep reading until nextPageToken is None. Return the end result.
@@ -459,4 +465,66 @@ where
     };
 
     Ok(ret)
+}
+
+// See https://github.com/serde-rs/json/issues/317#issuecomment-300251188
+fn from_str<'de, T, D>(deserializer: D) -> Result<T, D::Error>
+where
+    T: FromStr,
+    T::Err: Display,
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    T::from_str(&s).map_err(de::Error::custom)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_file_parse() {
+        let resp = r#"
+            {
+              "mimeType": "application/pdf",
+              "parents": [
+                "1OxsJmztdignVn-FX1qQidCFxP114z50F"
+              ],
+              "headRevisionId": "0B2qh_6UFaLFoZ0NWQ1NiNWVCNzl0dWZvaERWeHQ0TTVNZWlVPQ",
+              "size": "26656929",
+              "id": "0B2qh_6UFaLFoOFRyYTEya2FjQ1E",
+              "name": "Book.pdf",
+              "modifiedTime": "2017-10-24T20:00:23.000Z",
+              "sha1Checksum": "91a4f57c4a3a75f472eb86f261b374a764d883fc"
+            }
+        "#;
+
+        let test: File = serde_json::from_str(resp).unwrap();
+        let attributes_should_be = MoreFileFields::BinaryFile {
+            head_revision_id: "0B2qh_6UFaLFoZ0NWQ1NiNWVCNzl0dWZvaERWeHQ0TTVNZWlVPQ".to_owned(),
+            sha1_checksum: "91a4f57c4a3a75f472eb86f261b374a764d883fc".to_owned(),
+            size: 26656929,
+        };
+        assert_eq!(test.more, Some(attributes_should_be));
+    }
+
+    #[test]
+    fn test_folder_parse() {
+        let resp = r#"
+            {
+              "mimeType": "application/vnd.google-apps.folder",
+              "parents": [
+                "12QIsh600sDMID96vFu0EZKN_5S8FW8Qw"
+              ],
+              "id": "1OxsJmztdignVn-FX1qQidCFxP114z50F",
+              "name": "Algebra",
+              "modifiedTime": "2018-11-06T00:58:12.616Z"
+            }
+        "#;
+
+        let test: File = serde_json::from_str(resp).unwrap();
+        assert_eq!(test.more, None);
+        assert_eq!(test.mime_type, "application/vnd.google-apps.folder");
+        assert!(test.is_folder());
+    }
 }

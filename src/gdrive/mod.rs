@@ -5,26 +5,13 @@ mod credential;
 mod drive_api;
 mod extensions;
 pub mod oauth;
-use anyhow::Context;
-use anyhow::{anyhow, bail};
-pub use config::*;
-use futures::stream::FuturesUnordered;
-use itertools::Itertools;
-use rusqlite::ffi::SQLITE_CANTOPEN_CONVPATH;
-
+use crate::append_to_cpath_in_place;
+use crate::file_repository::AsyncReader;
+use crate::file_repository::Error as FileRepositoryError;
+use crate::file_repository::Result as FileRepositoryResult;
 use crate::gdrive::drive_api::MoreFileFields;
 use crate::DirectoryInfo;
 use crate::Result;
-use async_recursion::async_recursion;
-pub use credential::{FatAccessToken, GoogleCredential};
-use futures::AsyncRead;
-use std::collections::VecDeque;
-use std::fmt::Write;
-use thiserror::Error;
-use tokio::{sync::Semaphore, task::block_in_place};
-
-use crate::file_repository::Error as FileRepositoryError;
-use crate::file_repository::Result as FileRepositoryResult;
 use crate::{
     append_to_relative_name,
     file_repository::{FileRepository, RemoteRepository},
@@ -34,16 +21,32 @@ use crate::{
     util::SemaphoreGuarded,
     FileInfo, PathInfo,
 };
+use anyhow::Context;
+use anyhow::{anyhow, bail};
+use async_recursion::async_recursion;
+use cached::Cached;
+use cached::TimedCache;
+use cached::TimedSizedCache;
+pub use config::*;
+pub use credential::{FatAccessToken, GoogleCredential};
+use futures::stream::FuturesUnordered;
+use futures::AsyncRead;
+use futures::StreamExt;
+use std::collections::VecDeque;
+use std::fmt::Write;
+use std::pin::Pin;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
+use thiserror::Error;
+use tokio::{sync::Semaphore, task::block_in_place};
 
 use self::drive_api::FilesReq;
 
 #[derive(Debug, Error)]
 pub(super) enum Error {
-    /// Returned if an HTTP request succeeded, but failed because of a non 2xx status code
+    /// Returned if a HTTP request succeeded, but failed because of a non 2xx status code
     #[error("HTTP {method} {uri} failed with status code {code}")]
     HttpRequestFailed {
         method: http::Method,
@@ -70,12 +73,13 @@ pub struct GDriveBackend {
     /// For this, we assume that this object is generally short lived and pretend
     /// like concurrent modification is not an issue (someone could move the folder,
     /// for example. Then the cached ID would point to another path now.).
-    id_cache: Arc<IdCache>,
+    id_cache: Arc<Mutex<TimedCache<String, Arc<String>>>>,
+
     credential: Arc<GoogleCredential>,
 }
 
 impl FileRepository for GDriveBackend {
-    type Reader = Box<dyn AsyncRead + Send + Unpin>;
+    type Reader = Pin<Box<dyn AsyncReader>>;
 
     async fn read_dir(&self, cpath: &str, up_to_depth: u32) -> FileRepositoryResult<Vec<PathInfo>> {
         const BATCH_SIZE: usize = 12;
@@ -99,22 +103,32 @@ impl FileRepository for GDriveBackend {
             }
 
             let mut next_queue = Vec::new();
+            let mut fts = FuturesUnordered::new();
 
             // Take up to BATCH_SIZE directories, and explore them using a single API call.
             // But: We can make several of these API calls concurrently, so let's do that :)
             for chunk in queue.chunks(BATCH_SIZE) {
-                let next = self
-                    .read_dirs(chunk)
-                    .await
-                    .map_err(|err| FileRepositoryError::Other(err))?;
+                fts.push(async move {
+                    let ret = self
+                        .read_dirs(chunk)
+                        .await
+                        .map_err(FileRepositoryError::Other)?;
 
-                for (next_id, next_info) in next {
+                    Ok(ret)
+                });
+            }
+
+            while let Some(next) = fts.next().await {
+                // TODO: Do not return immediately on error
+                for (next_id, next_info) in next? {
                     if let PathInfo::Dir(info) = &next_info {
                         next_queue.push((next_id, info.clone()));
                     }
                     ret.push(next_info);
                 }
             }
+
+            drop(fts);
 
             queue = next_queue;
         }
@@ -169,7 +183,7 @@ impl GDriveBackend {
             mkdir_lock: tokio::sync::Mutex::new(()),
             credential: Arc::new(credential),
             client,
-            id_cache: Default::default(),
+            id_cache: Arc::new(Mutex::new(TimedCache::with_lifespan(60))),
         }
     }
 
@@ -181,26 +195,23 @@ impl GDriveBackend {
         Ok(SemaphoreGuarded { permit, inner })
     }
 
-    /// Try and find the Google-Drive-ID of the given relative name (path). If use_cache is set,
-    /// the results may come from a cache. This cache is never invalidated for the lifetime
-    /// of the object Self, since it is assumed that this object is generally short lived.
-    /// If only_folders is set, this returns the Error::NotAFolder if *something* exists at the given
-    /// relative path, but it is not a folder.
-    #[async_recursion]
-    async fn get_drive_id_advanced(
-        &self,
-        cpath: &str,
-        use_cache: bool,
-        only_folders: bool,
-    ) -> anyhow::Result<String> {
+    fn cache_id(&self, cpath: &str, id: &str) {
+        log::debug!("Cache: path {cpath} has id {id}");
+        self.id_cache
+            .lock()
+            .unwrap()
+            .cache_set(cpath.to_owned(), Arc::new(id.to_owned()));
+    }
+
+    fn get_cached_id(&self, cpath: &str) -> Option<Arc<String>> {
+        self.id_cache.lock().unwrap().cache_get(cpath).cloned()
+    }
+
+    /// Try and find the Google-Drive-ID of the given cpath. None of the results this function returns are cached.
+    /// However, this function uses read_dirs under the hood, and therefore may update the cache when running.
+    async fn get_drive_id(&self, cpath: &str) -> anyhow::Result<String> {
         // Trust me: It's not worth it to do this non-recursively, even if we then could
         // avoid the heap allocation thats caused by async_recursion.
-
-        if use_cache {
-            if let Some(x) = self.id_cache.get(cpath) {
-                return Ok(x.clone());
-            }
-        }
 
         // In Google Drive, the root folder has an actual id (e.g. 0AGqh_9UFaLFoUk9PVA) and the "virtual" id
         // 'root' by which it can be accessed almost anywhere. Unfortunately, we need the actual id,
@@ -208,92 +219,62 @@ impl GDriveBackend {
         // behavior in the read_dir function, that concurrently fetches multiple directory contents
         // in a single request.
         // See also: https://developers.google.com/drive/api/guides/folder
-        if cpath.is_empty() {
-            let f = self.make_drive_api().await?.files_get("root").await?;
-            debug_assert_eq!(f.parents, None);
+        let root_file = self.make_drive_api().await?.files_get("root").await?;
+        debug_assert_eq!(root_file.parents, None);
+        self.cache_id(cpath, &root_file.id);
 
-            self.id_cache.update(cpath, &f.id);
-            return Ok(f.id);
+        if cpath.is_empty() {
+            return Ok(root_file.id);
         }
 
-        // If not, find our parent, get its id, list its contents. We should be in that list.
-        let (parent_cpath, _) = pop_cpath(cpath);
-        let parent_id = self
-            .get_drive_id_advanced(parent_cpath, use_cache, only_folders)
-            .await?;
+        let mut current_cpath = "";
+        let mut current_id = root_file.id;
 
-        // It would be possible here to only list the folders first, and check if
-        // we are looking for a folder. This would only really be worth it when one assumes that
-        // there are far less folders in a folder than files. I am unsure if that is the case in
-        // general or if thats worth it.
-        let mut ret = None;
+        let sep_indices = cpath
+            .match_indices('/')
+            .map(|(i, _)| i)
+            .chain(std::iter::once(cpath.len()));
 
-        let files = self
-            .make_drive_api()
-            .await?
-            .file_list_all(&format!("'{parent_id}' in parents and trashed=false"))
-            .await?;
+        for i in sep_indices {
+            let next_cpath = &cpath[..i];
+            let files = self
+                .read_dirs(&[(
+                    current_id,
+                    DirectoryInfo {
+                        cpath: current_cpath.to_owned(),
+                    },
+                )])
+                .await?;
 
-        for file in files {
-            let this_relative_name = append_to_relative_name(parent_cpath, &file.name);
-            // Use the opportunity to remember a lot of the ids
-            self.id_cache.update(&this_relative_name, &file.id);
+            // Append the current part to cpath, to make the "target" cpath; the one we're looking for.
+            let mut next_id = None;
 
-            if this_relative_name == cpath {
-                if ret.is_some() {
-                    println!(
-                        "Warning: Folder {} [{}] contains two children with the same name",
-                        parent_cpath, parent_id
-                    );
+            for (id, info) in files {
+                if info.cpath() == next_cpath {
+                    if next_id.is_some() {
+                        // TODO: Warn that there are duplicate two files with the same name!
+                    }
+                    next_id = Some(id);
                 }
+            }
 
-                if only_folders && !file.is_folder() {
-                    bail!(FileRepositoryError::NotAFolder {
-                        cpath: cpath.to_owned()
-                    });
-                }
-
-                ret = Some(file.id)
+            if let Some(next_id) = next_id {
+                current_id = next_id;
+                current_cpath = next_cpath;
+            } else {
+                bail!(FileRepositoryError::NotFound {
+                    cpath: next_cpath.to_owned()
+                })
             }
         }
 
-        ret.ok_or_else(|| {
-            anyhow!(FileRepositoryError::NotFound {
-                cpath: cpath.to_string()
-            })
-        })
-    }
-
-    async fn get_drive_id(&self, relative_name: &str) -> anyhow::Result<String> {
-        self.get_drive_id_advanced(relative_name, true, false).await
+        log::debug!("Id of {cpath:?} is {current_id:?}");
+        Ok(current_id)
     }
 
     #[async_recursion]
     async fn mkdir_all_impl(&self, relative_name: &str) -> anyhow::Result<String> {
-        // Base case: If this already exists, just return its id
-        match self.get_drive_id_advanced(relative_name, true, true).await {
-            Ok(id) => return Ok(id),
-            Err(err) => match err.downcast_ref::<FileRepositoryError>() {
-                Some(FileRepositoryError::NotFound { .. }) => {
-                    // Path does not yet exist, so we find our parent and create a new folder there.
-                    let (parent, name) = pop_cpath(relative_name);
-
-                    let parent_id = self.mkdir_all_impl(parent).await?;
-                    let req = drive_api::FilesReq {
-                        name: Some(name.to_string()),
-                        mime_type: Some("application/vnd.google-apps.folder".to_string()),
-                        parents: Some(vec![parent_id]),
-                        ..Default::default()
-                    };
-
-                    let id = self.make_drive_api().await?.files_create(req).await?.id;
-                    self.id_cache.update(relative_name, &id);
-
-                    Ok(id)
-                }
-                _ => bail!(err),
-            },
-        }
+        todo!()
     }
 
     /// Creates the given relative name and returns its id. If this path
@@ -330,10 +311,10 @@ impl GDriveBackend {
 
             q
         };
-        log::debug!("Google drive query string is {query}");
+
+        log::debug!("Requesting files with query {query}");
 
         let files = self.make_drive_api().await?.file_list_all(&query).await?;
-
         for file in files {
             let parent_id = &file
                 .parents
@@ -342,7 +323,7 @@ impl GDriveBackend {
 
             let parent_cpath = targets
                 .iter()
-                .find(|(id, _)| false)
+                .find(|(id, _)| id == parent_id)
                 .map(|(_, info)| &info.cpath)
                 .with_context(|| format!("List of targets is {targets:?} and we recevied a file with parent id {parent_id:?}"))
                 .expect("Every file we receive should have a parent we know of");
@@ -394,7 +375,7 @@ impl GDriveBackend {
             .await?
             .id;
 
-        self.id_cache.update(cpath, id);
+        self.cache_id(cpath, &id);
 
         Ok(())
     }

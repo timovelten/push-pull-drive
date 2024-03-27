@@ -20,7 +20,7 @@ pub struct GoogleDriveInitArgs {
     /// `installed/client_secret` with values the OAuth Client ID and Client Secret respectively.
     /// You can create this file yourself or download it from the Google Cloud Console using the
     /// "Download JSON" button after creating a new Desktop OAuth Client at
-    /// https://console.cloud.google.com/apis/credentials
+    /// <https://console.cloud.google.com/apis/credentials>
     #[arg(value_name = "path")]
     secrets_path: String,
 }

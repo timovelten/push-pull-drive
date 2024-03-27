@@ -1,5 +1,6 @@
 use crate::Result;
 use anyhow::bail;
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -52,16 +53,23 @@ pub fn relative_name<P: AsRef<Path>, Q: AsRef<Path>>(base_path: P, path: Q) -> R
     }
 }
 
-pub fn append_to_relative_name(relative_name: &str, filename: &str) -> String {
-    if filename.is_empty() {
-        return relative_name.to_string();
+pub fn append_to_cpath_in_place(base_cpath: &mut String, s: &str) {
+    if base_cpath.is_empty() {
+        write!(base_cpath, "{}", s).unwrap();
+        return;
     }
 
-    if relative_name.is_empty() {
-        filename.to_owned()
-    } else {
-        format!("{}/{}", relative_name, filename)
+    if s.is_empty() {
+        return;
     }
+
+    write!(base_cpath, "/{}", s).unwrap();
+}
+
+pub fn append_to_relative_name(relative_name: &str, filename: &str) -> String {
+    let mut ret = relative_name.to_owned();
+    append_to_cpath_in_place(&mut ret, filename);
+    ret
 }
 
 pub fn pop_cpath(cpath: &str) -> (&str, &str) {

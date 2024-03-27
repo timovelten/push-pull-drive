@@ -27,11 +27,13 @@ pin-project-lite = "0.2.13"
 log = "0.4.0"
 env_logger = "0.10.0"
 prodash = { version = "28.0.0", features = ["render-line", "render-line-crossterm"] }
-itertools = "0.12.1"
 ahash = "0.8.7"
 anyhow = "1.0.81"
 hex = "0.4.3"
 const_format = "0.2.32"
+cached = { version = "0.49.2", default-features = false, features = ["ahash"] }
+libc = "0.2.153"
+either = "1.10.0"
 
 [dev-dependencies]
 tempfile = "3.3.0"

@@ -6,11 +6,14 @@ use crate::{
 #[derive(clap::Args)]
 pub struct LsArgs {
     path: Option<String>,
+
+    #[arg(short, long)]
+    depth: Option<u32>,
 }
 
-pub async fn remote_ls(ctx: &impl Context, LsArgs { path }: LsArgs) -> anyhow::Result<()> {
+pub async fn remote_ls(ctx: &impl Context, LsArgs { path, depth }: LsArgs) -> anyhow::Result<()> {
     let path = append_to_relative_name(ctx.wd(), path.as_deref().unwrap_or(""));
-    let mut contents = ctx.remote().read_dir(&path, 1).await?;
+    let mut contents = ctx.remote().read_dir(&path, depth.unwrap_or(1)).await?;
 
     // Sort directories first
     fn key(f: &PathInfo) -> (u8, &str) {

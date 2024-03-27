@@ -41,6 +41,13 @@ impl PathInfo {
             PathInfo::File(_) => true,
         }
     }
+
+    pub fn cpath(&self) -> &str {
+        match self {
+            PathInfo::Dir(DirectoryInfo { cpath }) => cpath.as_str(),
+            PathInfo::File(FileInfo { cpath, .. }) => cpath.as_str(),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

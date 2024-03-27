@@ -1,5 +1,6 @@
 pub mod config;
 pub mod file_hasher;
+use anyhow::anyhow;
 pub use config::*;
 
 use crate::{
@@ -14,6 +15,7 @@ use std::{
     fs::File,
     io::{ErrorKind, Seek},
     path::PathBuf,
+    pin::Pin,
     sync::Arc,
 };
 use time::OffsetDateTime;
@@ -127,13 +129,18 @@ impl<H: FileHasher> LocalBackend<H> {
 
             file.rewind().map_err(as_other_error)?;
             (PathInfo::File(info), file)
-        } else {
+        } else if metadata.is_dir() {
             (
                 PathInfo::Dir(DirectoryInfo {
                     cpath: cpath.to_owned(),
                 }),
                 file,
             )
+        } else {
+            // For now, we ignore symlinks by return NotAllowed...
+            return Err(FileRepositoryError::NotAllowed {
+                cpath: cpath.to_owned(),
+            });
         };
 
         Ok(res)
@@ -214,23 +221,35 @@ fn map_io_error(err: std::io::Error, cpath: &str) -> FileRepositoryError {
         return as_other_error(err);
     }
 
-    let res = match err.kind() {
+    match err.kind() {
         ErrorKind::NotFound => FileRepositoryError::NotFound {
             cpath: cpath.to_owned(),
         },
         ErrorKind::PermissionDenied => FileRepositoryError::NotAllowed {
             cpath: cpath.to_owned(),
         },
-        _ => return as_other_error(err),
-    };
-
-    println!("Mapping {err:?} to {res:?}");
-
-    res
+        _ => {
+            // It is actually extremely unfortunate that more error kinds are still not
+            // stabilized. In the meantime, we really want the IsADirectory and IsNotADirectory
+            // so we do them ourselves here...
+            match err.raw_os_error() {
+                Some(libc::ENOTDIR) => FileRepositoryError::NotADirectory {
+                    cpath: cpath.to_owned(),
+                },
+                Some(libc::EISDIR) => FileRepositoryError::IsADirectory {
+                    cpath: cpath.to_owned(),
+                },
+                _ => {
+                    let e = anyhow!(err).context(cpath.to_owned());
+                    FileRepositoryError::Other(e)
+                }
+            }
+        }
+    }
 }
 
 fn as_other_error(err: std::io::Error) -> FileRepositoryError {
-    return FileRepositoryError::Other(err.into());
+    FileRepositoryError::Other(err.into())
 }
 
 impl Config {
@@ -250,7 +269,7 @@ impl Config {
 }
 
 impl<H: FileHasher> FileRepository for LocalBackend<H> {
-    type Reader = SemaphoreGuarded<Compat<TokioFile>>;
+    type Reader = Pin<SemaphoreGuarded<Compat<TokioFile>>>;
 
     async fn read_file(&self, cpath: &str) -> FileRepositoryResult<(FileInfo, Self::Reader)> {
         let permit = self.aquire_owned_permit().await;
@@ -260,7 +279,7 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
             .await
             .unwrap()?
         else {
-            return Err(FileRepositoryError::NotAFile {
+            return Err(FileRepositoryError::IsADirectory {
                 cpath: cpath.to_owned(),
             });
         };
@@ -270,7 +289,7 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
             inner: TokioFile::from_std(file).compat(),
         };
 
-        Ok((info, reader))
+        Ok((info, Pin::new(reader)))
     }
 
     async fn write_file<R: AsyncRead + Send>(
@@ -301,9 +320,9 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
             .write(true)
             .read(true)
             .truncate(true)
-            .open(&local_path)
+            .open(local_path)
             .await
-            .map_err(|err| map_io_error(err, &cpath))?;
+            .map_err(|err| map_io_error(err, cpath))?;
 
         let mut src = Box::pin(src.compat());
         tokio::io::copy(&mut src, &mut file)
@@ -669,5 +688,42 @@ mod tests {
                 cpath
             } if cpath == "should-not-exist"
         ));
+    }
+
+    #[tokio::test]
+    async fn test_write_file_on_directory() {
+        // Check that if write_file is called on a path that exists but is a directory
+        // returns Error::IsADirectory.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("testdir").join("nested")).unwrap();
+        let b = LocalBackend::<Sha1Hasher>::from_config(Config {
+            root_path: tmp.path().to_owned(),
+            ..Default::default()
+        });
+
+        let result = b
+            .write_file("testdir/nested", None, futures::io::empty(), 0)
+            .await
+            .unwrap_err();
+        let FileRepositoryError::IsADirectory { cpath } = result else {
+            panic!("Unexpectedly got {:?}", result);
+        };
+        assert_eq!(cpath, "testdir/nested");
+    }
+
+    #[tokio::test]
+    async fn test_read_file_on_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("testdir").join("nested")).unwrap();
+        let b = LocalBackend::<Sha1Hasher>::from_config(Config {
+            root_path: tmp.path().to_owned(),
+            ..Default::default()
+        });
+
+        let result = b.read_file("testdir/nested").await.unwrap_err();
+        let FileRepositoryError::IsADirectory { cpath } = result else {
+            panic!("Unexpectedly got {:?}", result);
+        };
+        assert_eq!(cpath, "testdir/nested");
     }
 }
