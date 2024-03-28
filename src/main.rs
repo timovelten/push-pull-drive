@@ -18,7 +18,7 @@ use commands::{
     push_pull::{self, PushPullArgs},
     status::{self, StatusArgs},
 };
-use context::{find_core_context, Context, CoreContext, FullContext};
+use context::{find_core_context, Ctx, CoreContext, GlobalContext};
 use env_logger::{Builder, Target};
 pub use fileinfo::*;
 use local::LocalBackend;
@@ -111,8 +111,8 @@ pub fn main() -> anyhow::Result<()> {
     }
 }
 
-// We use this awkward construction, where this returns dyn CommandHandler instead
-// of FullContext<B> so that FullContext<B> does not need to be dyn.
+// This awkward construction enables us to have type parameters inside of the context, whose
+// value is only determined at runtime.
 fn get_full_context(ctx: CoreContext) -> anyhow::Result<Box<dyn CommandHandler>> {
     let config = local::Config {
         root_path: ctx.root_dir.clone(),
@@ -125,9 +125,9 @@ fn get_full_context(ctx: CoreContext) -> anyhow::Result<Box<dyn CommandHandler>>
     // to return None if it is not applicable to the current config. In that case we
     // continue to the next candidate.
     let ret: Box<dyn CommandHandler> = if let Some(remote) = local::load(&ctx)? {
-        Box::new(FullContext::new(ctx, local, remote))
+        Box::new(GlobalContext::new(ctx, local, remote))
     } else if let Some(remote) = gdrive::load(&ctx)? {
-        Box::new(FullContext::new(ctx, local, remote))
+        Box::new(GlobalContext::new(ctx, local, remote))
     } else {
         return Err(anyhow!("Config invalid. All backends failed to load."));
     };
@@ -135,7 +135,7 @@ fn get_full_context(ctx: CoreContext) -> anyhow::Result<Box<dyn CommandHandler>>
     Ok(ret)
 }
 
-impl<C: Context> CommandHandler for C {
+impl<C: Ctx> CommandHandler for C {
     fn handle(&mut self, cmd: Commands) -> anyhow::Result<()> {
         let handler_future = async move {
             match cmd {

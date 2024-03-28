@@ -7,7 +7,7 @@ use anyhow::bail;
 
 use crate::{
     db::{KeyValueStore, Side, SqliteDatabase, TrackedFilesRepository},
-    file_repository::RemoteRepository,
+    file_repository::FileRepository,
     local::LocalBackend,
     paths, FileInfo,
 };
@@ -22,38 +22,31 @@ pub struct CoreContext {
     pub tracked_files: Arc<dyn TrackedFilesRepository>,
 }
 
-pub struct FullContext<R: RemoteRepository> {
+pub struct GlobalContext<R: FileRepository> {
     pub core: CoreContext,
-    pub local: LocalBackend<R::Hasher>,
+    pub local: LocalBackend,
     pub remote: R,
 }
 
-impl<R: RemoteRepository> FullContext<R> {
-    pub fn new(core: CoreContext, local: LocalBackend<R::Hasher>, remote: R) -> Self {
+#[allow(dead_code)]
+impl<R: FileRepository> GlobalContext<R> {
+    pub fn new(core: CoreContext, local: LocalBackend, remote: R) -> Self {
         Self {
             core,
             local,
             remote,
         }
     }
-}
 
-pub trait Context {
-    type Remote: RemoteRepository;
-
-    fn get(&self) -> &FullContext<Self::Remote>;
-
-    fn get_mut(&mut self) -> &mut FullContext<Self::Remote>;
-
-    fn key_value_store(&self) -> &dyn KeyValueStore {
+    pub fn key_value_store(&self) -> &dyn KeyValueStore {
         &*self.get().core.key_value_store
     }
 
-    fn tracked_files(&self) -> &dyn TrackedFilesRepository {
+    pub fn tracked_files(&self) -> &dyn TrackedFilesRepository {
         &*self.get().core.tracked_files
     }
 
-    fn tracked_files_or_ignore(&self, ignore_index: bool) -> &dyn TrackedFilesRepository {
+    pub fn tracked_files_or_ignore(&self, ignore_index: bool) -> &dyn TrackedFilesRepository {
         if ignore_index {
             &IgnoreTrackedFilesRepo
         } else {
@@ -61,27 +54,44 @@ pub trait Context {
         }
     }
 
-    fn local(&self) -> &LocalBackend<<Self::Remote as RemoteRepository>::Hasher> {
+    pub fn local(&self) -> &LocalBackend {
         &self.get().local
     }
 
-    fn remote(&self) -> &Self::Remote {
+    pub fn remote(&self) -> &R {
         &self.get().remote
     }
 
-    fn wd(&self) -> &str {
+    pub fn wd(&self) -> &str {
         &self.get().core.wd
     }
 }
 
-impl<R: RemoteRepository> Context for FullContext<R> {
+/// This Trait exists purely out of convenience. We want to be able to simpl write
+/// function arguments as 
+/// `ctx: &impl Ctx` instead of `<R: FileRepository>(ctx: &FullContext<R>)`.
+pub trait Ctx {
+    type Remote: FileRepository;
+
+    fn get(&self) -> &GlobalContext<Self::Remote>;
+
+    fn get_mut(&mut self) -> &mut GlobalContext<Self::Remote>;
+
+    fn into(self) -> GlobalContext<Self::Remote>;
+}
+
+impl<R: FileRepository> Ctx for GlobalContext<R> {
     type Remote = R;
 
-    fn get(&self) -> &FullContext<Self::Remote> {
+    fn get(&self) -> &GlobalContext<Self::Remote> {
         self
     }
 
-    fn get_mut(&mut self) -> &mut FullContext<Self::Remote> {
+    fn get_mut(&mut self) -> &mut GlobalContext<Self::Remote> {
+        self
+    }
+    
+    fn into(self) -> GlobalContext<Self::Remote> {
         self
     }
 }

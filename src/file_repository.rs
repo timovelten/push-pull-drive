@@ -91,7 +91,3 @@ pub trait FileRepository: Debug + Send + Sync {
         }
     }
 }
-
-pub trait RemoteRepository: FileRepository {
-    type Hasher: FileHasher;
-}

@@ -4,7 +4,7 @@ use anyhow::anyhow;
 pub use config::*;
 
 use crate::{
-    file_repository::{FileRepository, RemoteRepository},
+    file_repository::FileRepository,
     paths,
     util::SemaphoreGuarded,
     DirectoryInfo, FileInfo, PathInfo,
@@ -400,10 +400,6 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
 
         Ok(info)
     }
-}
-
-impl RemoteRepository for LocalBackend<Sha1Hasher> {
-    type Hasher = Sha1Hasher;
 }
 
 #[cfg(test)]

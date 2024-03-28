@@ -14,9 +14,8 @@ use crate::DirectoryInfo;
 use crate::Result;
 use crate::{
     append_to_relative_name,
-    file_repository::{FileRepository, RemoteRepository},
+    file_repository::FileRepository,
     gdrive::drive_api::DriveApi,
-    local::file_hasher::Sha1Hasher,
     pop_cpath,
     util::SemaphoreGuarded,
     FileInfo, PathInfo,
@@ -168,10 +167,6 @@ impl FileRepository for GDriveBackend {
     ) -> FileRepositoryResult<()> {
         todo!()
     }
-}
-
-impl RemoteRepository for GDriveBackend {
-    type Hasher = Sha1Hasher;
 }
 
 impl GDriveBackend {

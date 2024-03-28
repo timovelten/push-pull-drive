@@ -2,7 +2,7 @@ use super::status::status_of_dir;
 use crate::db::TrackedFilesRepository;
 use crate::file_repository::Error as FileRepositoryError;
 use crate::{
-    context::Context,
+    context::Ctx,
     db::Side,
     file_repository::FileRepository,
     paths,
@@ -41,7 +41,7 @@ fn setup_progress(name: &str) -> (prodash::tree::Item, impl Any) {
     (item, keep_around)
 }
 
-pub async fn push(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> {
+pub async fn push(ctx: &impl Ctx, args: PushPullArgs) -> anyhow::Result<()> {
     let ctx = ctx.get();
     let (progress, _drop_later) = setup_progress("push");
     let mut flow = PushPullFlow {
@@ -58,7 +58,7 @@ pub async fn push(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> 
     Ok(())
 }
 
-pub async fn pull(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> {
+pub async fn pull(ctx: &impl Ctx, args: PushPullArgs) -> anyhow::Result<()> {
     let ctx = ctx.get();
     let (progress, _drop_later) = setup_progress("pull");
     let mut flow = PushPullFlow {

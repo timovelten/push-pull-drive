@@ -1,5 +1,5 @@
 use crate::{
-    context::Context,
+    context::Ctx,
     db::{Side, TrackedFilesRepository},
     file_repository::FileRepository,
     FileChange, FileInfo, PathInfo,
@@ -12,7 +12,7 @@ pub struct StatusArgs {
     pub ignore_index: bool,
 }
 
-pub async fn local_status(ctx: &impl Context, args: StatusArgs) -> anyhow::Result<()> {
+pub async fn local_status(ctx: &impl Ctx, args: StatusArgs) -> anyhow::Result<()> {
     let ctx = ctx.get();
     let (_, report) = status_of_dir(
         ctx.tracked_files_or_ignore(args.ignore_index),
@@ -26,7 +26,7 @@ pub async fn local_status(ctx: &impl Context, args: StatusArgs) -> anyhow::Resul
     Ok(())
 }
 
-pub async fn remote_status(ctx: &impl Context, args: StatusArgs) -> anyhow::Result<()> {
+pub async fn remote_status(ctx: &impl Ctx, args: StatusArgs) -> anyhow::Result<()> {
     let ctx = ctx.get();
     let (_, report) = status_of_dir(
         ctx.tracked_files_or_ignore(args.ignore_index),

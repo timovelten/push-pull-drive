@@ -1,6 +1,5 @@
 use crate::{
-    append_to_relative_name, context::Context, file_repository::FileRepository, DirectoryInfo,
-    FileInfo, PathInfo,
+    append_to_relative_name, context::Ctx, file_repository::FileRepository, DirectoryInfo, FileInfo, PathInfo
 };
 
 #[derive(clap::Args)]
@@ -11,7 +10,9 @@ pub struct LsArgs {
     depth: Option<u32>,
 }
 
-pub async fn remote_ls(ctx: &impl Context, LsArgs { path, depth }: LsArgs) -> anyhow::Result<()> {
+pub async fn remote_ls(ctx: &impl Ctx, LsArgs { path, depth }: LsArgs) -> anyhow::Result<()> {
+    let ctx = ctx.get();
+
     let path = append_to_relative_name(ctx.wd(), path.as_deref().unwrap_or(""));
     let mut contents = ctx.remote().read_dir(&path, depth.unwrap_or(1)).await?;
 
