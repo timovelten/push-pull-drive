@@ -13,17 +13,18 @@ mod util;
 use anyhow::anyhow;
 use clap::{Parser, Subcommand};
 use commands::{
-    init::{self, InitBackend},
+    init::{self, InitBackendCmd},
     ls::{self, LsArgs},
     push_pull::{self, PushPullArgs},
     status::{self, StatusArgs},
 };
-use context::{find_core_context, Ctx, CoreContext, GlobalContext};
+use context::{find_context, Context, Ctx, FullContext};
 use env_logger::{Builder, Target};
 pub use fileinfo::*;
 use local::LocalBackend;
 pub use paths::*;
 use std::fs::File;
+use util::shell::Shell;
 
 const CONFIG_DIR: &str = ".basicdrive";
 const DATABASE_NAME: &str = "database.sqlite3";
@@ -54,7 +55,7 @@ enum Commands {
     /// Adds files to myapp
     Init {
         #[command(subcommand)]
-        backend: InitBackend,
+        backend: InitBackendCmd,
     },
     /// Show status of local files
     Status(StatusArgs),
@@ -86,6 +87,11 @@ pub fn main() -> anyhow::Result<()> {
         _ => std::env::current_dir()?,
     };
 
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("building runtime should not fail");
+
     if let Some(path) = cli.log {
         let target = if path == "-" {
             Target::Stdout
@@ -102,10 +108,10 @@ pub fn main() -> anyhow::Result<()> {
 
     if let Commands::Init { backend } = &cli.command {
         // Handle init separately
-        init::init(backend.clone(), &wd)
+        init::init(backend.clone(), &wd, Shell::new(), rt.handle().clone())
     } else {
         // Handle every other command
-        let ctx = find_core_context(&wd).unwrap();
+        let ctx = find_context(&wd, Shell::new(), rt.handle().clone()).unwrap();
         let mut full_context = get_full_context(ctx).unwrap();
         full_context.handle(cli.command)
     }
@@ -113,7 +119,7 @@ pub fn main() -> anyhow::Result<()> {
 
 // This awkward construction enables us to have type parameters inside of the context, whose
 // value is only determined at runtime.
-fn get_full_context(ctx: CoreContext) -> anyhow::Result<Box<dyn CommandHandler>> {
+fn get_full_context(ctx: Context) -> anyhow::Result<Box<dyn CommandHandler>> {
     let config = local::Config {
         root_path: ctx.root_dir.clone(),
         ignore_prefixes: vec![crate::CONFIG_DIR.to_string()],
@@ -125,9 +131,9 @@ fn get_full_context(ctx: CoreContext) -> anyhow::Result<Box<dyn CommandHandler>>
     // to return None if it is not applicable to the current config. In that case we
     // continue to the next candidate.
     let ret: Box<dyn CommandHandler> = if let Some(remote) = local::load(&ctx)? {
-        Box::new(GlobalContext::new(ctx, local, remote))
+        Box::new(FullContext::new(ctx, local, remote))
     } else if let Some(remote) = gdrive::load(&ctx)? {
-        Box::new(GlobalContext::new(ctx, local, remote))
+        Box::new(FullContext::new(ctx, local, remote))
     } else {
         return Err(anyhow!("Config invalid. All backends failed to load."));
     };
@@ -137,6 +143,8 @@ fn get_full_context(ctx: CoreContext) -> anyhow::Result<Box<dyn CommandHandler>>
 
 impl<C: Ctx> CommandHandler for C {
     fn handle(&mut self, cmd: Commands) -> anyhow::Result<()> {
+        let handle = self.get().ctx.handle.clone();
+
         let handler_future = async move {
             match cmd {
                 Commands::Init { .. } => {
@@ -150,11 +158,6 @@ impl<C: Ctx> CommandHandler for C {
             }
         };
 
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("building runtime should not fail");
-
-        rt.block_on(handler_future)
+        handle.block_on(handler_future)
     }
 }

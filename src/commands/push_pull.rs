@@ -1,5 +1,5 @@
 use super::status::status_of_dir;
-use crate::db::TrackedFilesRepository;
+use crate::context::{Context, FullContext};
 use crate::file_repository::Error as FileRepositoryError;
 use crate::{
     context::Ctx,
@@ -13,11 +13,7 @@ use crate::{
 use anyhow::{bail, Context as _};
 use either::Either;
 use futures::{stream::FuturesUnordered, StreamExt};
-use prodash::{tree::Root, Count, NestedProgress, Progress};
-use std::{
-    any::Any,
-    sync::{Arc, Mutex},
-};
+use std::io::Write;
 
 #[derive(clap::Args)]
 pub struct PushPullArgs {
@@ -27,30 +23,14 @@ pub struct PushPullArgs {
     pub yes: bool,
 }
 
-fn setup_progress(name: &str) -> (prodash::tree::Item, impl Any) {
-    let root = Root::new();
-    let options = prodash::render::line::Options {
-        ..Default::default()
-    };
-    let renderer = prodash::render::line(std::io::stderr(), Arc::<Root>::downgrade(&root), options);
-    let item = root.add_child(name);
-
-    // The caller must not drop this if he wants there to be progress...
-    let keep_around = (root, renderer);
-
-    (item, keep_around)
-}
-
-pub async fn push(ctx: &impl Ctx, args: PushPullArgs) -> anyhow::Result<()> {
-    let ctx = ctx.get();
-    let (progress, _drop_later) = setup_progress("push");
+pub async fn push(ctx: &impl Ctx, _: PushPullArgs) -> anyhow::Result<()> {
+    let FullContext { ctx, local, remote } = ctx.get();
     let mut flow = PushPullFlow {
-        tracked_files: ctx.tracked_files_or_ignore(args.ignore_index),
-        from: ctx.local(),
-        to: ctx.remote(),
+        ctx: &ctx,
+        from: local,
+        to: remote,
         wd: ctx.wd(),
         from_side: Side::Local,
-        progress: Arc::new(Mutex::new(progress)),
         state: PushPullState::None,
     };
     flow.execute().await?;
@@ -58,16 +38,14 @@ pub async fn push(ctx: &impl Ctx, args: PushPullArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn pull(ctx: &impl Ctx, args: PushPullArgs) -> anyhow::Result<()> {
-    let ctx = ctx.get();
-    let (progress, _drop_later) = setup_progress("pull");
+pub async fn pull(ctx: &impl Ctx, _: PushPullArgs) -> anyhow::Result<()> {
+    let FullContext { ctx, local, remote } = ctx.get();
     let mut flow = PushPullFlow {
-        tracked_files: ctx.tracked_files_or_ignore(args.ignore_index),
-        from: ctx.remote(),
-        to: ctx.local(),
+        ctx: &ctx,
+        from: remote,
+        to: local,
         wd: ctx.wd(),
         from_side: Side::Remote,
-        progress: Arc::new(Mutex::new(progress)),
         state: PushPullState::None,
     };
     flow.execute().await?;
@@ -105,13 +83,12 @@ enum PushPullState {
     Transient,
 }
 
-struct PushPullFlow<'a, T: ?Sized, A, B, P> {
-    tracked_files: &'a T,
+struct PushPullFlow<'a, A, B> {
+    ctx: &'a Context,
     from: &'a A,
     to: &'a B,
     wd: &'a str,
     from_side: Side,
-    progress: Arc<Mutex<P>>,
     state: PushPullState,
 }
 
@@ -195,13 +172,10 @@ fn either_okay_or_conflict(
     Either::Left(from_change)
 }
 
-impl<'a, T, A, B, P> PushPullFlow<'a, T, A, B, P>
+impl<'a, A, B> PushPullFlow<'a, A, B>
 where
     A: FileRepository,
     B: FileRepository,
-    T: TrackedFilesRepository + ?Sized,
-    P: NestedProgress,
-    P::SubProgress: 'static,
 {
     async fn execute(&mut self) -> anyhow::Result<()> {
         loop {
@@ -226,7 +200,7 @@ where
         // check what has changed on the from side. These are the only files we (may) touch on the destination side.i
         // (Except possibly for directories that contain no files, we may silently delete those).
         let (_, from_changes) =
-            status_of_dir(self.tracked_files, self.from, self.wd, self.from_side).await?;
+            status_of_dir(self.ctx.tracked_files(), self.from, self.wd, self.from_side).await?;
 
         if from_changes.is_empty() {
             self.state = PushPullState::NothingToDo;
@@ -239,8 +213,13 @@ where
         log::debug!("Using optimized working directory {better_wd} for querying remote");
 
         // Determine all files in the "better working directory" and check if they have changed
-        let (_, mut to_changes) =
-            status_of_dir(self.tracked_files, self.to, better_wd, !self.from_side).await?;
+        let (_, mut to_changes) = status_of_dir(
+            self.ctx.tracked_files(),
+            self.to,
+            better_wd,
+            !self.from_side,
+        )
+        .await?;
 
         // find_conflicts requires to_changes to be sorted.
         sort_filechanges(&mut to_changes);
@@ -280,11 +259,6 @@ where
             bail!("Wrong state");
         };
 
-        self.progress
-            .lock()
-            .unwrap()
-            .init(Some(changes.len()), None);
-
         let mut deletion_futures = FuturesUnordered::new();
         let mut modification_futures = FuturesUnordered::new();
 
@@ -307,7 +281,7 @@ where
                 errors.push(err);
             }
 
-            self.progress.lock().unwrap().inc();
+            // TODO: Increment overall progress here!
         }
         drop(deletion_futures);
 
@@ -316,7 +290,7 @@ where
                 errors.push(err);
             }
 
-            self.progress.lock().unwrap().inc();
+            // TODO: Increment overall progress here!
         }
         drop(modification_futures);
 
@@ -342,22 +316,18 @@ where
                     let progress_name = get_progress_name(&from_info);
                     let len = from_info.size;
 
-                    let mut child: Option<Box<dyn prodash::Progress>> = None;
-                    let reporter = |status: AsyncReadProgress| match status {
+                    let reporter_shell = self.ctx.shell.clone();
+                    let reporter = move |status: AsyncReadProgress| match status {
                         AsyncReadProgress::Starting => {
                             // Once the download has actually started, we start a child for the progress entry.
                             // Note that we rely on the backend rate limiting us here: If all the read_file's run concurrently, we might add
                             // far more than a thousand progress indicators here, which is bad. In any normal situation, the file system backend should
                             // also limit this...
-                            let mut c =
-                                Box::new(self.progress.lock().unwrap().add_child(progress_name));
-                            c.init(Some(len as usize), None);
-                            child = Some(c);
+                            let _ = write!(reporter_shell.err(), "{}", progress_name);
                         }
-                        AsyncReadProgress::InProgress { bytes }
-                        | AsyncReadProgress::Finished { bytes } => {
-                            let Some(child) = &child else { return };
-                            child.set(bytes);
+                        AsyncReadProgress::InProgress { .. }
+                        | AsyncReadProgress::Finished { .. } => {
+                            // TODO: Increment overall bytes read here to calculate throughput.
                         }
                     };
 
@@ -390,12 +360,12 @@ where
                     };
 
                     // We have just pulled a file from `from` and pushed it to `to`. We therefore need to update both sides.
-                    self.tracked_files.update(from_info, self.from_side)?;
-                    self.tracked_files.update(to_info, !self.from_side)?;
+                    self.ctx.tracked_files.update(from_info, self.from_side)?;
+                    self.ctx.tracked_files.update(to_info, !self.from_side)?;
                 }
                 FileChange::Deleted { cpath } => {
                     self.to.delete_file(cpath).await?;
-                    self.tracked_files.delete(cpath)?;
+                    self.ctx.tracked_files.delete(cpath)?;
                 }
             }
 

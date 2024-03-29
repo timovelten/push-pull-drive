@@ -1,10 +1,11 @@
-use crate::{local::file_hasher::FileHasher, FileInfo, PathInfo};
+use crate::{FileInfo, PathInfo};
 use futures::AsyncRead;
 use std::fmt::Debug;
 use thiserror::Error;
 use time::OffsetDateTime;
 
 #[derive(Debug, Error)]
+#[allow(dead_code)]
 pub enum Error {
     #[error("{cpath} was not found")]
     NotFound { cpath: String },

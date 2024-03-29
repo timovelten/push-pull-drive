@@ -1,3 +1,5 @@
+pub mod shell;
+
 use http::Request;
 use tokio::sync::OwnedSemaphorePermit;
 

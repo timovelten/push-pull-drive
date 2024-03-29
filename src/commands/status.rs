@@ -1,9 +1,11 @@
 use crate::{
-    context::Ctx,
+    context::{Ctx, FullContext},
     db::{Side, TrackedFilesRepository},
     file_repository::FileRepository,
+    util::shell::Shell,
     FileChange, FileInfo, PathInfo,
 };
+use std::io::Write;
 use std::{collections::HashMap, time::Duration};
 
 #[derive(clap::Args)]
@@ -13,30 +15,30 @@ pub struct StatusArgs {
 }
 
 pub async fn local_status(ctx: &impl Ctx, args: StatusArgs) -> anyhow::Result<()> {
-    let ctx = ctx.get();
+    let FullContext { ctx, local, .. } = ctx.get();
     let (_, report) = status_of_dir(
         ctx.tracked_files_or_ignore(args.ignore_index),
-        ctx.local(),
+        local,
         ctx.wd(),
         Side::Local,
     )
     .await?;
 
-    print_status(&report);
+    print_status(&ctx.shell, &report);
     Ok(())
 }
 
 pub async fn remote_status(ctx: &impl Ctx, args: StatusArgs) -> anyhow::Result<()> {
-    let ctx = ctx.get();
+    let FullContext { ctx, remote, .. } = ctx.get();
     let (_, report) = status_of_dir(
         ctx.tracked_files_or_ignore(args.ignore_index),
-        ctx.remote(),
+        remote,
         ctx.wd(),
         Side::Remote,
     )
     .await?;
 
-    print_status(&report);
+    print_status(&ctx.shell, &report);
     Ok(())
 }
 
@@ -122,12 +124,12 @@ fn is_changed(old: &FileInfo, new: &FileInfo) -> bool {
     false
 }
 
-fn print_status(changes: &[FileChange]) {
+fn print_status(shell: &Shell, changes: &[FileChange]) {
     for change in changes {
-        match change {
-            FileChange::New(info) => println!("New: {}", info.cpath),
-            FileChange::Modified(info) => println!("Modified: {}", info.cpath),
-            FileChange::Deleted { cpath } => println!("Deleted: {}", cpath),
-        }
+        let _ = match change {
+            FileChange::New(info) => writeln!(shell.err(), "New: {}", info.cpath),
+            FileChange::Modified(info) => writeln!(shell.err(), "Modified: {}", info.cpath),
+            FileChange::Deleted { cpath } => writeln!(shell.err(), "Deleted: {}", cpath),
+        };
     }
 }

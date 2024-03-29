@@ -61,15 +61,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ansiterm"
-version = "0.12.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ab587f5395da16dd2e6939adf53dede583221b320cadfb94e02b5b7b9bf24cc"
-dependencies = [
- "winapi",
-]
-
-[[package]]
 name = "anstream"
 version = "0.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -357,16 +348,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "acdd7c62a3665c7f6830a51635d9ac9b23ed385797f70a83bb8bafe9c572ab2b"
 dependencies = [
  "winapi",
-]
-
-[[package]]
-name = "crosstermion"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "400415b86f4dc01b9e4e129e822dad900e546287319da7ab229654978d3e07e1"
-dependencies = [
- "ansiterm",
- "crossterm",
 ]
 
 [[package]]
@@ -887,9 +868,9 @@ checksum = "b5e6163cb8c49088c2c36f57875e58ccd8c87c7427f7fbd50ea6710b2f3f2e8f"
 
 [[package]]
 name = "memchr"
-version = "2.7.1"
+version = "2.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "523dc4f511e55ab87b694dc30d0f820d60906ef06413f93d4d7a1385599cc149"
+checksum = "6c8640c5d730cb13ebd907d8d04b52f55ac9a2eec55b440c8892f40d56c76c1d"
 
 [[package]]
 name = "mime"
@@ -1103,19 +1084,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "prodash"
-version = "28.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "744a264d26b88a6a7e37cbad97953fa233b94d585236310bcbc88474b4092d79"
-dependencies = [
- "crosstermion",
- "humantime",
- "log",
- "parking_lot",
- "unicode-width",
-]
-
-[[package]]
 name = "push-pull-drive"
 version = "0.1.0"
 dependencies = [
@@ -1125,6 +1093,7 @@ dependencies = [
  "cached",
  "clap",
  "const_format",
+ "crossterm",
  "either",
  "env_logger",
  "futures",
@@ -1134,7 +1103,6 @@ dependencies = [
  "log",
  "oauth2",
  "pin-project-lite",
- "prodash",
  "rand",
  "reqwest",
  "rusqlite",
@@ -1794,12 +1762,6 @@ checksum = "5c5713f0fc4b5db668a2ac63cdb7bb4469d8c9fed047b1d0292cc7b0ce2ba921"
 dependencies = [
  "tinyvec",
 ]
-
-[[package]]
-name = "unicode-width"
-version = "0.1.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e51733f11c9c4f72aa0c160008246859e340b00807569a0da0e7a1079b27ba85"
 
 [[package]]
 name = "unicode-xid"

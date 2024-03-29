@@ -1,19 +1,25 @@
-use std::{io::ErrorKind, path::Path, sync::Arc};
-
 use crate::{
-    context::CoreContext,
+    context::Context,
     db::SqliteDatabase,
     gdrive::{self, config::GoogleDriveInitArgs},
     local::{self, LocalInitArgs},
+    util::shell::Shell,
 };
+use std::{io::ErrorKind, path::Path, sync::Arc};
+use tokio::runtime::Handle as RuntimeHandle;
 
 #[derive(clap::Subcommand, Clone)]
-pub enum InitBackend {
+pub enum InitBackendCmd {
     Local(LocalInitArgs),
     GoogleDrive(GoogleDriveInitArgs),
 }
 
-pub fn init(b: InitBackend, root_dir: &Path) -> anyhow::Result<()> {
+pub fn init(
+    b: InitBackendCmd,
+    root_dir: &Path,
+    shell: Shell,
+    handle: RuntimeHandle,
+) -> anyhow::Result<()> {
     let config_dir = root_dir.join(crate::CONFIG_DIR);
 
     // Make sure the config directory exists
@@ -40,15 +46,17 @@ pub fn init(b: InitBackend, root_dir: &Path) -> anyhow::Result<()> {
         }
     };
 
-    let ctx: CoreContext = CoreContext {
+    let ctx: Context = Context {
+        shell: Arc::new(shell),
         wd: "".to_owned(),
         key_value_store: db.clone(),
         tracked_files: db,
         root_dir: root_dir.to_owned(),
+        handle,
     };
 
     match b {
-        InitBackend::Local(args) => local::init(&ctx, args),
-        InitBackend::GoogleDrive(args) => gdrive::init(&ctx, args),
+        InitBackendCmd::Local(args) => local::init(&ctx, args),
+        InitBackendCmd::GoogleDrive(args) => gdrive::init(&ctx, args),
     }
 }

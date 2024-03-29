@@ -1,18 +1,20 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
-
-use anyhow::bail;
-
 use crate::{
     db::{KeyValueStore, Side, SqliteDatabase, TrackedFilesRepository},
     file_repository::FileRepository,
     local::LocalBackend,
-    paths, FileInfo,
+    paths,
+    util::shell::Shell,
+    FileInfo,
 };
+use anyhow::bail;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use tokio::runtime::Handle as TokioHandle;
 
-pub struct CoreContext {
+pub struct Context {
+    pub shell: Arc<Shell>,
     /// Working directory. This is a "context path" of the current working directory
     /// (NOT the OS provided working directory.)
     pub wd: String,
@@ -20,30 +22,17 @@ pub struct CoreContext {
     pub root_dir: PathBuf,
     pub key_value_store: Arc<dyn KeyValueStore>,
     pub tracked_files: Arc<dyn TrackedFilesRepository>,
+    pub handle: tokio::runtime::Handle,
 }
 
-pub struct GlobalContext<R: FileRepository> {
-    pub core: CoreContext,
-    pub local: LocalBackend,
-    pub remote: R,
-}
-
-#[allow(dead_code)]
-impl<R: FileRepository> GlobalContext<R> {
-    pub fn new(core: CoreContext, local: LocalBackend, remote: R) -> Self {
-        Self {
-            core,
-            local,
-            remote,
-        }
-    }
-
+impl Context {
+    #[allow(dead_code)]
     pub fn key_value_store(&self) -> &dyn KeyValueStore {
-        &*self.get().core.key_value_store
+        &*self.key_value_store
     }
 
     pub fn tracked_files(&self) -> &dyn TrackedFilesRepository {
-        &*self.get().core.tracked_files
+        &*self.tracked_files
     }
 
     pub fn tracked_files_or_ignore(&self, ignore_index: bool) -> &dyn TrackedFilesRepository {
@@ -54,49 +43,57 @@ impl<R: FileRepository> GlobalContext<R> {
         }
     }
 
-    pub fn local(&self) -> &LocalBackend {
-        &self.get().local
-    }
-
-    pub fn remote(&self) -> &R {
-        &self.get().remote
-    }
-
     pub fn wd(&self) -> &str {
-        &self.get().core.wd
+        &self.wd
+    }
+}
+
+pub struct FullContext<R: FileRepository> {
+    pub ctx: Context,
+    pub local: LocalBackend,
+    pub remote: R,
+}
+
+impl<R: FileRepository> FullContext<R> {
+    pub fn new(ctx: Context, local: LocalBackend, remote: R) -> Self {
+        Self { ctx, local, remote }
     }
 }
 
 /// This Trait exists purely out of convenience. We want to be able to simpl write
-/// function arguments as 
+/// function arguments as
 /// `ctx: &impl Ctx` instead of `<R: FileRepository>(ctx: &FullContext<R>)`.
 pub trait Ctx {
     type Remote: FileRepository;
 
-    fn get(&self) -> &GlobalContext<Self::Remote>;
+    fn get(&self) -> &FullContext<Self::Remote>;
 
-    fn get_mut(&mut self) -> &mut GlobalContext<Self::Remote>;
+    fn get_mut(&mut self) -> &mut FullContext<Self::Remote>;
 
-    fn into(self) -> GlobalContext<Self::Remote>;
+    fn into(self) -> FullContext<Self::Remote>;
 }
 
-impl<R: FileRepository> Ctx for GlobalContext<R> {
+impl<R: FileRepository> Ctx for FullContext<R> {
     type Remote = R;
 
-    fn get(&self) -> &GlobalContext<Self::Remote> {
+    fn get(&self) -> &FullContext<Self::Remote> {
         self
     }
 
-    fn get_mut(&mut self) -> &mut GlobalContext<Self::Remote> {
+    fn get_mut(&mut self) -> &mut FullContext<Self::Remote> {
         self
     }
-    
-    fn into(self) -> GlobalContext<Self::Remote> {
+
+    fn into(self) -> FullContext<Self::Remote> {
         self
     }
 }
 
-pub fn find_core_context<P: AsRef<Path>>(wd: P) -> anyhow::Result<CoreContext> {
+pub fn find_context<P: AsRef<Path>>(
+    wd: P,
+    shell: Shell,
+    handle: TokioHandle,
+) -> anyhow::Result<Context> {
     // Traverse ancestors of the current workign directory to try and find the next valid root...
     for root_dir in wd.as_ref().ancestors() {
         let config_dir = root_dir.join(crate::CONFIG_DIR);
@@ -115,11 +112,13 @@ pub fn find_core_context<P: AsRef<Path>>(wd: P) -> anyhow::Result<CoreContext> {
 
         let wd = paths::relative_name(root_dir, &wd)?;
         log::info!("Root directory is {root_dir:?}, relative working directory is {wd}");
-        return Ok(CoreContext {
+        return Ok(Context {
+            shell: Arc::new(shell),
             wd,
             key_value_store,
             tracked_files,
             root_dir: root_dir.to_owned(),
+            handle,
         });
     }
 
