@@ -18,7 +18,7 @@ pub struct LsArgs {
     details: bool,
 }
 
-pub async fn remote_ls(
+pub fn remote_ls(
     ctx: &impl Ctx,
     LsArgs {
         path,
@@ -31,7 +31,9 @@ pub async fn remote_ls(
     ctx.shell.print_transient("Reading directory...")?;
 
     let path = append_to_relative_name(ctx.wd(), path.as_deref().unwrap_or(""));
-    let mut contents = remote.read_dir(&path, depth.unwrap_or(1)).await?;
+    let mut contents = ctx
+        .handle
+        .block_on(remote.read_dir(&path, depth.unwrap_or(1)))?;
 
     // Sort directories first
     fn key(f: &PathInfo) -> (u8, &str) {

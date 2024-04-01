@@ -1,4 +1,8 @@
-pub mod shell;
+mod async_read;
+mod shell;
+
+pub use async_read::InspectAsyncReader;
+pub use shell::*;
 
 use http::Request;
 use tokio::sync::OwnedSemaphorePermit;
@@ -23,6 +27,18 @@ impl<T> std::ops::DerefMut for SemaphoreGuarded<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }
+}
+
+pub fn human_readable_bytes(bs: u64) -> (f64, &'static str) {
+    static UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let i = if bs == 0 {
+        0
+    } else {
+        (bs.ilog2() as usize / 10).min(UNITS.len() - 1)
+    };
+    let magnitude = 1 << (10 * i);
+
+    (bs as f64 / magnitude as f64, UNITS[i])
 }
 
 pub fn clone_request<T: Clone>(req: &Request<T>) -> Request<T> {
@@ -69,5 +85,19 @@ mod test {
         assert_eq!(find_common_prefix("abcdefgh", "abc"), 3);
         assert_eq!(find_common_prefix("abcdefg", "bcd"), 0);
         assert_eq!(find_common_prefix("äü😀äallo", "äü😀"), "äü😀".len());
+    }
+
+    #[test]
+    fn test_human_readable_bytes() {
+        assert_eq!(human_readable_bytes(42), (42f64, "B"));
+        assert_eq!(human_readable_bytes(1024), (1f64, "KiB"));
+        assert_eq!(human_readable_bytes(5 * 1024 * 1024), (5f64, "MiB"));
+        assert_eq!(
+            human_readable_bytes(1024 * 1024 * 1024 + 42),
+            (
+                (1024.0 * 1024.0 * 1024.0 + 42.0) / (1024.0 * 1024.0 * 1024.0),
+                "GiB"
+            )
+        );
     }
 }

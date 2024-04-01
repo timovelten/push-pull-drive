@@ -1,11 +1,11 @@
-use std::fs::File;
-
-use crate::{context::Context, gdrive::oauth, KEY_BACKEND};
+use super::{FatAccessToken, GDriveBackend, GoogleCredential};
+use crate::{context::AppContext, gdrive::oauth, KEY_BACKEND};
 use anyhow::{anyhow, Context as _};
 use oauth2::{AccessToken, ClientId, ClientSecret, RefreshToken};
+use std::fs::File;
+use std::io::Write;
+use std::sync::Arc;
 use time::OffsetDateTime;
-
-use super::{FatAccessToken, GDriveBackend, GoogleCredential};
 
 const GDRIVE_BACKEND: &str = "gdrive";
 const KEY_GDRIVE_CLIENT_SECRET: &str = "s";
@@ -26,7 +26,7 @@ pub struct GoogleDriveInitArgs {
 }
 
 pub fn init(
-    ctx: &Context,
+    ctx: &AppContext,
     GoogleDriveInitArgs { secrets_path }: GoogleDriveInitArgs,
 ) -> anyhow::Result<()> {
     let f = File::open(secrets_path)?;
@@ -73,11 +73,12 @@ pub fn init(
         &format!("{}", fat_token.expires.unix_timestamp()),
     )?;
 
-    println!("Success");
+    writeln!(ctx.shell.err(), "Success!")?;
+
     Ok(())
 }
 
-pub fn load(ctx: &Context) -> anyhow::Result<Option<GDriveBackend>> {
+pub fn load(ctx: &AppContext) -> anyhow::Result<Option<Arc<GDriveBackend>>> {
     if ctx.key_value_store.get(KEY_BACKEND)?.as_deref() == Some(GDRIVE_BACKEND) {
         Ok(Some(load_internal(ctx)?))
     } else {
@@ -85,7 +86,7 @@ pub fn load(ctx: &Context) -> anyhow::Result<Option<GDriveBackend>> {
     }
 }
 
-fn load_internal(ctx: &Context) -> anyhow::Result<GDriveBackend> {
+fn load_internal(ctx: &AppContext) -> anyhow::Result<Arc<GDriveBackend>> {
     log::debug!("Loading google drive backend");
 
     // Read what we previously saved from the database
@@ -148,5 +149,5 @@ fn load_internal(ctx: &Context) -> anyhow::Result<GDriveBackend> {
         },
     );
 
-    Ok(GDriveBackend::new(credential))
+    Ok(Arc::new(GDriveBackend::new(credential)))
 }

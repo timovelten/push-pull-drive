@@ -2,7 +2,7 @@ use crate::{
     context::{Ctx, FullContext},
     db::{Side, TrackedFilesRepository},
     file_repository::FileRepository,
-    util::shell::Shell,
+    util::Shell,
     FileChange, FileInfo, PathInfo,
 };
 use std::io::Write;
@@ -14,29 +14,31 @@ pub struct StatusArgs {
     pub ignore_index: bool,
 }
 
-pub async fn local_status(ctx: &impl Ctx, args: StatusArgs) -> anyhow::Result<()> {
+pub fn local_status(ctx: &impl Ctx, args: StatusArgs) -> anyhow::Result<()> {
     let FullContext { ctx, local, .. } = ctx.get();
-    let (_, report) = status_of_dir(
+    let status_of_dir_future = status_of_dir(
         ctx.tracked_files_or_ignore(args.ignore_index),
         local,
         ctx.wd(),
         Side::Local,
-    )
-    .await?;
+    );
+    ctx.shell.print_transient("Reading directories...")?;
+    let (_, report) = ctx.handle.block_on(status_of_dir_future)?;
 
     print_status(&ctx.shell, &report);
     Ok(())
 }
 
-pub async fn remote_status(ctx: &impl Ctx, args: StatusArgs) -> anyhow::Result<()> {
+pub fn remote_status(ctx: &impl Ctx, args: StatusArgs) -> anyhow::Result<()> {
     let FullContext { ctx, remote, .. } = ctx.get();
-    let (_, report) = status_of_dir(
+    let status_of_dir_future = status_of_dir(
         ctx.tracked_files_or_ignore(args.ignore_index),
         remote,
         ctx.wd(),
         Side::Remote,
-    )
-    .await?;
+    );
+    ctx.shell.print_transient("Reading directories...")?;
+    let (_, report) = ctx.handle.block_on(status_of_dir_future)?;
 
     print_status(&ctx.shell, &report);
     Ok(())
@@ -45,6 +47,7 @@ pub async fn remote_status(ctx: &impl Ctx, args: StatusArgs) -> anyhow::Result<(
 /// Return a list of all files in that directory, and how they have changed from the index.
 /// Note that if the target directory does not exist, this simply returns two empty vectors (and NOT
 /// an error.)
+/// This is also used by push / pull.
 pub(super) async fn status_of_dir(
     db: &(impl TrackedFilesRepository + ?Sized),
     repo: &impl FileRepository,

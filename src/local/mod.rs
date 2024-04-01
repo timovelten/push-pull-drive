@@ -4,10 +4,8 @@ use anyhow::anyhow;
 pub use config::*;
 
 use crate::{
-    file_repository::FileRepository,
-    paths,
-    util::SemaphoreGuarded,
-    DirectoryInfo, FileInfo, PathInfo,
+    file_repository::FileRepository, paths, util::SemaphoreGuarded, DirectoryInfo, FileInfo,
+    PathInfo,
 };
 use futures::AsyncRead;
 use std::{
@@ -30,7 +28,7 @@ use self::file_hasher::{FileHasher, Sha1Hasher};
 use crate::file_repository::Error as FileRepositoryError;
 use crate::file_repository::Result as FileRepositoryResult;
 
-const CONCURRENCY_LIMIT: usize = 24;
+const CONCURRENCY_LIMIT: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct LocalBackend<H = Sha1Hasher> {
@@ -640,7 +638,7 @@ mod tests {
         // Create the file manually to really test it..
         let ignored_dir = tmp.path().join("dir/subdir");
         let ignored_file_path = ignored_dir.join("test");
-        println!("File is at {:?}", ignored_file_path);
+
         std::fs::create_dir_all(&ignored_dir).unwrap();
         let mut f = File::options()
             .write(true)

@@ -3,7 +3,7 @@ use crate::{
     file_repository::FileRepository,
     local::LocalBackend,
     paths,
-    util::shell::Shell,
+    util::Shell,
     FileInfo,
 };
 use anyhow::bail;
@@ -13,7 +13,8 @@ use std::{
 };
 use tokio::runtime::Handle as TokioHandle;
 
-pub struct Context {
+#[derive(Clone)]
+pub struct AppContext {
     pub shell: Arc<Shell>,
     /// Working directory. This is a "context path" of the current working directory
     /// (NOT the OS provided working directory.)
@@ -25,7 +26,7 @@ pub struct Context {
     pub handle: tokio::runtime::Handle,
 }
 
-impl Context {
+impl AppContext {
     #[allow(dead_code)]
     pub fn key_value_store(&self) -> &dyn KeyValueStore {
         &*self.key_value_store
@@ -49,13 +50,13 @@ impl Context {
 }
 
 pub struct FullContext<R: FileRepository> {
-    pub ctx: Context,
+    pub ctx: AppContext,
     pub local: LocalBackend,
     pub remote: R,
 }
 
 impl<R: FileRepository> FullContext<R> {
-    pub fn new(ctx: Context, local: LocalBackend, remote: R) -> Self {
+    pub fn new(ctx: AppContext, local: LocalBackend, remote: R) -> Self {
         Self { ctx, local, remote }
     }
 }
@@ -67,10 +68,6 @@ pub trait Ctx {
     type Remote: FileRepository;
 
     fn get(&self) -> &FullContext<Self::Remote>;
-
-    fn get_mut(&mut self) -> &mut FullContext<Self::Remote>;
-
-    fn into(self) -> FullContext<Self::Remote>;
 }
 
 impl<R: FileRepository> Ctx for FullContext<R> {
@@ -79,21 +76,13 @@ impl<R: FileRepository> Ctx for FullContext<R> {
     fn get(&self) -> &FullContext<Self::Remote> {
         self
     }
-
-    fn get_mut(&mut self) -> &mut FullContext<Self::Remote> {
-        self
-    }
-
-    fn into(self) -> FullContext<Self::Remote> {
-        self
-    }
 }
 
 pub fn find_context<P: AsRef<Path>>(
     wd: P,
     shell: Shell,
     handle: TokioHandle,
-) -> anyhow::Result<Context> {
+) -> anyhow::Result<AppContext> {
     // Traverse ancestors of the current workign directory to try and find the next valid root...
     for root_dir in wd.as_ref().ancestors() {
         let config_dir = root_dir.join(crate::CONFIG_DIR);
@@ -112,7 +101,7 @@ pub fn find_context<P: AsRef<Path>>(
 
         let wd = paths::relative_name(root_dir, &wd)?;
         log::info!("Root directory is {root_dir:?}, relative working directory is {wd}");
-        return Ok(Context {
+        return Ok(AppContext {
             shell: Arc::new(shell),
             wd,
             key_value_store,

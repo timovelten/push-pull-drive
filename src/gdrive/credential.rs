@@ -1,10 +1,8 @@
-use std::sync::Mutex;
-
 use anyhow::anyhow;
-use oauth2::reqwest::http_client;
 use oauth2::{basic::BasicClient, AccessToken, RefreshToken, TokenResponse};
 use time::ext::NumericalDuration;
 use time::OffsetDateTime;
+use tokio::sync::Mutex as TokioMutex;
 
 #[derive(Debug, Clone)]
 pub struct FatAccessToken {
@@ -26,7 +24,9 @@ impl FatAccessToken {
 
 #[derive(Debug)]
 pub struct GoogleCredential {
-    inner: Mutex<GoogleCredentialImpl>,
+    /// I really don't know how to get rid of this lock. We definitely need to avoid having
+    /// two token requests in flight at once.
+    inner: TokioMutex<GoogleCredentialImpl>,
 }
 
 impl GoogleCredential {
@@ -44,12 +44,12 @@ impl GoogleCredential {
         };
 
         GoogleCredential {
-            inner: Mutex::new(inner),
+            inner: TokioMutex::new(inner),
         }
     }
 
-    pub fn get_or_refresh_token(&self) -> anyhow::Result<AccessToken> {
-        self.inner.lock().unwrap().get_or_refresh_token()
+    pub async fn get_or_refresh_token(&self) -> anyhow::Result<AccessToken> {
+        self.inner.lock().await.get_or_refresh_token().await
     }
 }
 
@@ -64,7 +64,6 @@ struct GoogleCredentialImpl {
     // Immutable state, this will not be changed after initial creation.
     client: BasicClient,
     refresh_token: RefreshToken,
-
     token: Option<FatAccessToken>,
 
     callback: Box<dyn Fn(FatAccessToken) + Send>,
@@ -100,9 +99,9 @@ impl GoogleCredentialImpl {
         }
     }
 
-    pub fn get_or_refresh_token(&mut self) -> anyhow::Result<AccessToken> {
+    pub async fn get_or_refresh_token(&mut self) -> anyhow::Result<AccessToken> {
         if self.needs_to_be_refreshed() {
-            self.refresh_token()?;
+            self.refresh_token().await?;
         }
 
         Ok(self
@@ -110,12 +109,13 @@ impl GoogleCredentialImpl {
             .expect("there should be a token after successful refresh"))
     }
 
-    pub fn refresh_token(&mut self) -> anyhow::Result<()> {
+    pub async fn refresh_token(&mut self) -> anyhow::Result<()> {
         let now = OffsetDateTime::now_utc();
         let token_response = self
             .client
             .exchange_refresh_token(&self.refresh_token)
-            .request(http_client)
+            .request_async(oauth2::reqwest::async_http_client)
+            .await
             .map_err(|e| anyhow!(e))?;
 
         let fat_token = FatAccessToken {

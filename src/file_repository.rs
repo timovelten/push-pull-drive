@@ -1,6 +1,7 @@
 use crate::{FileInfo, PathInfo};
 use futures::AsyncRead;
 use std::fmt::Debug;
+use std::future::Future;
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -28,7 +29,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Implementations should ensure that the number of concurrent requests does not exceed
 /// the capabilities of an underlying server. This can be implemented with a semaphore.
-pub trait FileRepository: Debug + Send + Sync {
+/// 
+/// Implementations should be cheaply cloneable, potentially by being wrapped inside of an Arc.
+pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
     type Reader: AsyncReader;
 
     /// Return all files and folders contained in the directory at `cpath` up to the specified `depth`. Note that if called
@@ -37,9 +40,13 @@ pub trait FileRepository: Debug + Send + Sync {
     ///
     /// # Errors
     /// - If `cpath` is a file this returns the error [`Error::NotADirectory`].
-    async fn read_dir(&self, cpath: &str, depth: u32) -> Result<Vec<PathInfo>>;
+    fn read_dir(
+        &self,
+        cpath: &str,
+        depth: u32,
+    ) -> impl Future<Output = Result<Vec<PathInfo>>> + Send;
 
-    async fn get_metadata(&self, cpath: &str) -> Result<PathInfo>;
+    fn get_metadata(&self, cpath: &str) -> impl Future<Output = Result<PathInfo>> + Send;
 
     /// Read file with the given relative name. Return a reader and the file size in bytes.
     ///
@@ -47,7 +54,10 @@ pub trait FileRepository: Debug + Send + Sync {
     ///
     /// - If the file at cpath is a directory, this returns [`Error::IsADirectory`]
     /// - If a subpath of `cpath` is a file, this returns either [`Error::NotADirectory`] or [`Error::NotFound`] (up to the implementation).
-    async fn read_file(&self, relative_name: &str) -> Result<(FileInfo, Self::Reader)>;
+    fn read_file(
+        &self,
+        relative_name: &str,
+    ) -> impl Future<Output = Result<(FileInfo, Self::Reader)>> + Send;
 
     /// Read the given `src` reader to completion and write its contents to the given cpath name. Do note the following behavior (which more or less mimicks the behavior
     // of `mkdir -p cpath_dir` and then writing the file on Linux):
@@ -62,33 +72,39 @@ pub trait FileRepository: Debug + Send + Sync {
     ///   see [`Self::delete_orphaned_directory`]. This particular case is very important. We rely on this behavior in push_pull.
     /// - If a subpath os `cpath` is a file itself, this returns either [`Error::NotADirectory`] or [`Error::NotFound`] (up to the implementation).
     /// - If the directory part of `cpath` does not exist, this returns [`Error::NotFound`].
-    async fn write_file<R: AsyncReader>(
+    fn write_file<R: AsyncReader>(
         &self,
         cpath: &str,
         modified_time: Option<time::OffsetDateTime>,
         src: R,
         len: u64,
-    ) -> Result<FileInfo>;
+    ) -> impl Future<Output = Result<FileInfo>> + Send;
 
     /// Delete a file or a folder at `cpath` (including all subfolders, if necessary).
-    async fn delete_file(&self, cpath: &str) -> Result<()>;
+    fn delete_file(&self, cpath: &str) -> impl Future<Output = Result<()>> + Send;
 
-    async fn set_modified_time(&self, relative_name: &str, modtime: OffsetDateTime) -> Result<()>;
+    fn set_modified_time(
+        &self,
+        relative_name: &str,
+        modtime: OffsetDateTime,
+    ) -> impl Future<Output = Result<()>> + Send;
 
     /// Deletes a directory at cpath (and all subdirectories it contains) if it contains no files. See [`Self::delete_file`].
-    async fn delete_orphaned_directory(&self, cpath: &str) -> Result<bool> {
-        let files_in_folder = self
-            .read_dir(cpath, u32::MAX)
-            .await?
-            .into_iter()
-            .filter(|d| matches!(d, PathInfo::File(_)))
-            .count();
+    fn delete_orphaned_directory(&self, cpath: &str) -> impl Future<Output = Result<bool>> + Send {
+        async {
+            let files_in_folder = self
+                .read_dir(cpath, u32::MAX)
+                .await?
+                .into_iter()
+                .filter(|d| matches!(d, PathInfo::File(_)))
+                .count();
 
-        if files_in_folder == 0 {
-            self.delete_file(cpath).await?;
-            Ok(true)
-        } else {
-            Ok(false)
+            if files_in_folder == 0 {
+                self.delete_file(cpath).await?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
         }
     }
 }

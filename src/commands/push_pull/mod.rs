@@ -1,54 +1,54 @@
+mod progress;
+
+use self::progress::{make_progress, ProgressSender};
+
 use super::status::status_of_dir;
-use crate::context::{Context, FullContext};
+use crate::context::{AppContext, FullContext};
+use crate::db::TrackedFilesRepository;
 use crate::file_repository::Error as FileRepositoryError;
+use crate::util::InspectAsyncReader;
 use crate::{
-    context::Ctx,
-    db::Side,
-    file_repository::FileRepository,
-    paths,
-    progress::{AsyncReadProgress, AsyncReadWithProgress},
-    util::find_common_prefix,
-    FileChange, FileInfo,
+    context::Ctx, db::Side, file_repository::FileRepository, util::find_common_prefix, FileChange,
+    FileInfo,
 };
-use anyhow::{bail, Context as _};
 use either::Either;
 use futures::{stream::FuturesUnordered, StreamExt};
 use std::io::Write;
+use std::sync::Arc;
 
-#[derive(clap::Args)]
+#[derive(clap::Args, Clone)]
 pub struct PushPullArgs {
     #[arg(long)]
     pub ignore_index: bool,
+
     #[arg(long)]
     pub yes: bool,
 }
 
-pub async fn push(ctx: &impl Ctx, _: PushPullArgs) -> anyhow::Result<()> {
+pub fn push(ctx: &impl Ctx, args: PushPullArgs) -> anyhow::Result<()> {
     let FullContext { ctx, local, remote } = ctx.get();
-    let mut flow = PushPullFlow {
-        ctx: &ctx,
-        from: local,
-        to: remote,
-        wd: ctx.wd(),
+    let flow = PushPullFlow {
+        args,
+        ctx: ctx.clone(),
+        from: local.clone(),
+        to: remote.clone(),
         from_side: Side::Local,
-        state: PushPullState::None,
     };
-    flow.execute().await?;
+    flow.execute()?;
 
     Ok(())
 }
 
-pub async fn pull(ctx: &impl Ctx, _: PushPullArgs) -> anyhow::Result<()> {
+pub fn pull(ctx: &impl Ctx, args: PushPullArgs) -> anyhow::Result<()> {
     let FullContext { ctx, local, remote } = ctx.get();
-    let mut flow = PushPullFlow {
-        ctx: &ctx,
-        from: remote,
-        to: local,
-        wd: ctx.wd(),
+    let flow = PushPullFlow {
+        args,
+        ctx: ctx.clone(),
+        from: remote.clone(),
+        to: local.clone(),
         from_side: Side::Remote,
-        state: PushPullState::None,
     };
-    flow.execute().await?;
+    flow.execute()?;
 
     Ok(())
 }
@@ -80,16 +80,15 @@ enum PushPullState {
         changes: Vec<FileChange>,
     },
     Done,
-    Transient,
 }
 
-struct PushPullFlow<'a, A, B> {
-    ctx: &'a Context,
-    from: &'a A,
-    to: &'a B,
-    wd: &'a str,
+#[derive(Clone)]
+struct PushPullFlow<A, B> {
+    args: PushPullArgs,
+    ctx: AppContext,
+    from: A,
+    to: B,
     from_side: Side,
-    state: PushPullState,
 }
 
 /// Find a common directory that is a prefix of all cpaths in the slice. Note that this panics
@@ -172,54 +171,71 @@ fn either_okay_or_conflict(
     Either::Left(from_change)
 }
 
-impl<'a, A, B> PushPullFlow<'a, A, B>
+impl<A, B> PushPullFlow<A, B>
 where
     A: FileRepository,
     B: FileRepository,
 {
-    async fn execute(&mut self) -> anyhow::Result<()> {
+    fn execute(self) -> anyhow::Result<()> {
+        let handle = self.ctx.handle.clone();
+        handle.block_on(self.execute_async())
+    }
+
+    fn tracked_files(&self) -> &dyn TrackedFilesRepository {
+        self.ctx.tracked_files_or_ignore(self.args.ignore_index)
+    }
+
+    async fn execute_async(mut self) -> anyhow::Result<()> {
+        let mut state = PushPullState::None;
+
         loop {
-            match &self.state {
+            let next_state = match state {
                 PushPullState::None => self.prepare().await?,
-                PushPullState::Prepared { .. } => self.do_conflict_resolution().await?,
-                PushPullState::Commit { .. } => self.commit().await?,
-                PushPullState::Transient => panic!("Transient state should never be observed."),
-                PushPullState::Done => {
-                    break;
+                PushPullState::Prepared { changes, conflicts } => {
+                    self.do_conflict_resolution(changes, conflicts).await?
                 }
+                PushPullState::Commit { changes } => self.commit(changes).await?,
+                PushPullState::Done => break,
                 PushPullState::NothingToDo => {
-                    println!("There is nothing to do.");
-                    self.state = PushPullState::Done;
+                    writeln!(self.ctx.shell.err(), "There is nothing to do.")?;
+                    PushPullState::Done
                 }
-            }
+            };
+
+            state = next_state;
         }
 
         Ok(())
     }
-    async fn prepare(&mut self) -> anyhow::Result<()> {
+    async fn prepare(&mut self) -> anyhow::Result<PushPullState> {
         // check what has changed on the from side. These are the only files we (may) touch on the destination side.i
         // (Except possibly for directories that contain no files, we may silently delete those).
-        let (_, from_changes) =
-            status_of_dir(self.ctx.tracked_files(), self.from, self.wd, self.from_side).await?;
+        self.ctx
+            .shell
+            .print_transient("Determining status of files on 'from' side...")?;
+        let (_, from_changes) = status_of_dir(
+            self.tracked_files(),
+            &self.from,
+            &self.ctx.wd,
+            self.from_side,
+        )
+        .await?;
 
         if from_changes.is_empty() {
-            self.state = PushPullState::NothingToDo;
-            return Ok(());
+            return Ok(PushPullState::NothingToDo);
         }
 
         // Optimization for a somewhat common case: If only files from a certain subdirectory were changed,
         // find that subdirectory. This potentially allows us to not list less remote files, which is good.
         let better_wd = common_cpath_directory_prefix(&from_changes);
-        log::debug!("Using optimized working directory {better_wd} for querying remote");
+        log::debug!("Using optimized working directory {better_wd} for querying remote..");
 
         // Determine all files in the "better working directory" and check if they have changed
-        let (_, mut to_changes) = status_of_dir(
-            self.ctx.tracked_files(),
-            self.to,
-            better_wd,
-            !self.from_side,
-        )
-        .await?;
+        self.ctx
+            .shell
+            .print_transient("Determining status of files on 'to' side")?;
+        let (_, mut to_changes) =
+            status_of_dir(self.tracked_files(), &self.to, better_wd, !self.from_side).await?;
 
         // find_conflicts requires to_changes to be sorted.
         sort_filechanges(&mut to_changes);
@@ -233,139 +249,126 @@ where
             }
         }
 
-        self.state = PushPullState::Prepared { changes, conflicts };
-
-        Ok(())
+        Ok(PushPullState::Prepared { changes, conflicts })
     }
 
-    async fn do_conflict_resolution(&mut self) -> anyhow::Result<()> {
-        let state = std::mem::replace(&mut self.state, PushPullState::Transient);
-        let PushPullState::Prepared {
-            changes,
-            conflicts: _conflicts,
-        } = state
-        else {
-            panic!();
-        };
-
+    async fn do_conflict_resolution(
+        &mut self,
+        changes: Vec<FileChange>,
+        _conflicts: Vec<Conflict>,
+    ) -> anyhow::Result<PushPullState> {
         // For now, our conflict resolution is to not do it...
-        self.state = PushPullState::Commit { changes };
-
-        Ok(())
+        Ok(PushPullState::Commit { changes })
     }
 
-    async fn commit(&mut self) -> anyhow::Result<()> {
-        let PushPullState::Commit { changes } = &self.state else {
-            bail!("Wrong state");
-        };
-
+    async fn commit(&self, changes: Vec<FileChange>) -> anyhow::Result<PushPullState> {
         let mut deletion_futures = FuturesUnordered::new();
         let mut modification_futures = FuturesUnordered::new();
+        let (sender, mut receiver) = make_progress(&changes);
 
-        for change in changes.iter().cloned() {
+        // Lets not duplicate so much data
+        let this = Arc::new(self.clone());
+
+        for (idx, change) in changes.iter().cloned().enumerate() {
+            let this = this.clone();
+            let sender = sender.clone();
+            let id = receiver.get_id(idx);
+
             match &change {
+
                 FileChange::Deleted { .. } => {
-                    deletion_futures.push(async { self.handle_change(change).await });
+                    deletion_futures
+                        .push(async move { this.handle_change(change, id, sender).await });
                 }
-                _ => {
-                    modification_futures.push(async { self.handle_change(change).await });
+                FileChange::New(..) | FileChange::Modified(..) => modification_futures
+                    .push(async move { this.handle_change(change, id, sender).await }),
+            }
+        }
+
+        // Drop the "original" sender, so that the channel is closed once all of the cloned senders are dropped
+        drop(sender);
+
+        let work_future = tokio::spawn(async move {
+            let mut errors = Vec::new();
+
+            while let Some(res) = deletion_futures.next().await {
+                if let Err(err) = res {
+                    errors.push(err);
                 }
             }
-        }
-
-        // Start handling all the futures, deletions first (that might be necessary so that the change futures can suceed!). Collect the errors to display them.
-        let mut errors = Vec::new();
-
-        while let Some(res) = deletion_futures.next().await {
-            if let Err(err) = res {
-                errors.push(err);
+            while let Some(res) = modification_futures.next().await {
+                if let Err(err) = res {
+                    errors.push(err);
+                }
             }
 
-            // TODO: Increment overall progress here!
-        }
-        drop(deletion_futures);
+            drop(deletion_futures);
+            drop(modification_futures);
 
-        while let Some(res) = modification_futures.next().await {
-            if let Err(err) = res {
-                errors.push(err);
-            }
+            errors
+        });
 
-            // TODO: Increment overall progress here!
-        }
-        drop(modification_futures);
+        receiver.run(&self.ctx.shell).await?;
 
         // Display the collected errors (this really could be a lot better...)
+        let errors = work_future.await.unwrap();
         if !errors.is_empty() {
-            println!("The following errors ocurred:");
+            writeln!(self.ctx.shell.err(), "The following errors ocurred:")?;
             for err in errors {
-                eprintln!("{:?}", err);
+                writeln!(self.ctx.shell.err(), "{:?}", err)?;
             }
         }
 
-        self.state = PushPullState::Done;
-        Ok(())
+        Ok(PushPullState::Done)
     }
 
     /// Given a single FileChange, handle it however we need to. This is the heart of push_pull_commit.
-    async fn handle_change(&self, change: FileChange) -> anyhow::Result<()> {
+    async fn handle_change(
+        &self,
+        change: FileChange,
+        id: usize,
+        progress: ProgressSender,
+    ) -> anyhow::Result<()> {
         loop {
             match &change {
                 FileChange::New(FileInfo { cpath, .. })
                 | FileChange::Modified(FileInfo { cpath, .. }) => {
                     let (from_info, reader) = self.from.read_file(cpath).await?;
-                    let progress_name = get_progress_name(&from_info);
                     let len = from_info.size;
 
-                    let reporter_shell = self.ctx.shell.clone();
-                    let reporter = move |status: AsyncReadProgress| match status {
-                        AsyncReadProgress::Starting => {
-                            // Once the download has actually started, we start a child for the progress entry.
-                            // Note that we rely on the backend rate limiting us here: If all the read_file's run concurrently, we might add
-                            // far more than a thousand progress indicators here, which is bad. In any normal situation, the file system backend should
-                            // also limit this...
-                            let _ = write!(reporter_shell.err(), "{}", progress_name);
-                        }
-                        AsyncReadProgress::InProgress { .. }
-                        | AsyncReadProgress::Finished { .. } => {
-                            // TODO: Increment overall bytes read here to calculate throughput.
-                        }
-                    };
+                    progress.notify_start(id).await;
 
-                    let reader_with_progress = AsyncReadWithProgress::new(reader, reporter);
+                    let reader = InspectAsyncReader::new(reader, |delta| {
+                        progress.notify_bytes_read(id, delta as u64);
+                    });
                     let write_result = self
                         .to
-                        .write_file(cpath, Some(from_info.modified), reader_with_progress, len)
+                        .write_file(cpath, Some(from_info.modified), reader, len)
                         .await;
 
                     let to_info = match write_result {
                         Ok(info) => info,
-                        Err(err @ FileRepositoryError::IsADirectory { .. }) => {
-                            let FileRepositoryError::IsADirectory { cpath: err_cpath } = &err
-                            else {
-                                unreachable!()
-                            };
-                            if cpath != err_cpath {
+                        Err(err) => {
+                            let should_retry = Self::should_try_to_delete_orphaned(cpath, &err);
+                            if should_retry {
+                                continue;
+                            } else {
                                 return Err(err.into());
                             }
-
-                            self.to
-                                .delete_orphaned_directory(cpath)
-                                .await
-                                .with_context(|| "Failed to delete orphaned directory")
-                                .context(err)?;
-
-                            continue;
                         }
-                        Err(err) => return Err(err.into()),
                     };
 
                     // We have just pulled a file from `from` and pushed it to `to`. We therefore need to update both sides.
-                    self.ctx.tracked_files.update(from_info, self.from_side)?;
-                    self.ctx.tracked_files.update(to_info, !self.from_side)?;
+                    self.tracked_files().update(from_info, self.from_side)?;
+                    self.tracked_files().update(to_info, !self.from_side)?;
+
+                    progress.notify_done(id).await;
                 }
                 FileChange::Deleted { cpath } => {
                     self.to.delete_file(cpath).await?;
-                    self.ctx.tracked_files.delete(cpath)?;
+                    self.tracked_files().delete(cpath)?;
+
+                    progress.notify_done(id).await;
                 }
             }
 
@@ -374,12 +377,15 @@ where
 
         Ok(())
     }
-}
 
-/// This function ensures that filenames print "nice enough". In particular,
-/// it guards against filenames that contain newlines (I actually had some of those)
-fn get_progress_name(info: &FileInfo) -> &str {
-    paths::filename(&info.cpath).lines().next().unwrap()
+    /// Interpret the error returned by FileRepository::write to determine if we should try
+    /// to delete orphaned directories and try again.
+    fn should_try_to_delete_orphaned(cpath: &str, write_error: &FileRepositoryError) -> bool {
+        match write_error {
+            FileRepositoryError::IsADirectory { cpath: err_cpath } if err_cpath == cpath => true,
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]

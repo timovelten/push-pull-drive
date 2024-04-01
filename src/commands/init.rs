@@ -1,9 +1,9 @@
 use crate::{
-    context::Context,
+    context::AppContext,
     db::SqliteDatabase,
     gdrive::{self, config::GoogleDriveInitArgs},
     local::{self, LocalInitArgs},
-    util::shell::Shell,
+    util::Shell,
 };
 use std::{io::ErrorKind, path::Path, sync::Arc};
 use tokio::runtime::Handle as RuntimeHandle;
@@ -46,7 +46,7 @@ pub fn init(
         }
     };
 
-    let ctx: Context = Context {
+    let ctx: AppContext = AppContext {
         shell: Arc::new(shell),
         wd: "".to_owned(),
         key_value_store: db.clone(),

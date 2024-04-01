@@ -25,6 +25,8 @@ impl Shell {
     /// s must not contain any newline characters.
     pub fn print_transient(&self, s: &str) -> io::Result<()> {
         let mut inner = self.inner.lock().unwrap();
+        inner.clear_if_needed();
+
         write!(inner.stderr, "{}", s)?;
         inner.stderr.flush()?;
         inner.set_needs_clearing(true);
@@ -34,19 +36,13 @@ impl Shell {
 
     pub fn err(&self) -> StderrWriter<'_> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.line_needs_clearing {
-            // This is how Cargo does it (i.e. ignoring the error)
-            let _ = inner.clear_current_line_err();
-        }
+        inner.clear_if_needed();
         StderrWriter { inner }
     }
 
     pub fn out(&self) -> StdoutWriter<'_> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.line_needs_clearing {
-            // This is how Cargo does it (i.e. ignoring the error)
-            let _ = inner.clear_current_line_err();
-        }
+        inner.clear_if_needed();
         StdoutWriter { inner }
     }
 }
@@ -75,6 +71,13 @@ impl ShellImpl {
         self.set_needs_clearing(false);
 
         Ok(())
+    }
+
+    fn clear_if_needed(&mut self) {
+        if self.line_needs_clearing {
+            // This is how Cargo does it (i.e. ignoring the error)
+            let _ = self.clear_current_line_err();
+        }
     }
 }
 

@@ -54,10 +54,13 @@ pub(super) enum Error {
     },
 }
 
+/// Google does not really like too many concurrent connections. In my personal testing,
+/// the limit seemed to be somewhere below 10.
+const MAX_CONCURRENT_CONNECTIONS: usize = 8;
+
 #[derive(Debug)]
 pub struct GDriveBackend {
-    /// Google does not really like concurrent connections. In my personal testing,
-    /// the limit seemed to be somewhere below 10.
+    /// See [`MAX_CONCURRENT_CONNECTIONS`].
     sem: Arc<tokio::sync::Semaphore>,
 
     /// There is a nasty race condition when using mkdirall, and this is the best way I can think of
@@ -72,12 +75,12 @@ pub struct GDriveBackend {
     /// For this, we assume that this object is generally short lived and pretend
     /// like concurrent modification is not an issue (someone could move the folder,
     /// for example. Then the cached ID would point to another path now.).
-    id_cache: Arc<Mutex<TimedCache<String, Arc<String>>>>,
+    id_cache: Mutex<TimedCache<String, Arc<String>>>,
 
-    credential: Arc<GoogleCredential>,
+    credential: GoogleCredential,
 }
 
-impl FileRepository for GDriveBackend {
+impl FileRepository for Arc<GDriveBackend> {
     type Reader = Pin<Box<dyn AsyncReader>>;
 
     async fn read_dir(&self, cpath: &str, up_to_depth: u32) -> FileRepositoryResult<Vec<PathInfo>> {
@@ -174,17 +177,17 @@ impl GDriveBackend {
         let client = reqwest::Client::builder().build().unwrap();
 
         Self {
-            sem: Arc::new(Semaphore::new(8)),
+            sem: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
             mkdir_lock: tokio::sync::Mutex::new(()),
-            credential: Arc::new(credential),
+            credential,
             client,
-            id_cache: Arc::new(Mutex::new(TimedCache::with_lifespan(60))),
+            id_cache: Mutex::new(TimedCache::with_lifespan(60)),
         }
     }
 
     async fn make_drive_api(&self) -> anyhow::Result<SemaphoreGuarded<DriveApi>> {
         let permit = self.sem.clone().acquire_owned().await.unwrap();
-        let token = block_in_place(|| self.credential.get_or_refresh_token())?;
+        let token = self.credential.get_or_refresh_token().await?;
         let inner = DriveApi::new(self.client.clone(), token);
 
         Ok(SemaphoreGuarded { permit, inner })
@@ -208,7 +211,7 @@ impl GDriveBackend {
         // Trust me: It's not worth it to do this non-recursively, even if we then could
         // avoid the heap allocation thats caused by async_recursion.
 
-        // In Google Drive, the root folder has an actual id (e.g. 0AGqh_9UFaLFoUk9PVA) and the "virtual" id
+        // In Google Drive, the root folder has an actual id (e.g. '0AGqh_9UFaLFoUk9PVA') and the "virtual" id
         // 'root' by which it can be accessed almost anywhere. Unfortunately, we need the actual id,
         // since the 'parents' field of a file contains the actual id (and not 'root'). We use this
         // behavior in the read_dir function, that concurrently fetches multiple directory contents

@@ -7,7 +7,6 @@ mod fileinfo;
 mod gdrive;
 mod local;
 mod paths;
-mod progress;
 mod util;
 
 use anyhow::anyhow;
@@ -18,13 +17,13 @@ use commands::{
     push_pull::{self, PushPullArgs},
     status::{self, StatusArgs},
 };
-use context::{find_context, Context, Ctx, FullContext};
+use context::{find_context, AppContext, Ctx, FullContext};
 use env_logger::{Builder, Target};
 pub use fileinfo::*;
 use local::LocalBackend;
 pub use paths::*;
 use std::fs::File;
-use util::shell::Shell;
+use util::Shell;
 
 const CONFIG_DIR: &str = ".basicdrive";
 const DATABASE_NAME: &str = "database.sqlite3";
@@ -81,6 +80,8 @@ trait CommandHandler {
 //  - if one of two folders is empty, delete it.
 //  - otherwise print a link to the web interface of google drive so the user may fix it himself.
 pub fn main() -> anyhow::Result<()> {
+    console_subscriber::init();
+
     let cli = Cli::parse();
     let wd = match cli.dir {
         Some(wd) => wd.into(),
@@ -119,7 +120,7 @@ pub fn main() -> anyhow::Result<()> {
 
 // This awkward construction enables us to have type parameters inside of the context, whose
 // value is only determined at runtime.
-fn get_full_context(ctx: Context) -> anyhow::Result<Box<dyn CommandHandler>> {
+fn get_full_context(ctx: AppContext) -> anyhow::Result<Box<dyn CommandHandler>> {
     let config = local::Config {
         root_path: ctx.root_dir.clone(),
         ignore_prefixes: vec![crate::CONFIG_DIR.to_string()],
@@ -143,21 +144,13 @@ fn get_full_context(ctx: Context) -> anyhow::Result<Box<dyn CommandHandler>> {
 
 impl<C: Ctx> CommandHandler for C {
     fn handle(&mut self, cmd: Commands) -> anyhow::Result<()> {
-        let handle = self.get().ctx.handle.clone();
-
-        let handler_future = async move {
-            match cmd {
-                Commands::Init { .. } => {
-                    unimplemented!("Init command is handled separately elsewhere")
-                }
-                Commands::Pull(args) => push_pull::pull(self, args).await,
-                Commands::Push(args) => push_pull::push(self, args).await,
-                Commands::RemoteLs(args) => ls::remote_ls(self, args).await,
-                Commands::Status(args) => status::local_status(self, args).await,
-                Commands::RemoteStatus(args) => status::remote_status(self, args).await,
-            }
-        };
-
-        handle.block_on(handler_future)
+        match cmd {
+            Commands::Init { .. } => unimplemented!("Init command is handled separately elsewhere"),
+            Commands::Pull(args) => push_pull::pull(self, args),
+            Commands::Push(args) => push_pull::push(self, args),
+            Commands::RemoteLs(args) => ls::remote_ls(self, args),
+            Commands::Status(args) => status::local_status(self, args),
+            Commands::RemoteStatus(args) => status::remote_status(self, args),
+        }
     }
 }
