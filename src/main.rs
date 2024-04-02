@@ -124,7 +124,7 @@ fn get_full_context(ctx: AppContext) -> anyhow::Result<Box<dyn CommandHandler>> 
     let config = local::Config {
         root_path: ctx.root_dir.clone(),
         ignore_prefixes: vec![crate::CONFIG_DIR.to_string()],
-        ..Default::default()
+        calculate_hashes: true,
     };
     let local = LocalBackend::from_config(config);
 
