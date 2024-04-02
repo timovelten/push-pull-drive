@@ -275,7 +275,6 @@ where
             let id = receiver.get_id(idx);
 
             match &change {
-
                 FileChange::Deleted { .. } => {
                     deletion_futures
                         .push(async move { this.handle_change(change, id, sender).await });
@@ -381,10 +380,7 @@ where
     /// Interpret the error returned by FileRepository::write to determine if we should try
     /// to delete orphaned directories and try again.
     fn should_try_to_delete_orphaned(cpath: &str, write_error: &FileRepositoryError) -> bool {
-        match write_error {
-            FileRepositoryError::IsADirectory { cpath: err_cpath } if err_cpath == cpath => true,
-            _ => false,
-        }
+        matches!(write_error, FileRepositoryError::IsADirectory { cpath: err_cpath } if err_cpath == cpath)
     }
 }
 

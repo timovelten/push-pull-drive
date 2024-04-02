@@ -1,8 +1,8 @@
 //! We use this to track the progress of an asyncread!
 use futures::AsyncRead;
 use pin_project_lite::pin_project;
-use std::task::{ready, Poll};
 use std::pin::Pin;
+use std::task::{ready, Poll};
 
 pin_project! {
     pub struct InspectAsyncReader<R, F> {
@@ -14,7 +14,7 @@ pin_project! {
 
 impl<R, F> InspectAsyncReader<R, F>
 where
-    F: FnMut(usize) -> (),
+    F: FnMut(usize),
 {
     pub fn new(reader: R, f: F) -> Self {
         Self { reader, f }
@@ -24,7 +24,7 @@ where
 impl<R, F> AsyncRead for InspectAsyncReader<R, F>
 where
     R: AsyncRead,
-    F: FnMut(usize) -> (),
+    F: FnMut(usize),
 {
     fn poll_read(
         self: Pin<&mut Self>,

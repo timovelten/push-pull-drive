@@ -16,7 +16,7 @@ use crate::{paths, util::Shell, FileChange};
 /// This function ensures that filenames print "nice enough". In particular,
 /// it guards against filenames that contain newlines (I actually had some of those)
 fn get_progress_name(change: &FileChange) -> &str {
-    paths::filename(&change.cpath()).lines().next().unwrap()
+    paths::filename(change.cpath()).lines().next().unwrap()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -52,14 +52,14 @@ struct Throughput {
     // it replaces the older sample
     samples: [(Instant, u64); 2],
     // Index to old sample (as boolean, for convenience)
-    cur: usize
+    cur: usize,
 }
 
 impl Throughput {
     fn new() -> Self {
         Self {
             samples: [(Instant::now(), 0), (Instant::now(), 0)],
-            cur: 0
+            cur: 0,
         }
     }
 
@@ -69,7 +69,7 @@ impl Throughput {
 
         let old = self.cur;
         let new = (self.cur + 1) % 2;
-        
+
         // Replace the newer sample with this sample (and the older with the newer)?
         if (now - self.samples[old].0) >= Duration::from_millis(500) {
             self.samples.swap(old, new);
@@ -89,8 +89,8 @@ pub(super) struct ProgressReciver<'a> {
 
     /// List of changes so that we can determine their names and stuff
     changes: &'a [FileChange],
-    
-    throughput: Throughput
+
+    throughput: Throughput,
 }
 
 impl<'a> ProgressReciver<'a> {
@@ -103,13 +103,14 @@ impl<'a> ProgressReciver<'a> {
     /// mut since we modify the throughput here...
     fn print_progress_line(&mut self, shell: &Shell) -> std::io::Result<()> {
         let bytes_read = self.total_bytes_read.load(Ordering::Acquire);
-        let remaining = self.total_bytes.checked_sub(bytes_read).unwrap_or(0);
+        let remaining = self.total_bytes.saturating_sub(bytes_read);
         let throughput = self.throughput.update_and_get(bytes_read) as u64;
 
         let percentage = 100 * bytes_read / self.total_bytes;
         let (rem, rem_unit) = human_readable_bytes(remaining);
         let (thru, thru_unit) = human_readable_bytes(throughput);
-        let status_line = format!("{percentage}%, Remaining: {rem:.2} {rem_unit} ({thru:.2} {thru_unit}/s)");
+        let status_line =
+            format!("{percentage}%, Remaining: {rem:.2} {rem_unit} ({thru:.2} {thru_unit}/s)");
         shell.print_transient(&status_line)?;
 
         Ok(())
@@ -129,7 +130,6 @@ impl<'a> ProgressReciver<'a> {
 
             // Documentation states that receiver does not have a problem with being cancelled.
             let next_value = timeout(Duration::from_millis(500), receive_and_update).await;
-
 
             match next_value {
                 Ok(Some(ProgressUpdate::Done { id })) => {
@@ -179,7 +179,7 @@ pub(super) fn make_progress(changes: &[FileChange]) -> (ProgressSender, Progress
         total_bytes_read,
         total_bytes,
         changes,
-        throughput: Throughput::new()
+        throughput: Throughput::new(),
     };
 
     (s, r)
