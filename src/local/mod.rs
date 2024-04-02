@@ -8,13 +8,14 @@ use crate::{
     file_repository::FileRepository, paths, util::SemaphoreGuarded, DirectoryInfo, FileInfo,
     PathInfo,
 };
-use futures::AsyncRead;
+use futures::{stream::FuturesUnordered, AsyncRead, StreamExt};
 use std::{
     fs::File,
     io::{ErrorKind, Seek},
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
+    thread::available_parallelism,
 };
 use time::OffsetDateTime;
 use tokio::{fs::File as TokioFile, sync::SemaphorePermit};
@@ -148,23 +149,21 @@ impl<H: FileHasher> LocalBackend<H> {
         self.read_file_impl_for_open_file(cpath, file)
     }
 
-    fn read_dir_impl(
-        &self,
-        cpath: String,
-        up_to_depth: u32,
-    ) -> FileRepositoryResult<Vec<PathInfo>> {
+    /// Return a list of all paths contained in the given path (except for path itself)
+    fn child_cpaths(
+        config: &Arc<Config>,
+        path: impl AsRef<Path>,
+        max_depth: usize,
+    ) -> FileRepositoryResult<Vec<String>> {
         let mut ret = Vec::new();
 
-        let local_path = self.config.get_local_path_from_relative_name(&cpath);
-        println!("Local path is {:?}", local_path);
-
-        let walker = WalkDir::new(local_path).max_depth(up_to_depth as usize);
+        let walker = WalkDir::new(path).max_depth(max_depth);
         for entry in walker {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(err) => {
                     let error_cpath = if let Some(err_path) = err.path() {
-                        paths::relative_name(&self.config.root_path, err_path)
+                        paths::relative_name(&config.root_path, err_path)
                             .with_context(|| {
                                 format!(
                                     "Error occurred at depth {} for error path {err_path:?}",
@@ -173,7 +172,7 @@ impl<H: FileHasher> LocalBackend<H> {
                             })
                             .map_err(FileRepositoryError::Other)?
                     } else {
-                        cpath.to_owned()
+                        "".to_owned()
                     };
 
                     let err = map_io_error(
@@ -188,16 +187,10 @@ impl<H: FileHasher> LocalBackend<H> {
                 continue;
             }
 
-            let child_cpath = paths::relative_name(&self.config.root_path, entry.path())
-                .map_err(as_other_error)?;
+            let child_cpath =
+                paths::relative_name(&config.root_path, entry.path()).map_err(as_other_error)?;
 
-            let info = match self.read_file_impl(child_cpath) {
-                Ok((info, _)) => info,
-                Err(FileRepositoryError::NotAllowed { .. }) => continue,
-                Err(err) => return Err(err),
-            };
-
-            ret.push(info);
+            ret.push(child_cpath);
         }
 
         Ok(ret)
@@ -372,11 +365,52 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
     }
 
     async fn read_dir(&self, cpath: &str, up_to_depth: u32) -> FileRepositoryResult<Vec<PathInfo>> {
+        // This whole function took less than 1 second to hash over 4000 files (around 6 Gigabytes) on my system.
+        // That is fast enough for our purposes. With one core it takes around 6 seconds, so the whole
+        // effort to multi-thread the hashing is almost worth it...
+        let this = Arc::new(self.clone());
         let cpath = cpath.to_owned();
-        let me = self.clone();
-        spawn_blocking(move || me.read_dir_impl(cpath, up_to_depth))
+        let cores = available_parallelism().unwrap().get();
+
+        let mut ret = Vec::new();
+
+        // This listing takes around 8 ms for 4000 files on my system (much faster than I would have expected)
+        let local_path = self.config.get_local_path_from_relative_name(&cpath);
+        let child_cpaths = {
+            let this = this.clone();
+            spawn_blocking(move || {
+                Self::child_cpaths(&this.config.clone(), local_path, up_to_depth as usize)
+            })
             .await
             .unwrap()
+        }?;
+
+        let cpu_bound_work = Arc::new(Semaphore::new(cores));
+        let mut files_to_be_processed = FuturesUnordered::new();
+        for cpath in child_cpaths {
+            // Hashing the files is actually quite expensive, so we do that on a thread pool.
+            // But we definitely should not run too many of them in parallel.
+            // The semaphore prevents that we suddenly hash 4000 files at the same time.
+            let this = this.clone();
+            let cpu_sem = cpu_bound_work.clone();
+            let work = async move {
+                let _permit = cpu_sem.acquire().await;
+                spawn_blocking(move || this.read_file_impl(cpath))
+                    .await
+                    .expect("spawn blocking should not fail")
+            };
+            files_to_be_processed.push(work);
+        }
+
+        while let Some(file) = files_to_be_processed.next().await {
+            match file {
+                Ok((info, _)) => ret.push(info),
+                Err(FileRepositoryError::NotAllowed { .. }) => continue,
+                Err(err) => return Err(err),
+            };
+        }
+
+        Ok(ret)
     }
 
     async fn get_metadata(&self, cpath: &str) -> FileRepositoryResult<PathInfo> {
