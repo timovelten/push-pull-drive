@@ -261,115 +261,161 @@ where
         Ok(PushPullState::Commit { changes })
     }
 
-    async fn commit(&self, changes: Vec<FileChange>) -> anyhow::Result<PushPullState> {
-        let mut deletion_futures = FuturesUnordered::new();
-        let mut modification_futures = FuturesUnordered::new();
-        let (sender, mut receiver) = make_progress(&changes);
+    async fn commit_deletions(
+        self: Arc<Self>,
+        changes: &[FileChange],
+        progress: &ProgressSender,
+    ) -> anyhow::Result<()> {
+        // Deletions should be quick, just do them in sequence.
+        for (id, change) in changes.iter().enumerate() {
+            let FileChange::Deleted { cpath } = change else {
+                continue;
+            };
 
-        // Lets not duplicate so much data
-        let this = Arc::new(self.clone());
+            self.to.delete_file(cpath).await?;
+            self.tracked_files().delete(cpath)?;
 
-        for (idx, change) in changes.iter().cloned().enumerate() {
-            let this = this.clone();
-            let sender = sender.clone();
-            let id = receiver.get_id(idx);
+            progress.notify_done(id).await;
+        }
 
-            match &change {
-                FileChange::Deleted { .. } => {
-                    deletion_futures
-                        .push(async move { this.handle_change(change, id, sender).await });
-                }
-                FileChange::New(..) | FileChange::Modified(..) => modification_futures
-                    .push(async move { this.handle_change(change, id, sender).await }),
+        Ok(())
+    }
+
+    async fn commit_other(
+        self: Arc<Self>,
+        changes: &[FileChange],
+        progress: &ProgressSender,
+    ) -> Result<(), Vec<anyhow::Error>> {
+        let mut change_futures = FuturesUnordered::new();
+
+        for (id, change) in changes.iter().enumerate() {
+            let (FileChange::New(info) | FileChange::Modified(info)) = change.clone() else {
+                continue;
+            };
+
+            let this = self.clone();
+            let progress = progress.clone();
+            change_futures.push(async move {
+                tokio::spawn(async move { this.handle_change(info, id, progress).await })
+                    .await
+                    .unwrap()
+            });
+        }
+
+        let mut errors = Vec::new();
+        while let Some(res) = change_futures.next().await {
+            if let Err(err) = res {
+                errors.push(err);
             }
         }
 
-        // Drop the "original" sender, so that the channel is closed once all of the cloned senders are dropped
-        drop(sender);
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 
-        let work_future = tokio::spawn(async move {
-            let mut errors = Vec::new();
+    /// The Error returns all errors that have ocurred, and the boolean indicates if the operation was "aborted"
+    /// (i.e. not "really" run to completion).
+    async fn commit_impl(
+        self: Arc<Self>,
+        changes: &[FileChange],
+        sender: ProgressSender,
+    ) -> Result<(), (bool, Vec<anyhow::Error>)> {
+        // If the deletions fail, we just bail and do not even try the modifications
+        self.clone()
+            .commit_deletions(&changes, &sender)
+            .await
+            .map_err(|err| (true, vec![err]))?;
 
-            while let Some(res) = deletion_futures.next().await {
-                if let Err(err) = res {
-                    errors.push(err);
-                }
+        self.commit_other(&changes, &sender)
+            .await
+            .map_err(|err| (false, err))
+    }
+
+    async fn commit(&self, changes: Vec<FileChange>) -> anyhow::Result<PushPullState> {
+        let (sender, mut receiver) = make_progress(&changes);
+        let this = Arc::new(self.clone());
+
+        // We move the sender here. That is important so that the progress can finish (it only finishes when all senders are dropped)
+        let work = this.commit_impl(&changes, sender);
+
+        // Wait for progress and display it in the background, so that we are free to do whatever here.
+        // In particular, we want to return early
+        let progress = {
+            let shell = self.ctx.shell.clone();
+            async move {
+                // TODO: Is this the right course of action?
+                let _ = receiver.run(&shell).await;
+                Ok(())
             }
-            while let Some(res) = modification_futures.next().await {
-                if let Err(err) = res {
-                    errors.push(err);
-                }
+        };
+
+        // Actually do the work!
+        let res = futures::try_join!(work, progress);
+        if let Err((failed_early, errors)) = res {
+            if failed_early {
+                writeln!(
+                    self.ctx.shell.err(),
+                    "Aborted operation because the following errors ocurred:"
+                )?;
+            } else {
+                writeln!(
+                    self.ctx.shell.err(),
+                    "During the operation, the following errors ocurred:"
+                )?;
             }
-
-            drop(deletion_futures);
-            drop(modification_futures);
-
-            errors
-        });
-
-        receiver.run(&self.ctx.shell).await?;
-
-        // Display the collected errors (this really could be a lot better...)
-        let errors = work_future.await.unwrap();
-        if !errors.is_empty() {
-            writeln!(self.ctx.shell.err(), "The following errors ocurred:")?;
             for err in errors {
                 writeln!(self.ctx.shell.err(), "{:?}", err)?;
             }
         }
-
         Ok(PushPullState::Done)
     }
 
     /// Given a single FileChange, handle it however we need to. This is the heart of push_pull_commit.
     async fn handle_change(
         &self,
-        change: FileChange,
+        FileInfo { cpath, .. }: FileInfo,
         id: usize,
         progress: ProgressSender,
     ) -> anyhow::Result<()> {
-        loop {
-            match &change {
-                FileChange::New(FileInfo { cpath, .. })
-                | FileChange::Modified(FileInfo { cpath, .. }) => {
-                    let (from_info, reader) = self.from.read_file(cpath).await?;
-                    let len = from_info.size;
-
-                    progress.notify_start(id).await;
-
-                    let reader = InspectAsyncReader::new(reader, |delta| {
-                        progress.notify_bytes_read(id, delta as u64);
-                    });
-                    let write_result = self
-                        .to
-                        .write_file(cpath, Some(from_info.modified), reader, len)
-                        .await;
-
-                    let to_info = match write_result {
-                        Ok(info) => info,
-                        Err(err) => {
-                            let should_retry = Self::should_try_to_delete_orphaned(cpath, &err);
-                            if should_retry {
-                                continue;
-                            } else {
-                                return Err(err.into());
-                            }
-                        }
-                    };
-
-                    // We have just pulled a file from `from` and pushed it to `to`. We therefore need to update both sides.
-                    self.tracked_files().update(from_info, self.from_side)?;
-                    self.tracked_files().update(to_info, !self.from_side)?;
-
-                    progress.notify_done(id).await;
-                }
-                FileChange::Deleted { cpath } => {
-                    self.to.delete_file(cpath).await?;
-                    self.tracked_files().delete(cpath)?;
-
-                    progress.notify_done(id).await;
-                }
+        // We might retry this once, if we think that we can fix the error by deleting some empty directories.
+        for is_retry in [false, true] {
+            if is_retry {
+                // If this is our second try, we do any sane thing we can think of to make it suceed after all
+                self.to.delete_orphaned_directory(&cpath).await?;
             }
+
+            let (from_info, reader) = self.from.read_file(&cpath).await?;
+            let len = from_info.size;
+
+            progress.notify_start(id).await;
+
+            let reader = InspectAsyncReader::new(reader, |delta| {
+                progress.notify_bytes_read(id, delta as u64);
+            });
+            let write_result = self
+                .to
+                .write_file(&cpath, Some(from_info.modified), reader, len)
+                .await;
+
+            let to_info = match write_result {
+                Ok(info) => info,
+                Err(err) => {
+                    if Self::should_try_to_delete_orphaned(&cpath, &err) {
+                        continue;
+                    } else {
+                        return Err(err.into());
+                    }
+                }
+            };
+
+            // We have just pulled a file from `from` and pushed it to `to`. We therefore need to update both sides.
+            self.tracked_files().update(from_info, self.from_side)?;
+            self.tracked_files().update(to_info, !self.from_side)?;
+
+            progress.notify_done(id).await;
 
             break;
         }

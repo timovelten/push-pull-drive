@@ -82,22 +82,42 @@ impl Throughput {
     }
 }
 
-pub(super) struct ProgressReciver<'a> {
-    receiver: mpsc::Receiver<ProgressUpdate>,
-    total_bytes_read: Arc<AtomicU64>,
-    total_bytes: u64,
-
-    /// List of changes so that we can determine their names and stuff
+pub(super) struct ProgressReceiver<'a> {
+    /// List of changes so that we can determine their names and stuff. If we have ever lifetime troubles,
+    /// this can be changed to Arc<[FileChange]>.
     changes: &'a [FileChange],
-
+    receiver: mpsc::Receiver<ProgressUpdate>,
+    /// How many bytes we have transferred
+    total_bytes_read: Arc<AtomicU64>,
+    /// How many bytes we expect to transfer
+    total_bytes: u64,
+    /// How many changes already finished.
+    done: usize,
     throughput: Throughput,
 }
 
-impl<'a> ProgressReciver<'a> {
-    /// This is an implementation detail, so we should hide it from our users. But right now,
-    /// id is the same as the index in that list above.
-    pub fn get_id(&self, idx: usize) -> usize {
-        idx
+impl<'a> ProgressReceiver<'a> {
+    fn new(
+        changes: &'a [FileChange],
+        receiver: mpsc::Receiver<ProgressUpdate>,
+        total_bytes_read: Arc<AtomicU64>,
+    ) -> Self {
+        let total_bytes = changes
+            .iter()
+            .filter_map(|change| match change {
+                FileChange::Modified(info) | FileChange::New(info) => Some(info.size),
+                FileChange::Deleted { .. } => None,
+            })
+            .sum();
+
+        Self {
+            receiver,
+            total_bytes_read,
+            total_bytes,
+            throughput: Throughput::new(),
+            changes,
+            done: 0,
+        }
     }
 
     /// mut since we modify the throughput here...
@@ -135,10 +155,13 @@ impl<'a> ProgressReciver<'a> {
                 Ok(Some(ProgressUpdate::Done { id })) => {
                     writeln!(
                         shell.err(),
-                        "Done: {}",
-                        get_progress_name(&self.changes[id])
+                        "({} / {}) Done: {}",
+                        self.done,
+                        self.changes.len(),
+                        get_progress_name(&self.changes[id]),
                     )?;
                     self.print_progress_line(shell)?;
+                    self.done += 1;
                 }
                 Ok(Some(_)) => {}
                 Ok(None) => break,
@@ -150,13 +173,20 @@ impl<'a> ProgressReciver<'a> {
         }
 
         let elapsed = start.map(|start| start.elapsed()).unwrap_or(Duration::ZERO);
-        write!(shell.err(), "Finished in {}s", elapsed.as_secs())?;
+
+        let avg_throughput = self.total_bytes as f64 / elapsed.as_secs_f64();
+        let (avg_throughput, avg_unit) = human_readable_bytes(avg_throughput as u64);
+        write!(
+            shell.err(),
+            "Finished in {}s (Average throughput: {avg_throughput:.2} {avg_unit})",
+            elapsed.as_secs()
+        )?;
 
         Ok(())
     }
 }
 
-pub(super) fn make_progress(changes: &[FileChange]) -> (ProgressSender, ProgressReciver) {
+pub(super) fn make_progress<'a>(changes: &'a [FileChange]) -> (ProgressSender, ProgressReceiver) {
     let (sender, receiver) = mpsc::channel(16);
     let total_bytes_read = Arc::new(AtomicU64::new(0));
 
@@ -164,23 +194,6 @@ pub(super) fn make_progress(changes: &[FileChange]) -> (ProgressSender, Progress
         sender,
         total_bytes_read: total_bytes_read.clone(),
     };
-
-    // Determine the total number of bytes we need to read
-    let total_bytes = changes
-        .iter()
-        .filter_map(|change| match change {
-            FileChange::New(info) | FileChange::Modified(info) => Some(info.size),
-            FileChange::Deleted { .. } => None,
-        })
-        .sum();
-
-    let r = ProgressReciver {
-        receiver,
-        total_bytes_read,
-        total_bytes,
-        changes,
-        throughput: Throughput::new(),
-    };
-
+    let r = ProgressReceiver::new(changes, receiver, total_bytes_read);
     (s, r)
 }
