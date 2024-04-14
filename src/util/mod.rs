@@ -1,11 +1,24 @@
 mod async_read;
 mod shell;
 
+use std::fmt::Display;
+
 pub use async_read::InspectAsyncReader;
 pub use shell::*;
 
 use http::Request;
 use tokio::sync::OwnedSemaphorePermit;
+
+pub struct WithoutNewlines<'a>(pub &'a str);
+
+impl Display for WithoutNewlines<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for line in self.0.lines() {
+            write!(f, "{}", line)?;
+        }
+        Ok(())
+    }
+}
 
 /// Utility type we use to keep the semaphore permit around
 /// as long as its inner type is not dropped.
@@ -99,5 +112,17 @@ mod test {
                 "GiB"
             )
         );
+    }
+
+    #[test]
+    fn test_without_newlines() {
+        use std::fmt::Write;
+
+        let x = "A text\n with at least\n three lines";
+        let mut out = String::new();
+
+        write!(out, "{}", WithoutNewlines(x)).unwrap();
+
+        assert_eq!(out, "A text with at least three lines");
     }
 }

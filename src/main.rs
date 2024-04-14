@@ -18,11 +18,11 @@ use commands::{
     status::{self, StatusArgs},
 };
 use context::{find_context, AppContext, Ctx, FullContext};
-use env_logger::{Builder, Target};
+use env_logger::Target;
 pub use fileinfo::*;
 use local::LocalBackend;
 pub use paths::*;
-use std::fs::File;
+use std::{fs::File, sync::Arc};
 use util::Shell;
 
 const CONFIG_DIR: &str = ".basicdrive";
@@ -33,14 +33,19 @@ pub const KEY_BACKEND: &str = "backend";
 
 pub type Result<E> = anyhow::Result<E>;
 
+// Note that the level argument is implemented through the LevelFilter::from_str implementation.
+// Therefore, clap cannot possibly know all values (and therefore also cannot list them in the help).
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 struct Cli {
-    /// A path to a log file. Can be "-" to log to stdout. Logging to terminal is not recommended,
-    /// because it currently (more or less) breaks the various progress bars we show.
+    /// A path to a logfile. If not set, log to stderr.
     #[arg(long)]
     log: Option<String>,
+
+    /// Possible values include off, error, warn, info, debug and trace. Default is warn.
+    #[arg(long, default_value_t = log::LevelFilter::Warn)]
+    level: log::LevelFilter,
     /// Pretend as if the current working directory was the given directory. Useful for operating
     /// on folders that are elsewhere.
     #[arg(long)]
@@ -93,26 +98,24 @@ pub fn main() -> anyhow::Result<()> {
         .build()
         .expect("building runtime should not fail");
 
-    if let Some(path) = cli.log {
-        let target = if path == "-" {
-            Target::Stdout
-        } else {
-            let f: Box<File> = File::create(path).expect("could not open log file").into();
-            Target::Pipe(f)
-        };
-
-        Builder::new()
-            .target(target)
-            .filter_level(log::LevelFilter::Debug)
-            .init();
-    }
+    let shell = Arc::new(Shell::new());
+    let target = if let Some(path) = cli.log {
+        let f: Box<File> = File::create(path).expect("could not open log file").into();
+        Target::Pipe(f)
+    } else {
+        Target::Pipe(Box::new(shell.clone().owned_err()))
+    };
+    env_logger::Builder::new()
+        .target(target)
+        .filter_level(cli.level)
+        .init();
 
     if let Commands::Init { backend } = &cli.command {
         // Handle init separately
-        init::init(backend.clone(), &wd, Shell::new(), rt.handle().clone())
+        init::init(backend.clone(), &wd, shell, rt.handle().clone())
     } else {
         // Handle every other command
-        let ctx = find_context(&wd, Shell::new(), rt.handle().clone()).unwrap();
+        let ctx = find_context(&wd, shell, rt.handle().clone()).unwrap();
         let mut full_context = get_full_context(ctx).unwrap();
         full_context.handle(cli.command)
     }

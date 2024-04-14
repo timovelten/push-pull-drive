@@ -17,7 +17,7 @@ pub enum InitBackendCmd {
 pub fn init(
     b: InitBackendCmd,
     root_dir: &Path,
-    shell: Shell,
+    shell: Arc<Shell>,
     handle: RuntimeHandle,
 ) -> anyhow::Result<()> {
     let config_dir = root_dir.join(crate::CONFIG_DIR);
@@ -47,7 +47,7 @@ pub fn init(
     };
 
     let ctx: AppContext = AppContext {
-        shell: Arc::new(shell),
+        shell,
         wd: "".to_owned(),
         key_value_store: db.clone(),
         tracked_files: db,

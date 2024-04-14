@@ -1,3 +1,6 @@
+use super::flow::ChangeRequest;
+use crate::util::human_readable_bytes;
+use crate::util::Shell;
 use std::io::Write;
 use std::time::Instant;
 use std::{
@@ -7,17 +10,7 @@ use std::{
     },
     time::Duration,
 };
-
 use tokio::{sync::mpsc, time::timeout};
-
-use crate::util::human_readable_bytes;
-use crate::{paths, util::Shell, FileChange};
-
-/// This function ensures that filenames print "nice enough". In particular,
-/// it guards against filenames that contain newlines (I actually had some of those)
-fn get_progress_name(change: &FileChange) -> &str {
-    paths::filename(change.cpath()).lines().next().unwrap()
-}
 
 #[derive(Clone, Debug, PartialEq)]
 enum ProgressUpdate {
@@ -85,7 +78,7 @@ impl Throughput {
 pub(super) struct ProgressReceiver<'a> {
     /// List of changes so that we can determine their names and stuff. If we have ever lifetime troubles,
     /// this can be changed to Arc<[FileChange]>.
-    changes: &'a [FileChange],
+    changes: &'a [ChangeRequest],
     receiver: mpsc::Receiver<ProgressUpdate>,
     /// How many bytes we have transferred
     total_bytes_read: Arc<AtomicU64>,
@@ -98,15 +91,17 @@ pub(super) struct ProgressReceiver<'a> {
 
 impl<'a> ProgressReceiver<'a> {
     fn new(
-        changes: &'a [FileChange],
+        changes: &'a [ChangeRequest],
         receiver: mpsc::Receiver<ProgressUpdate>,
         total_bytes_read: Arc<AtomicU64>,
     ) -> Self {
         let total_bytes = changes
             .iter()
             .filter_map(|change| match change {
-                FileChange::Modified(info) | FileChange::New(info) => Some(info.size),
-                FileChange::Deleted { .. } => None,
+                ChangeRequest::CreateFile { info } | ChangeRequest::UpdateFile { info } => {
+                    Some(info.size)
+                }
+                ChangeRequest::DeleteFile { .. } | ChangeRequest::DeleteDir { .. } => None,
             })
             .sum();
 
@@ -153,15 +148,15 @@ impl<'a> ProgressReceiver<'a> {
 
             match next_value {
                 Ok(Some(ProgressUpdate::Done { id })) => {
+                    self.done += 1;
                     writeln!(
                         shell.err(),
                         "({} / {}) Done: {}",
                         self.done,
                         self.changes.len(),
-                        get_progress_name(&self.changes[id]),
+                        &self.changes[id],
                     )?;
                     self.print_progress_line(shell)?;
-                    self.done += 1;
                 }
                 Ok(Some(_)) => {}
                 Ok(None) => break,
@@ -186,7 +181,9 @@ impl<'a> ProgressReceiver<'a> {
     }
 }
 
-pub(super) fn make_progress<'a>(changes: &'a [FileChange]) -> (ProgressSender, ProgressReceiver) {
+pub(super) fn make_progress<'a>(
+    changes: &'a [ChangeRequest],
+) -> (ProgressSender, ProgressReceiver) {
     let (sender, receiver) = mpsc::channel(16);
     let total_bytes_read = Arc::new(AtomicU64::new(0));
 

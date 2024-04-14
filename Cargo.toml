@@ -24,7 +24,7 @@ futures = "0.3.25"
 reqwest = { version = "0.11.13", features = ["stream", "json"] }
 rand = "0.8.5"
 pin-project-lite = "0.2.13"
-log = "0.4.0"
+log = { version = "0.4.21", features = ["std"] }
 env_logger = "0.10.0"
 ahash = "0.8.7"
 anyhow = "1.0.81"

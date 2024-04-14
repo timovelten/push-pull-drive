@@ -336,9 +336,22 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
         let _permit = self.aquire_permit().await;
 
         let local_path = self.config.get_local_path_from_relative_name(cpath);
-        tokio::fs::remove_file(local_path)
+
+        // Pretend it is a file first. If that fails, try to delete a directory there...
+        let res = tokio::fs::remove_file(&local_path)
             .await
-            .map_err(move |err| map_io_error(err, cpath))?;
+            .map_err(move |err| map_io_error(err, cpath));
+
+        match res {
+            Ok(()) => {}
+            Err(FileRepositoryError::IsADirectory { cpath: cp }) if cp == cpath => {
+                // Maybe it is a directory?
+                tokio::fs::remove_dir(&local_path)
+                    .await
+                    .map_err(move |err| map_io_error(err, cpath))?;
+            }
+            Err(err) => return Err(err),
+        };
 
         Ok(())
     }
@@ -747,5 +760,21 @@ mod tests {
             panic!("Unexpectedly got {:?}", result);
         };
         assert_eq!(cpath, "testdir/nested");
+    }
+
+    #[tokio::test]
+    async fn deleting_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let test_path = tmp.path().join("testdir");
+        std::fs::create_dir(&test_path).unwrap();
+        assert!(test_path.exists());
+
+        let b = LocalBackend::<Sha1Hasher>::from_config(Config {
+            ..default_config(tmp.path().to_owned())
+        });
+
+        b.delete_file("testdir").await.unwrap();
+
+        assert!(!test_path.exists());
     }
 }

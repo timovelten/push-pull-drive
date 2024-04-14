@@ -80,7 +80,7 @@ impl<R: FileRepository> Ctx for FullContext<R> {
 
 pub fn find_context<P: AsRef<Path>>(
     wd: P,
-    shell: Shell,
+    shell: Arc<Shell>,
     handle: TokioHandle,
 ) -> anyhow::Result<AppContext> {
     // Traverse ancestors of the current workign directory to try and find the next valid root...
@@ -102,7 +102,7 @@ pub fn find_context<P: AsRef<Path>>(
         let wd = paths::relative_name(root_dir, &wd)?;
         log::info!("Root directory is {root_dir:?}, relative working directory is {wd}");
         return Ok(AppContext {
-            shell: Arc::new(shell),
+            shell,
             wd,
             key_value_store,
             tracked_files,

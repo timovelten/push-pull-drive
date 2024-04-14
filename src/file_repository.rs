@@ -29,7 +29,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Implementations should ensure that the number of concurrent requests does not exceed
 /// the capabilities of an underlying server. This can be implemented with a semaphore.
-/// 
+///
 /// Implementations should be cheaply cloneable, potentially by being wrapped inside of an Arc.
 pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
     type Reader: AsyncReader;
@@ -98,6 +98,8 @@ pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
                 .into_iter()
                 .filter(|d| matches!(d, PathInfo::File(_)))
                 .count();
+
+            log::debug!("delete_oprhanded_directory found {} files", files_in_folder);
 
             if files_in_folder == 0 {
                 self.delete_file(cpath).await?;

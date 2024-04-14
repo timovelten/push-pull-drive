@@ -1,5 +1,5 @@
 use std::io::{self, Write};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crossterm::cursor::MoveToColumn;
 use crossterm::execute;
@@ -45,6 +45,10 @@ impl Shell {
         inner.clear_if_needed();
         StdoutWriter { inner }
     }
+
+    pub fn owned_err(self: Arc<Shell>) -> OwnedStderrWriter {
+        OwnedStderrWriter { inner: self }
+    }
 }
 
 struct ShellImpl {
@@ -78,6 +82,20 @@ impl ShellImpl {
             // This is how Cargo does it (i.e. ignoring the error)
             let _ = self.clear_current_line_err();
         }
+    }
+}
+
+pub struct OwnedStderrWriter {
+    inner: Arc<Shell>,
+}
+
+impl Write for OwnedStderrWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.err().write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.err().flush()
     }
 }
 
