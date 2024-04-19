@@ -13,6 +13,9 @@ use std::{
 };
 use tokio::runtime::Handle as TokioHandle;
 
+pub const CONFIG_DIR: &str = ".basicdrive";
+pub const DATABASE_NAME: &str = "database.sqlite3";
+
 #[derive(Clone)]
 pub struct AppContext {
     pub shell: Arc<Shell>,
@@ -85,7 +88,7 @@ pub fn find_context<P: AsRef<Path>>(
 ) -> anyhow::Result<AppContext> {
     // Traverse ancestors of the current workign directory to try and find the next valid root...
     for root_dir in wd.as_ref().ancestors() {
-        let config_dir = root_dir.join(crate::CONFIG_DIR);
+        let config_dir = root_dir.join(CONFIG_DIR);
         if !config_dir.exists() {
             continue;
         }
@@ -94,7 +97,7 @@ pub fn find_context<P: AsRef<Path>>(
 
         // This may fail. We then do not check folder further up,
         // but instead notify the user that the config folder that exists is somehow invalid.
-        let db_path = config_dir.join(crate::DATABASE_NAME);
+        let db_path = config_dir.join(DATABASE_NAME);
         let db = Arc::new(SqliteDatabase::new_from_path(db_path, false)?);
         let key_value_store: Arc<dyn KeyValueStore> = db.clone();
         let tracked_files: Arc<dyn TrackedFilesRepository> = db;

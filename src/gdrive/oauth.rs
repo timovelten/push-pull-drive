@@ -28,7 +28,7 @@ pub fn new_google_oauth_client(client_id: ClientId, client_secret: ClientSecret)
     )
 }
 
-pub fn sign_in(client: BasicClient) -> crate::Result<(FatAccessToken, RefreshToken)> {
+pub fn sign_in(client: BasicClient) -> anyhow::Result<(FatAccessToken, RefreshToken)> {
     // This is very much based on the example from the oauth2 crate
     // https://github.com/ramosbugs/oauth2-rs/blob/main/examples/google.rs
 

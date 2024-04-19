@@ -1,8 +1,12 @@
+use std::cell::OnceCell;
+use std::fmt::Write as _;
 use std::io::ErrorKind;
+use std::pin::pin;
 use std::time::Duration;
 use std::{fmt::Display, str::FromStr};
 
 use crate::util::clone_request;
+use crate::{hex_must_decode, FileInfo};
 
 use super::extensions::RequestBuilderExt;
 use super::extensions::UrlExt;
@@ -11,8 +15,9 @@ use anyhow::{anyhow, Context};
 use futures::{AsyncRead, AsyncReadExt, TryStreamExt};
 use http::{Request, StatusCode};
 use oauth2::AccessToken;
+use once_cell::sync::Lazy;
 use rand::Rng;
-use reqwest::Body;
+use serde::de::DeserializeOwned;
 use serde::{de, Deserialize};
 use serde::{Deserializer, Serialize};
 use time::OffsetDateTime;
@@ -26,6 +31,84 @@ use url::Url;
 // for why we need the [serde(default)]
 
 const EMPTY_BODY: &[u8] = &[];
+const REQUEST_IS_VALID: &str = "request is valid";
+
+pub const FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
+
+#[derive(Debug, Error)]
+pub(super) enum ApiError {
+    #[error(transparent)]
+    HttpError(reqwest::Error),
+    #[error(transparent)]
+    IoError(futures::io::Error),
+    #[error("HTTP request had non 2xx status code (retries: {retries}): {inner:?}")]
+    RequestFailed { inner: GoogleError, retries: u32 },
+    #[error(transparent)]
+    Other(anyhow::Error),
+}
+
+#[derive(Deserialize, Debug)]
+pub(super) struct GoogleErrorDetails {
+    domain: String,
+    reason: String,
+    message: String,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum GoogleError {
+    Error {
+        code: u16,
+        message: String,
+        errors: Vec<GoogleErrorDetails>,
+    },
+}
+
+impl GoogleError {
+    fn code(&self) -> u16 {
+        let Self::Error { code, .. } = self;
+        *code
+    }
+
+    fn message(&self) -> &str {
+        let Self::Error { message, .. } = self;
+        message
+    }
+
+    fn errors(&self) -> &[GoogleErrorDetails] {
+        let Self::Error { errors, .. } = self;
+        errors
+    }
+
+    fn is_rate_limit_exceeded(&self) -> bool {
+        if self.code() != 403 {
+            return false;
+        }
+
+        for error in self.errors() {
+            if error.reason == "userRateLimitExceeded" {
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
+const FILE_FIELDS: [&str; 8] = [
+    "id",
+    "name",
+    "mimeType",
+    "sha1Checksum",
+    "modifiedTime",
+    "parents",
+    "headRevisionId",
+    "size",
+];
+static FILE_FIELDS_QUERY: Lazy<[(&'static str, &'static str); 1]> = Lazy::new(|| {
+    let fields_str = FILE_FIELDS.join(",").leak();
+    [("fields", fields_str)]
+});
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -40,6 +123,8 @@ pub struct File {
     /// (and possibly others, I'm not quite sure)
     pub parents: Option<[String; 1]>,
 
+    /// Consumers can use this field to determine the type of the File. If this is `Some(MoreFileFields::BinaryFile { .., })`, then
+    /// this is a binary file. If this is a directory, this is None. Other combinations are possible too...
     #[serde(flatten)]
     pub more: Option<MoreFileFields>,
 }
@@ -61,6 +146,24 @@ pub enum MoreFileFields {
     },
 }
 
+impl File {
+    pub fn as_fileinfo(self, cpath: String) -> Option<FileInfo> {
+        match self.more {
+            Some(MoreFileFields::BinaryFile {
+                sha1_checksum,
+                size,
+                ..
+            }) => Some(FileInfo {
+                cpath,
+                size,
+                modified: self.modified_time,
+                hash: hex_must_decode(sha1_checksum),
+            }),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct FileId {
@@ -69,7 +172,7 @@ pub struct FileId {
 
 impl File {
     pub fn is_folder(&self) -> bool {
-        self.mime_type == "application/vnd.google-apps.folder"
+        self.mime_type == FOLDER_MIME_TYPE
     }
 }
 
@@ -97,9 +200,21 @@ pub struct FilesReq {
     pub parents: Option<Vec<String>>,
 }
 
+impl FilesReq {
+    pub fn new_create_folder(name: String, parent_id: String) -> Self {
+        Self {
+            name: Some(name),
+            parents: Some(vec![parent_id]),
+            mime_type: Some(FOLDER_MIME_TYPE.to_owned()),
+            modified_time: None,
+        }
+    }
+}
+
 /// This struct just exists to extract common paramters that would
 /// need to be passed to each function here in any case. It should not be kept
 /// around and is generally extremely short lived.
+#[derive(Debug)]
 pub struct DriveApi {
     client: reqwest::Client,
     token: AccessToken,
@@ -113,18 +228,20 @@ impl DriveApi {
         Self { client, token }
     }
 
-    async fn send_retry<B: Clone + Into<Body>>(
+    async fn send_retry<B: Clone + Into<reqwest::Body>>(
         &self,
         req: Request<B>,
-    ) -> anyhow::Result<reqwest::Response> {
-        const MAXIMUM_DELAY: Duration = Duration::from_secs(32);
+    ) -> Result<reqwest::Response, ApiError> {
+        const MAXIMUM_RETRIES: u32 = 3;
 
-        let mut delay = Duration::from_secs(1);
+        log::debug!("Request: {} {}", req.method(), req.uri());
+
+        let mut retries = 0u32;
         loop {
             let converted_req: reqwest::Request = clone_request(&req).try_into().unwrap();
             let resp = self.client.execute(converted_req).await;
 
-            let (err, should_retry): (_, bool) = match resp {
+            let (err, retryable): (_, bool) = match resp {
                 Ok(resp) => {
                     let status = resp.status();
 
@@ -134,52 +251,75 @@ impl DriveApi {
                         return Ok(resp);
                     }
 
-                    // Otherwise, try to make sense of the error we got
-                    let body_str = resp.text().await.unwrap_or_else(|_| String::new());
+                    // Otherwise, try to parse the error
+                    let err_str = resp.text().await.map_err(ApiError::HttpError)?;
+                    let err = match serde_json::from_str::<GoogleError>(&err_str) {
+                        Ok(val) => {
+                            assert_eq!(
+                                val.code(),
+                                status.as_u16(),
+                                "Google returned two different status codes"
+                            );
+                            ApiError::RequestFailed {
+                                inner: val,
+                                retries,
+                            }
+                        }
+                        Err(err) => ApiError::Other(anyhow!(
+                            "HTTP request failed with code {}. Error: {err_str}",
+                            status
+                        )),
+                    };
 
-                    let should_retry = match status.as_u16() {
+                    // Decide if this request is worth retrying (most 4xx status codes should not be retried)
+                    let retryable = match status.as_u16() {
                         403 => {
-                            // We are potentially being rate limited, find out if we are.
-                            let rate_limited = serde_json::from_str::<serde_json::Value>(&body_str)
-                                .ok()
-                                .as_ref()
-                                .and_then(|x| x.get("error"))
-                                .and_then(|x| x.get("errors"))
-                                .and_then(|x| x.as_array())
-                                .and_then(|x| x.first())
-                                .and_then(|x| x.get("reason"))
-                                .and_then(|x| x.as_str())
-                                .map(|x| x == "userRateLimitExceeded")
-                                .unwrap_or(false);
-
-                            rate_limited
+                            if let ApiError::RequestFailed { inner, .. } = &err {
+                                inner.is_rate_limit_exceeded()
+                            } else {
+                                false
+                            }
                         }
                         // Otherwise, do not retry client errors
                         400..=499 => false,
                         // ...but everything else
                         _ => true,
                     };
-                    let err = Error::HttpRequestFailed {
-                        method: req.method().clone(),
-                        uri: req.uri().clone(),
-                        code: status,
-                    };
-                    log::warn!("{err}");
-                    (anyhow!(err), should_retry)
+
+                    (err, retryable)
                 }
-                Err(err) => (anyhow!(err), true),
+                Err(err) => (ApiError::HttpError(err), true),
             };
 
-            if !should_retry || delay >= MAXIMUM_DELAY {
-                return Err(err).with_context(|| "Maximum number of retries or time exceeded");
+            let should_retry = retryable && retries <= MAXIMUM_RETRIES;
+            if !should_retry {
+                return Err(err);
             }
 
-            log::warn!("Retrying request ({:?} {:?})", req.method(), req.uri());
+            log::warn!("Request failed: {}", err);
 
             let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..=1000));
+            // Note: For the third fourth try, retries is 3 and we wait 16 seconds
+            let delay = Duration::from_secs(2u64.pow(retries + 1));
             tokio::time::sleep(delay + jitter).await;
-            delay *= 2;
+
+            retries += 1;
         }
+    }
+
+    async fn send_retry_json<T, B>(&self, req: Request<B>) -> Result<T, ApiError>
+    where
+        B: Clone + Into<reqwest::Body>,
+        T: DeserializeOwned,
+    {
+        let ret = self
+            .send_retry(req)
+            .await?
+            .json()
+            .await
+            .map_err(ApiError::HttpError)?;
+
+        Ok(ret)
     }
 
     /// Note: you should probably always add the query parameter ... and trashed = false
@@ -187,36 +327,48 @@ impl DriveApi {
         &self,
         q: &str,
         next_page_token: Option<&str>,
-    ) -> anyhow::Result<FilesListResp> {
+    ) -> Result<FilesListResp, ApiError> {
+        static PREFIXED_FIELDS: Lazy<String> = Lazy::new(|| {
+            let mut s = "nextPageToken".to_owned();
+            // The files are "nested", and therefore the fields need to be prefixed,
+            // i.e. files/mimeType instead of just mimeType
+            for field in FILE_FIELDS {
+                write!(&mut s, ",files/{}", field).unwrap();
+            }
+            s
+        });
+
         // Our response type is hardcoded anyways, and we almost always use the same
         // fields anyway. So we just hardcode it here and move one.
-        let url = Url::parse("https://www.googleapis.com/drive/v3/files").unwrap()
+        let url = Url::parse("https://www.googleapis.com/drive/v3/files")
+            .unwrap()
             .with_query_pairs(&[
-                Some(("fields", "nextPageToken,files/id,files/name,files/mimeType,files/size,files/sha1Checksum,files/modifiedTime,files/parents,files/headRevisionId")),
+                Some(("fields", PREFIXED_FIELDS.as_str())),
                 Some(("pageSize", "1000")),
                 // Google does not complain about empty q paramter. Besides, it's never empty in practice
                 Some(("q", q)),
-                next_page_token.map(|x| ("pageToken", x))
+                next_page_token.map(|x| ("pageToken", x)),
             ]);
 
         let req = Request::get(url.to_string())
             .bearer_auth(self.token.secret())
-            .body(EMPTY_BODY)?;
+            .body(EMPTY_BODY)
+            .expect("request is valid");
 
-        let resp = self.send_retry(req).await?;
-        Ok(resp.json().await?)
+        let ret = self.send_retry_json::<FilesListResp, _>(req).await?;
+        Ok(ret)
     }
 
     /// Wrap file_list and keep reading until nextPageToken is None. Return the end result.
-    pub async fn file_list_all(&self, q: &str) -> anyhow::Result<Vec<File>> {
+    pub async fn file_list_all(&self, q: &str) -> Result<Vec<File>, ApiError> {
         let mut ret = Vec::new();
 
-        let mut next_token = "".to_string();
+        let mut next_page_token: Option<String> = None;
         loop {
-            let resp = self.file_list(q, Some(&next_token)).await?;
+            let resp = self.file_list(q, next_page_token.as_deref()).await?;
             ret.extend(resp.files);
             if let Some(t) = resp.next_page_token {
-                next_token = t
+                next_page_token = Some(t);
             } else {
                 break;
             }
@@ -225,35 +377,33 @@ impl DriveApi {
         Ok(ret)
     }
 
-    pub async fn files_get(&self, id: &str) -> anyhow::Result<File> {
+    pub async fn files_get(&self, id: &str) -> Result<File, ApiError> {
         let url = Url::parse(&format!("https://www.googleapis.com/drive/v3/files/{id}"))
             .unwrap()
-            .with_query_pairs(&[(
-                "fields",
-                "id,name,mimeType,sha1Checksum,modifiedTime,parents,headRevisionId,size",
-            )]);
+            .with_query_pairs(&*FILE_FIELDS_QUERY);
 
         let req = Request::get(url.to_string())
             .bearer_auth(self.token.secret())
-            .body(EMPTY_BODY)?;
+            .body(EMPTY_BODY)
+            .expect(REQUEST_IS_VALID);
 
-        Ok(self.send_retry(req).await?.json().await?)
+        self.send_retry_json(req).await
     }
 
     pub async fn files_get_alt_media(
         &self,
         id: &str,
         revision_id: Option<&str>,
-    ) -> anyhow::Result<Box<dyn AsyncRead + Unpin + Send>> {
+    ) -> Result<Box<dyn AsyncRead + Unpin + Send>, ApiError> {
         let url = if let Some(revision_id) = revision_id {
-            format!("https://www.googleapis.com/drive/v3/files/{id}/revision/{revision_id}")
+            format!("https://www.googleapis.com/drive/v3/files/{id}/revisions/{revision_id}")
         } else {
             format!("https://www.googleapis.com/drive/v3/files/{id}")
         };
 
         let url = Url::parse(&url)
             .unwrap()
-            .with_query_pairs(&[Some(("acknowledgeAbuse", "true")), Some(("alt", "media"))]);
+            .with_query_pairs(&[("acknowledgeAbuse", "true"), ("alt", "media")]);
 
         // At some point, we included a a range header in the request, so that Google sends a Content-Range
         // header from which we can know the (uncompressed) size of the body before downloading it.
@@ -262,7 +412,8 @@ impl DriveApi {
         // bytes=0- results in 416 Content Range Not Satisfiable (which we had to work around...)
         let req = Request::get(url.to_string())
             .bearer_auth(self.token.secret())
-            .body(EMPTY_BODY)?;
+            .body(EMPTY_BODY)
+            .expect(REQUEST_IS_VALID);
 
         let resp = self.send_retry(req).await?;
 
@@ -274,26 +425,30 @@ impl DriveApi {
         Ok(Box::new(ret))
     }
 
-    pub async fn files_delete(&self, id: &str) -> anyhow::Result<()> {
+    pub async fn files_delete(&self, id: &str) -> Result<(), ApiError> {
         let url = Url::parse(&format!("https://www.googleapis.com/drive/v3/files/{id}")).unwrap();
 
         let req = Request::delete(url.to_string())
             .bearer_auth(self.token.secret())
-            .body(EMPTY_BODY)?;
+            .body(EMPTY_BODY)
+            .expect(REQUEST_IS_VALID);
 
         self.send_retry(req).await?;
 
         Ok(())
     }
 
-    pub async fn files_create(&self, create_request: FilesReq) -> anyhow::Result<FileId> {
-        let url = Url::parse("https://www.googleapis.com/drive/v3/files").unwrap();
+    pub async fn files_create(&self, create_request: FilesReq) -> Result<File, ApiError> {
+        let url = Url::parse("https://www.googleapis.com/drive/v3/files")
+            .unwrap()
+            .with_query_pairs(&*FILE_FIELDS_QUERY);
 
         let req = Request::post(url.to_string())
             .bearer_auth(self.token.secret())
-            .json_body(&create_request)?;
+            .json_body(&create_request)
+            .expect(REQUEST_IS_VALID);
 
-        Ok(self.send_retry(req).await?.json().await?)
+        self.send_retry_json(req).await
     }
 
     pub async fn files_create_upload<R: AsyncRead + Send>(
@@ -301,20 +456,23 @@ impl DriveApi {
         create_request: FilesReq,
         src: R,
         len: u64,
-    ) -> anyhow::Result<FileId> {
+    ) -> Result<File, ApiError> {
         let url =
             Url::parse("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable")
-                .unwrap();
+                .unwrap()
+                .with_query_pairs(&*FILE_FIELDS_QUERY);
 
         let req = Request::post(url.to_string())
             .bearer_auth(self.token.secret())
-            .json_body(&create_request)?;
+            .json_body(&create_request)
+            .expect(REQUEST_IS_VALID);
 
         let resp = self.send_retry(req).await?;
 
         let resumable_session_url = resp.headers().get("Location").unwrap().to_str().unwrap();
 
-        self.upload(resumable_session_url, src, len).await
+        let value = self.upload(resumable_session_url, src, len).await?;
+        Ok(serde_json::from_value(value).map_err(|err| ApiError::Other(err.into()))?)
     }
 
     pub async fn files_update_upload<R: AsyncRead + Send>(
@@ -322,28 +480,33 @@ impl DriveApi {
         id: &str,
         src: R,
         len: u64,
-    ) -> anyhow::Result<FileId> {
+    ) -> Result<File, ApiError> {
         let url = Url::parse(&format!(
             "https://www.googleapis.com/upload/drive/v3/files/{id}?uploadType=resumable"
         ))
-        .unwrap();
+        .unwrap()
+        .with_query_pairs(&*FILE_FIELDS_QUERY);
 
         let req = Request::patch(url.to_string())
             // Note that we could send a non empty object here, but for now,
             // we don't. We use another API request to change metadata.
             .header(http::header::CONTENT_TYPE, "application/json")
             .bearer_auth(self.token.secret())
-            .body("{}")?;
+            .body("{}")
+            .expect(REQUEST_IS_VALID);
 
         let resp = self.send_retry(req).await?;
 
         let resumable_session_url = resp.headers().get("Location").unwrap().to_str().unwrap();
 
-        self.upload(resumable_session_url, src, len).await
+        let value = self.upload(resumable_session_url, src, len).await?;
+        Ok(serde_json::from_value(value).map_err(|err| ApiError::Other(err.into()))?)
     }
 
     pub async fn files_update(&self, id: &str, update_req: FilesReq) -> anyhow::Result<()> {
-        let url = Url::parse(&format!("https://www.googleapis.com/drive/v3/files/{id}")).unwrap();
+        let url = Url::parse(&format!("https://www.googleapis.com/drive/v3/files/{id}"))
+            .unwrap()
+            .with_query_pairs(&*FILE_FIELDS_QUERY);
 
         let req = Request::patch(url.to_string())
             .bearer_auth(self.token.secret())
@@ -356,28 +519,32 @@ impl DriveApi {
         Ok(())
     }
 
-    // Try and read everything from the reader. Try to not but it into memory.
+    // Try and read everything from the reader. Try to not put it into memory.
     // At this point, it's already seekable, so we do not have to do that.
+    //
+    // This is a helper method, and we technically do not really know what it returns, so we use the
+    // generic serde_json::Value, and let the caller deal with it...
     async fn upload<R: AsyncRead + Send>(
         &self,
         resumable_session_url: &str,
         src: R,
         len: u64,
-    ) -> anyhow::Result<FileId> {
-        // I have no idea what I'm doing here. I should probably read that blog
-        // post "Pin and suffering" again (great title btw)
-        let mut src = Box::pin(src);
+    ) -> Result<serde_json::Value, ApiError> {
+        let mut src = pin!(src);
 
         let mut buf = vec![0u8; Self::CHUNKSIZE].into_boxed_slice();
         let mut buf_len = 0;
 
         let mut resend = 0;
         let mut cursor = 0;
-        let id: FileId = loop {
+        let value: serde_json::Value = loop {
             if resend == 0 {
                 buf_len = 0;
                 while buf_len < Self::CHUNKSIZE {
-                    let just_read = src.read(&mut buf[buf_len..]).await?;
+                    let just_read = src
+                        .read(&mut buf[buf_len..])
+                        .await
+                        .map_err(ApiError::IoError)?;
                     if just_read == 0 {
                         break;
                     }
@@ -399,15 +566,19 @@ impl DriveApi {
 
                 req = req.header(http::header::CONTENT_RANGE, range_header);
             }
-            let req = req.body(send_buffer.to_vec())?;
+            let req = req.body(send_buffer.to_vec()).expect(REQUEST_IS_VALID);
 
-            // Note how the retrying will end up cloning the body
-            // contained in this request. But the "body" is just a *reference* to an array,
-            // and cloning a reference is cheap.
-            let resp = self.client.execute(req.try_into().unwrap()).await?;
+            // Note how the retrying will end up cloning the body contained in this request.
+            // But the "body" is just a *reference* to an array, and cloning a reference is cheap.
+            let resp = self
+                .client
+                .execute(req.try_into().unwrap())
+                .await
+                .map_err(ApiError::HttpError)?;
+
             match resp.status().as_u16() {
                 // Success. We are done, extract the field and return it
-                200..=299 => break resp.json().await?,
+                200..=299 => break resp.json().await.map_err(ApiError::HttpError)?,
 
                 // Not yet finished
                 308 => {
@@ -435,7 +606,9 @@ impl DriveApi {
             }
         };
 
-        Ok(id)
+        log::debug!("Uploaded file and got {:?}", value);
+
+        Ok(value)
     }
 }
 
@@ -467,19 +640,22 @@ where
     Ok(ret)
 }
 
-// See https://github.com/serde-rs/json/issues/317#issuecomment-300251188
 fn from_str<'de, T, D>(deserializer: D) -> Result<T, D::Error>
 where
     T: FromStr,
     T::Err: Display,
     D: Deserializer<'de>,
 {
+    // See https://github.com/serde-rs/json/issues/317#issuecomment-300251188
+
     let s = String::deserialize(deserializer)?;
     T::from_str(&s).map_err(de::Error::custom)
 }
 
 #[cfg(test)]
 mod test {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -526,5 +702,31 @@ mod test {
         assert_eq!(test.more, None);
         assert_eq!(test.mime_type, "application/vnd.google-apps.folder");
         assert!(test.is_folder());
+    }
+
+    #[test]
+    fn errors_can_be_parsed_test() {
+        // See https://developers.google.com/drive/api/guides/handle-errors#user-rate-limit
+        let data = r#"
+            {
+               "error":{
+                  "errors":[
+                     {
+                        "domain":"usageLimits",
+                        "reason":"userRateLimitExceeded",
+                        "message":"User Rate Limit Exceeded"
+                     }
+                  ],
+                  "code":403,
+                  "message":"User Rate Limit Exceeded"
+               }
+            }
+        "#;
+
+        let val: GoogleError = serde_json::from_str(data).unwrap();
+
+        assert_eq!(val.code(), 403);
+        assert_eq!(val.message(), "User Rate Limit Exceeded");
+        assert_eq!(val.errors()[0].reason, "userRateLimitExceeded");
     }
 }

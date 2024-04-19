@@ -15,7 +15,7 @@ pub struct PushPullArgs {
 }
 
 #[derive(ValueEnum, Clone, Copy, PartialEq, Eq)]
-pub(self) enum ConflictResolution {
+pub enum ConflictResolution {
     Interactive,
     Normal,
     Aggressive,

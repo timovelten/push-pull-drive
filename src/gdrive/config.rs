@@ -1,5 +1,5 @@
 use super::{FatAccessToken, GDriveBackend, GoogleCredential};
-use crate::{context::AppContext, gdrive::oauth, KEY_BACKEND};
+use crate::{context::AppContext, gdrive::oauth};
 use anyhow::{anyhow, Context as _};
 use oauth2::{AccessToken, ClientId, ClientSecret, RefreshToken};
 use std::fs::File;
@@ -7,6 +7,7 @@ use std::io::Write;
 use std::sync::Arc;
 use time::OffsetDateTime;
 
+const KEY_BACKEND: &str = "backend";
 const GDRIVE_BACKEND: &str = "gdrive";
 const KEY_GDRIVE_CLIENT_SECRET: &str = "s";
 const KEY_GDRIVE_CLIENT_ID: &str = "cid";

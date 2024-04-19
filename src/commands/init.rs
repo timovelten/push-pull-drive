@@ -1,5 +1,5 @@
 use crate::{
-    context::AppContext,
+    context::{self, AppContext},
     db::SqliteDatabase,
     gdrive::{self, config::GoogleDriveInitArgs},
     local::{self, LocalInitArgs},
@@ -20,7 +20,7 @@ pub fn init(
     shell: Arc<Shell>,
     handle: RuntimeHandle,
 ) -> anyhow::Result<()> {
-    let config_dir = root_dir.join(crate::CONFIG_DIR);
+    let config_dir = root_dir.join(context::CONFIG_DIR);
 
     // Make sure the config directory exists
     match std::fs::create_dir(&config_dir) {
@@ -35,7 +35,7 @@ pub fn init(
     // ever expires or something similar happens.
     let db_path = {
         let mut tmp = config_dir;
-        tmp.push(crate::DATABASE_NAME);
+        tmp.push(context::DATABASE_NAME);
         tmp
     };
 

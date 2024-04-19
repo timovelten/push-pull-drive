@@ -23,7 +23,7 @@ pub enum Error {
 }
 
 pub trait AsyncReader: AsyncRead + Send {}
-impl<T: AsyncRead + Send> AsyncReader for T {}
+impl<T> AsyncReader for T where T: AsyncRead + Send {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -70,7 +70,7 @@ pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
     ///
     /// - If cpath is a directory, this returns [`Error::IsADirectory`]. Consider deleting the directory in this case and trying again. Also
     ///   see [`Self::delete_orphaned_directory`]. This particular case is very important. We rely on this behavior in push_pull.
-    /// - If a subpath os `cpath` is a file itself, this returns either [`Error::NotADirectory`] or [`Error::NotFound`] (up to the implementation).
+    /// - If a subpath of `cpath` is a file itself, this returns either [`Error::NotADirectory`] or [`Error::NotFound`] (up to the implementation).
     /// - If the directory part of `cpath` does not exist, this returns [`Error::NotFound`].
     fn write_file<R: AsyncReader>(
         &self,

@@ -1,37 +1,34 @@
-mod commands;
-mod context;
-mod db;
-mod error;
-mod file_repository;
-mod fileinfo;
-mod gdrive;
-mod local;
-mod paths;
-mod util;
-
-use anyhow::anyhow;
-use clap::{Parser, Subcommand};
+pub mod commands;
 use commands::{
     init::{self, InitBackendCmd},
     ls::{self, LsArgs},
     push_pull::{self, PushPullArgs},
     status::{self, StatusArgs},
 };
+
+pub mod context;
 use context::{find_context, AppContext, Ctx, FullContext};
-use env_logger::Target;
+
+mod fileinfo;
 pub use fileinfo::*;
-use local::LocalBackend;
-pub use paths::*;
-use std::{fs::File, sync::Arc};
-use util::Shell;
 
-const CONFIG_DIR: &str = ".basicdrive";
-const DATABASE_NAME: &str = "database.sqlite3";
+pub mod local;
+use crate::local::LocalBackend;
 
-// Constants, that are used in the app configuration (database)
-pub const KEY_BACKEND: &str = "backend";
+pub mod paths;
+pub use paths::{append_to_cpath_in_place, append_to_relative_name, pop_cpath};
 
-pub type Result<E> = anyhow::Result<E>;
+mod util;
+pub use util::*;
+
+pub mod db;
+pub mod file_repository;
+pub mod gdrive;
+
+use anyhow::anyhow;
+use clap::{Parser, Subcommand};
+use env_logger::Target;
+use std::{fs::File, path::Path, sync::Arc};
 
 // Note that the level argument is implemented through the LevelFilter::from_str implementation.
 // Therefore, clap cannot possibly know all values (and therefore also cannot list them in the help).
@@ -121,15 +118,18 @@ pub fn main() -> anyhow::Result<()> {
     }
 }
 
+fn get_local_backend_config(root_dir: impl AsRef<Path>) -> local::Config {
+    return local::Config {
+        root_path: root_dir.as_ref().to_owned(),
+        ignore_prefixes: vec![crate::context::CONFIG_DIR.to_string()],
+        calculate_hashes: true,
+    };
+}
+
 // This awkward construction enables us to have type parameters inside of the context, whose
 // value is only determined at runtime.
 fn get_full_context(ctx: AppContext) -> anyhow::Result<Box<dyn CommandHandler>> {
-    let config = local::Config {
-        root_path: ctx.root_dir.clone(),
-        ignore_prefixes: vec![crate::CONFIG_DIR.to_string()],
-        calculate_hashes: true,
-    };
-    let local = LocalBackend::from_config(config);
+    let local = LocalBackend::from_config(get_local_backend_config(&ctx.root_dir));
 
     // Try to load an appropriate functions. It is the responsibility of the 'load' function
     // to return None if it is not applicable to the current config. In that case we

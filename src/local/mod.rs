@@ -1,6 +1,6 @@
 pub mod config;
 pub mod file_hasher;
-use anyhow::{anyhow, Context};
+use anyhow::anyhow;
 pub use config::*;
 use walkdir::WalkDir;
 
@@ -162,15 +162,15 @@ impl<H: FileHasher> LocalBackend<H> {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(err) => {
+                    let error_depth = err.depth();
                     let error_cpath = if let Some(err_path) = err.path() {
-                        paths::relative_name(&config.root_path, err_path)
-                            .with_context(|| {
-                                format!(
-                                    "Error occurred at depth {} for error path {err_path:?}",
-                                    err.depth()
-                                )
-                            })
-                            .map_err(FileRepositoryError::Other)?
+                        paths::relative_name(&config.root_path, err_path).map_err(|err| {
+                            let err = anyhow!(err).context(format!(
+                                "Error occurred at depth {} for error path {err_path:?}",
+                                error_depth
+                            ));
+                            FileRepositoryError::Other(err)
+                        })?
                     } else {
                         "".to_owned()
                     };

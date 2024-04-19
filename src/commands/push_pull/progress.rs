@@ -181,9 +181,7 @@ impl<'a> ProgressReceiver<'a> {
     }
 }
 
-pub(super) fn make_progress<'a>(
-    changes: &'a [ChangeRequest],
-) -> (ProgressSender, ProgressReceiver) {
+pub(super) fn make_progress(changes: &[ChangeRequest]) -> (ProgressSender, ProgressReceiver) {
     let (sender, receiver) = mpsc::channel(16);
     let total_bytes_read = Arc::new(AtomicU64::new(0));
 

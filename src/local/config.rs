@@ -1,11 +1,12 @@
 use anyhow::anyhow;
 
-use crate::{context::AppContext, KEY_BACKEND};
+use crate::context::AppContext;
 
 use super::LocalBackend;
 
 const LOCAL_BACKEND: &str = "local";
 const KEY_LOCAL_PATH: &str = "local_path";
+const KEY_BACKEND: &str = "backend";
 
 #[derive(clap::Args, Clone)]
 pub struct LocalInitArgs {

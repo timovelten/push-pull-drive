@@ -416,11 +416,11 @@ where
     ) -> Result<(), (bool, Vec<anyhow::Error>)> {
         // If the deletions fail, we just bail and do not even try the modifications
         self.clone()
-            .commit_deletions(&changes, &sender)
+            .commit_deletions(changes, &sender)
             .await
             .map_err(|err| (true, vec![err]))?;
 
-        self.commit_other(&changes, &sender)
+        self.commit_other(changes, &sender)
             .await
             .map_err(|err| (false, err))
     }

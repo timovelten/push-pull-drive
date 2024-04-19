@@ -89,6 +89,10 @@ pub fn find_common_prefix(a: &str, b: &str) -> usize {
     a.len()
 }
 
+pub fn hex_must_decode(s: impl AsRef<[u8]>) -> Vec<u8> {
+    hex::decode(s).expect("hex is valid")
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

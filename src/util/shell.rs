@@ -9,6 +9,12 @@ pub struct Shell {
     inner: Mutex<ShellImpl>,
 }
 
+impl Default for Shell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 const fn _assert_send_sync<T: Send + Sync>() {}
 
 const _: () = _assert_send_sync::<Shell>();

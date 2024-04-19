@@ -1,5 +1,3 @@
-use crate::Result;
-use anyhow::bail;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -26,15 +24,30 @@ fn strip_leading_separator(path: &Path) -> &Path {
     ret
 }
 
-/// Convert a path to what we refer to as a "relative name"
-/// relative to the given base_path.
-pub fn relative_name<P: AsRef<Path>, Q: AsRef<Path>>(base_path: P, path: Q) -> Result<String> {
+pub fn subpaths(cpath: &str) -> impl Iterator<Item = &str> {
+    let sep_indices = cpath
+        .match_indices('/')
+        .map(|(i, _)| i)
+        .chain(std::iter::once(cpath.len()));
+
+    sep_indices.map(|i| &cpath[..i])
+}
+
+pub fn components(cpath: &str) -> impl Iterator<Item = &str> {
+    subpaths(cpath).map(filename)
+}
+
+/// Convert a path to what we refer to as a "relative name" relative to the given base_path.
+pub fn relative_name<P: AsRef<Path>, Q: AsRef<Path>>(
+    base_path: P,
+    path: Q,
+) -> Result<String, Error> {
     // TODO: Make this more robust, i.e. perhaps handle paths that contains dots etc.
     let base_path = base_path.as_ref();
     let path = path.as_ref();
 
     if !base_path.is_absolute() || !path.is_absolute() {
-        bail!(Error::PathNotAbsolute(path.to_owned()));
+        return Err(Error::PathNotAbsolute(path.to_owned()));
     }
 
     if let Ok(relative_path) = path.strip_prefix(base_path) {
@@ -46,10 +59,10 @@ pub fn relative_name<P: AsRef<Path>, Q: AsRef<Path>>(base_path: P, path: Q) -> R
             .ok_or(Error::PathContainsInvalidUnicode)?
             .to_owned())
     } else {
-        bail!(Error::PathIsNotSubpathOf {
+        Err(Error::PathIsNotSubpathOf {
             base: base_path.to_owned(),
             path: path.to_owned(),
-        });
+        })
     }
 }
 
@@ -106,5 +119,19 @@ mod test {
         // Make sure that passing in the same path twice works.
         // We unwrap that at some points.
         assert_eq!(relative_name("/tmp/test", "/tmp/test").unwrap(), "");
+    }
+
+    #[test]
+    pub fn subpaths_works() {
+        let cpath = "videos/2024/good_ones/test.mkv";
+        let res = subpaths(cpath).collect::<Vec<_>>();
+        let should_be = vec![
+            "videos",
+            "videos/2024",
+            "videos/2024/good_ones",
+            "videos/2024/good_ones/test.mkv",
+        ];
+
+        assert_eq!(res, should_be);
     }
 }
