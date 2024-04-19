@@ -32,6 +32,8 @@ enum Conflict {
     SubpathIsFile { src: FileChange, file: FileChange },
 }
 
+// One could imagine that we might add a variant here to also make some changes on the src side (?)
+// For now, we do not have that though and all these represent changes we intend to make on the dst side.
 #[derive(PartialEq, Clone, Debug)]
 pub(super) enum ChangeRequest {
     DeleteFile { cpath: String },
@@ -52,8 +54,7 @@ impl From<FileChange> for ChangeRequest {
 
 impl std::fmt::Display for ChangeRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Note: It is somewhat important that whatever we return contains no line-breaks (so as to not break
-        // the asthetic...)
+        // Note: It is somewhat important that whatever we return contains no line-breaks (so as to not break the asthetic...)
         match self {
             ChangeRequest::DeleteFile { cpath } => {
                 write!(f, "Delete {}", WithoutNewlines(cpath))?;
@@ -301,7 +302,6 @@ where
         for conflict in conflicts {
             // "conservative" for us means to make less changes. So (for now anyway) conservative
             // means to just skip this change.
-
             match conflict {
                 Conflict::BothModified { src, dst: _ } => match self.args.conflict_resolution {
                     ConflictResolution::Interactive => todo!("Interactive conflict resolution"),
@@ -347,7 +347,6 @@ where
             }
         }
 
-        // For now, our conflict resolution is to not do it...
         Ok(PushPullState::Commit { changes })
     }
 
@@ -476,7 +475,7 @@ where
         for is_retry in [false, true] {
             if is_retry {
                 // If this is our second try, we do any sane thing we can think of to make it suceed after all
-                // (which might include "expensive" API calls)
+                // (which might include "expensive" API calls we do not want to do for every file always)
                 log::warn!(
                     "Trying to delete orphaned directory at {} to make change suceed.",
                     &cpath
@@ -534,87 +533,89 @@ mod test {
         }
     }
 
-    #[test]
-    fn test_conflict_detection_ident() {
-        let mut to_changes = vec![
-            FileChange::New(f("a/b/c1")),
-            FileChange::New(f("a/b/c2")),
-            FileChange::Modified(f("a/b/c3")),
+    fn test_changes_1() -> Vec<FileChange> {
+        // When changing this, it is important to take care not to invalidate all the test that use this.
+        let mut ret = vec![
+            FileChange::New(f("documents/2024/invoice")),
+            FileChange::New(f("documents/2024/letter")),
+            FileChange::Modified(f("documents/2024/cv")),
             FileChange::Deleted {
-                cpath: "a/f".to_owned(),
+                cpath: "documents/template".to_owned(),
+            },
+            FileChange::New(f("videos/test/vid.mp4")),
+            FileChange::New(f("videos/test/vid2.mkv")),
+            FileChange::Modified(f("videos/test/another.mkv")),
+            FileChange::Deleted {
+                cpath: "tmp/file1".to_owned(),
+            },
+            FileChange::Deleted {
+                cpath: "tmp/file2".to_owned(),
             },
         ];
-        sort_filechanges(&mut to_changes);
+        sort_filechanges(&mut ret);
 
-        let Either::Left(_) = either_okay_or_conflict(FileChange::Modified(f("a/f")), &to_changes)
-        else {
-            panic!("Deletions should not be a conflict");
+        ret
+    }
+
+    #[test]
+    fn deletion_should_not_conflict_with_modification() {
+        let changes = test_changes_1();
+
+        let res = either_okay_or_conflict(FileChange::Modified(f("documents/template")), &changes);
+        assert!(matches!(res, Either::Left(_)));
+    }
+
+    #[test]
+    fn conflict_detection_both_modified() {
+        let to_changes = test_changes_1();
+
+        let Either::Right(Conflict::BothModified { dst, .. }) = either_okay_or_conflict(
+            FileChange::Modified(f("documents/2024/letter")),
+            &to_changes,
+        ) else {
+            panic!();
         };
+        assert_eq!(dst.cpath(), "documents/2024/letter");
+    }
 
-        let Either::Right(Conflict::BothModified { dst, .. }) =
-            either_okay_or_conflict(FileChange::Modified(f("a/b/c2")), &to_changes)
+    #[test]
+    fn conflict_target_is_dir() {
+        let changes = test_changes_1();
+
+        let info = f("videos/test");
+        for change in [FileChange::Modified(info.clone()), FileChange::New(info)] {
+            let Either::Right(Conflict::IsADirectory { contents, .. }) =
+                either_okay_or_conflict(change, &changes)
+            else {
+                panic!();
+            };
+            assert_eq!(contents.len(), 3);
+        }
+    }
+
+    #[test]
+    fn conflict_target_is_empty_dir() {
+        let changes = test_changes_1();
+
+        // This one a is a bit tricky. Clearly, the user was able to create the file "tmp" (even though that
+        // was a folder at the point in time we last synced). Unless there were remote changes in that folder
+        // the user knowingly deleted the folder, and replaced it by a file. There is no conflict here!
+        let Either::Left(_) = either_okay_or_conflict(FileChange::Modified(f("tmp")), &changes)
         else {
             panic!();
         };
-        assert_eq!(dst.cpath(), "a/b/c2");
     }
 
     #[test]
-    fn test_conflict_target_is_dir() {
-        let mut changes = vec![
-            FileChange::Modified(f("a/b/c/f1")),
-            FileChange::Modified(f("a/b/c/f2")),
-            FileChange::Modified(f("a/b/c/f3")),
-            FileChange::Deleted {
-                cpath: "b/c1".to_owned(),
-            },
-            FileChange::Deleted {
-                cpath: "b/c2".to_owned(),
-            },
-        ];
-        sort_filechanges(&mut changes);
+    fn conflict_subpath_is_file() {
+        let changes = test_changes_1();
 
-        let Either::Right(Conflict::IsADirectory { contents, .. }) =
-            either_okay_or_conflict(FileChange::Modified(f("a/b")), &changes)
-        else {
-            panic!("unexpected variant");
+        let Either::Right(Conflict::SubpathIsFile { file, .. }) = either_okay_or_conflict(
+            FileChange::Modified(f("documents/2024/cv/pictures/coverpic.jpg")),
+            &changes,
+        ) else {
+            panic!()
         };
-        assert_eq!(contents.len(), 3);
-
-        let Either::Left(_) = either_okay_or_conflict(FileChange::Modified(f("b")), &changes)
-        else {
-            panic!(
-                "For our purposes b should be considered empty, and is therefore not a conflict"
-            );
-        };
-    }
-
-    #[test]
-    fn test_conflict_target_is_subpathed() {
-        let mut changes = vec![
-            FileChange::Modified(f("a/b")),
-            FileChange::Modified(f("a/c")),
-            FileChange::New(f("dummy")),
-            FileChange::Deleted {
-                cpath: "something/file1".to_owned(),
-            },
-            FileChange::Deleted {
-                cpath: "something/file2".to_owned(),
-            },
-        ];
-        sort_filechanges(&mut changes);
-
-        let Either::Right(Conflict::SubpathIsFile { file, .. }) =
-            either_okay_or_conflict(FileChange::Modified(f("a/b/c/d")), &changes)
-        else {
-            panic!("unexpected variant");
-        };
-        assert_eq!(file.cpath(), "a/b");
-
-        let Either::Left(_) =
-            either_okay_or_conflict(FileChange::Modified(f("something")), &changes)
-        else {
-            panic!("unexpected variant");
-        };
+        assert_eq!(file.cpath(), "documents/2024/cv");
     }
 }

@@ -507,7 +507,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_dir_depth_1() {
+    async fn read_dir_depth_1() {
         let (b, files_should_be, dirs_should_be, _drop_later) = setup_read_dir_test();
 
         // Now read it with read_dir (this should really be done recursively,
@@ -536,7 +536,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_dir_max_depth() {
+    async fn read_dir_max_depth() {
         let (b, files_should_be, dirs_should_be, _drop_later) = setup_read_dir_test();
 
         let retrieved = b.read_dir("", u32::MAX).await.unwrap();
@@ -557,7 +557,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_file() {
+    async fn read_file() {
         let tmp = tempfile::tempdir().unwrap();
         let config = Config {
             ..default_config(tmp.path().to_owned())
@@ -593,7 +593,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_file_ignores_ignored() {
+    async fn file_ignores_ignored() {
         let tmp = tempfile::tempdir().unwrap();
         let b = LocalBackend::<Sha1Hasher>::from_config(Config {
             ignore_prefixes: vec!["dir/subdir".into()],
@@ -606,7 +606,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_file() {
+    async fn write_file() {
         let tmp = tempfile::tempdir().unwrap();
         let b: LocalBackend<Sha1Hasher> = LocalBackend::from_config(Config {
             ignore_prefixes: vec!["dir/we/ignore".into()],
@@ -728,7 +728,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_file_on_directory() {
+    async fn write_file_on_directory() {
         // Check that if write_file is called on a path that exists but is a directory
         // returns Error::IsADirectory.
         let tmp = tempfile::tempdir().unwrap();
@@ -748,7 +748,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_file_on_directory() {
+    async fn read_file_on_directory() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("testdir").join("nested")).unwrap();
         let b = LocalBackend::<Sha1Hasher>::from_config(Config {

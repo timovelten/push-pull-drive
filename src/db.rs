@@ -336,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn test_key_value() {
+    fn key_value() {
         let repo = empty_in_memory_repository();
 
         let v = repo.get_value("SomeKey").unwrap();
@@ -350,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn test_file_tracking() {
+    fn file_tracking() {
         let repo = empty_in_memory_repository();
 
         let cpath = "somedir/that/contains/file";
@@ -400,17 +400,17 @@ mod tests {
     }
 
     #[test]
-    fn test_update_remote() {
+    fn update_remote() {
         update_sided_impl(Side::Remote)
     }
 
     #[test]
-    fn test_update_local() {
+    fn update_local() {
         update_sided_impl(Side::Local)
     }
 
     #[test]
-    fn test_fail_for_non_existing() {
+    fn fail_for_non_existing_database() {
         let p = "/tmp/3e3a7d09-2c8d-4382-b8aa-688fdbaffbc4eca4ad30-879c-4b73-9485-d278502538d8/no_such_file";
         let x = SqliteDatabase::new_from_path(p, false);
         assert!(
