@@ -12,7 +12,6 @@ use crate::file_repository::AsyncReader;
 use crate::file_repository::Error;
 use crate::file_repository::Result;
 use crate::gdrive::drive_api::MoreFileFields;
-use crate::paths::components;
 use crate::paths::filename;
 use crate::paths::subpaths;
 use crate::util::hex_must_decode;
@@ -383,7 +382,9 @@ impl GDriveBackend {
         let mut current_cpath = "".to_owned();
         let mut current_file = root_file;
 
-        for next_file_name in components(cpath) {
+        for subcpath in subpaths(cpath).skip(1) {
+            let next_file_name = filename(subcpath);
+
             // At this point, "{current_cpath}/next_file_name" is the file were looking for.
             if !current_file.is_folder() {
                 return Err(Error::NotADirectory {

@@ -29,22 +29,14 @@ pub fn init(
         Err(err) => return Err(err.into()),
     };
 
-    // In an earlier version, we failed here if the database already existed. We
-    // are now a bit more lenient. If the database already exists, we just run with it.
-    // This is so that we can prompt users to to run init again in case the refresh token
-    // ever expires or something similar happens.
     let db_path = {
         let mut tmp = config_dir;
         tmp.push(context::DATABASE_NAME);
         tmp
     };
 
-    let db = match SqliteDatabase::new_from_path(db_path, true) {
-        Ok(db) => Arc::new(db),
-        Err(_) => {
-            todo!("Intialize the database")
-        }
-    };
+    // Open or create the dabase
+    let db: Arc<SqliteDatabase> = Arc::new(SqliteDatabase::new_from_path(db_path, true)?);
 
     let ctx: AppContext = AppContext {
         shell,

@@ -24,17 +24,26 @@ fn strip_leading_separator(path: &Path) -> &Path {
     ret
 }
 
-pub fn subpaths(cpath: &str) -> impl Iterator<Item = &str> {
-    let sep_indices = cpath
-        .match_indices('/')
-        .map(|(i, _)| i)
-        .chain(std::iter::once(cpath.len()));
+/// Returns all the subpaths of a path. Note that this ALWAYS included the empty path as
+/// the first subpath.
+pub fn subpaths(cpath: &str) -> impl DoubleEndedIterator<Item = &str> {
+    // This is not 'hand written' to avoid us having to think about how one can
+    // efficiently implement both next and next_back.
+    // As a result, the code is kind of cryptic. Check the tests to see how it should work..
+    let end = if cpath.is_empty() {
+        // If the string is empty to begin with, we need to avoid emitting the empty subpath twice.
+        None
+    } else {
+        Some(cpath.len())
+    };
 
-    sep_indices.map(|i| &cpath[..i])
-}
+    let indices_raw = cpath.match_indices('/').map(|(i, _)| Some(i));
+    let indices = [Some(0)]
+        .into_iter()
+        .chain(indices_raw)
+        .chain([end].into_iter());
 
-pub fn components(cpath: &str) -> impl Iterator<Item = &str> {
-    subpaths(cpath).map(filename)
+    indices.filter_map(|maybe_i| maybe_i.map(|i| &cpath[..i]))
 }
 
 /// Convert a path to what we refer to as a "relative name" relative to the given base_path.
@@ -126,6 +135,7 @@ mod test {
         let cpath = "videos/2024/good_ones/test.mkv";
         let res = subpaths(cpath).collect::<Vec<_>>();
         let should_be = vec![
+            "",
             "videos",
             "videos/2024",
             "videos/2024/good_ones",
@@ -133,5 +143,11 @@ mod test {
         ];
 
         assert_eq!(res, should_be);
+    }
+
+    #[test]
+    pub fn subpath_works_for_empty() {
+        let res = subpaths("").collect::<Vec<_>>();
+        assert_eq!(res, vec![""]);
     }
 }
