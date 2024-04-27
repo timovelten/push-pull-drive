@@ -100,7 +100,7 @@ impl FileRepository for Arc<GDriveBackend> {
                 fts.push(async move {
                     let mut ret = Vec::new();
                     let files = self
-                        .read_dirs(chunk, &*self.make_drive_api(false).await?)
+                        .read_dirs(chunk.iter().map(|(x, _)| x.as_str()), &*self.make_drive_api(false).await?)
                         .await?;
 
                     for file in files {
@@ -392,18 +392,7 @@ impl GDriveBackend {
                 });
             }
 
-            let files = self
-                .read_dirs(
-                    &[(
-                        current_file.id,
-                        DirectoryInfo {
-                            cpath: current_cpath.to_owned(),
-                        },
-                    )],
-                    api,
-                )
-                .await?;
-
+            let files = self.read_dirs([current_file.id], api).await?;
             log::debug!("Looking for {} in {}", next_file_name, current_cpath);
 
             let mut next_file = None;
@@ -497,9 +486,9 @@ impl GDriveBackend {
     /// this will not error if they are not). It then returns a list of google drive files. Note that these have a parent id
     /// which can subsequently be used to determine to which of the targets the file belongs.
     /// Also note that "file" in this context can also be a folder.
-    async fn read_dirs(
+    async fn read_dirs<S: AsRef<str>>(
         &self,
-        targets: &[(String, DirectoryInfo)],
+        targets: impl IntoIterator<Item = S>,
         api: &DriveApi,
     ) -> Result<Vec<drive_api::File>> {
         let mut ret = Vec::new();
@@ -509,11 +498,11 @@ impl GDriveBackend {
             // Query string is of the form
             // trashed = false and ('abc' in parents or 'cdf' in parents)
             let mut q = String::from("trashed = false and (");
-            for (i, (id, cpath)) in targets.iter().enumerate() {
+            for (i, id) in targets.into_iter().enumerate() {
                 if i > 0 {
                     write!(q, " or ").unwrap();
                 }
-                write!(q, "'{}' in parents", id).unwrap();
+                write!(q, "'{}' in parents", id.as_ref()).unwrap();
             }
             // Don't forget the closing brace
             write!(q, ")").unwrap();
