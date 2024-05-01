@@ -12,6 +12,7 @@ use crate::{
     PathInfo,
 };
 use futures::{stream::FuturesUnordered, AsyncRead, StreamExt};
+use glob_match::glob_match;
 use std::{
     fs::File,
     io::{ErrorKind, Seek},
@@ -44,10 +45,8 @@ pub struct Config {
     /// and will panic at runtime.
     pub root_path: PathBuf,
 
-    /// A list of relative_name prefixes. Any file or folder with a relative name that matches
-    /// these prefixes will not be emitted by read_dir. If asked explicitly about these files,
-    /// this implementation will return an error `Error::NotAllowed(_)`
-    pub ignore_prefixes: Vec<String>,
+    /// We use these globs to determine if a cpath is ignored or not.
+    pub ignore_globs: Vec<String>,
 
     /// Whether we should calculate hashes of files. Calculating hashes is not particularly cheap
     /// as we can't really cache the result in any meaniningful way.
@@ -237,9 +236,9 @@ impl Config {
         self.root_path.join(relative_name)
     }
 
-    fn is_ignored(&self, relative_name: &str) -> bool {
-        for x in self.ignore_prefixes.iter() {
-            if relative_name.starts_with(x) {
+    fn is_ignored(&self, cpath: &str) -> bool {
+        for glob in self.ignore_globs.iter() {
+            if glob_match(glob, cpath) {
                 return true;
             }
         }
@@ -465,7 +464,7 @@ mod tests {
     fn default_config(root_path: PathBuf) -> Config {
         Config {
             root_path,
-            ignore_prefixes: vec![],
+            ignore_globs: vec![],
             calculate_hashes: true,
         }
     }
@@ -473,9 +472,10 @@ mod tests {
     fn setup_read_dir_test() -> (LocalBackend, Vec<&'static str>, Vec<&'static str>, impl Any) {
         let tmp = tempfile::tempdir().unwrap();
         let config = Config {
-            ignore_prefixes: vec!["ignored".into()],
+            ignore_globs: vec!["ignored".to_owned(), "ignored/**".to_owned()],
             ..default_config(tmp.path().to_owned())
         };
+        println!("Info: {}", glob_match("ignored/test/**", "ignored/test"));
 
         let b = LocalBackend::<Sha1Hasher>::from_config(config);
 
@@ -614,7 +614,7 @@ mod tests {
     async fn file_ignores_ignored() {
         let tmp = tempfile::tempdir().unwrap();
         let b = LocalBackend::<Sha1Hasher>::from_config(Config {
-            ignore_prefixes: vec!["dir/subdir".into()],
+            ignore_globs: vec!["dir/subdir/**".into()],
             ..default_config(tmp.path().to_owned())
         });
         let res = b.read_file("dir/subdir/a/b/somefile").await;
@@ -627,7 +627,7 @@ mod tests {
     async fn write_file() {
         let tmp = tempfile::tempdir().unwrap();
         let b: LocalBackend<Sha1Hasher> = LocalBackend::from_config(Config {
-            ignore_prefixes: vec!["dir/we/ignore".into()],
+            ignore_globs: vec!["dir/we/ignore/**".into()],
             ..default_config(tmp.path().to_owned())
         });
         let test_bytes = (0..1_000_000u64).map(|x| x as u8).collect::<Vec<_>>();
@@ -674,7 +674,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let b: LocalBackend<Sha1Hasher> = LocalBackend::from_config(Config {
             root_path: tmp.path().to_owned(),
-            ignore_prefixes: vec!["dir/subdir".into()],
+            ignore_globs: vec!["dir/subdir/**".into()],
             ..default_config(tmp.path().to_owned())
         });
 
@@ -690,7 +690,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let b = LocalBackend::<Sha1Hasher>::from_config(Config {
             root_path: tmp.path().to_owned(),
-            ignore_prefixes: vec!["dir/subdir".into()],
+            ignore_globs: vec!["dir/subdir/**".into()],
             ..default_config(tmp.path().to_owned())
         });
 
@@ -717,7 +717,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let b = LocalBackend::<Sha1Hasher>::from_config(Config {
             root_path: tmp.path().to_owned(),
-            ignore_prefixes: vec!["dir/subdir".into()],
+            ignore_globs: vec!["dir/subdir/**".into()],
             calculate_hashes: false,
         });
 

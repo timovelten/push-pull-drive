@@ -38,6 +38,7 @@ console-subscriber = "0.2.0"
 walkdir = "2.5.0"
 once_cell = "1.19.0"
 tempfile = "3.10.1"
+glob-match = "0.2.1"
 
 [dev-dependencies]
 test-log = "0.2.15"

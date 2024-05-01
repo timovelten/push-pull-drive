@@ -42,7 +42,7 @@ fn load_internal(ctx: &AppContext) -> anyhow::Result<LocalBackend> {
         .ok_or_else(|| anyhow!("Expected to find {KEY_LOCAL_PATH}"))?;
     let config = super::Config {
         root_path: local_path.into(),
-        ignore_prefixes: vec![],
+        ignore_globs: vec![],
         calculate_hashes: true,
     };
     Ok(LocalBackend::from_config(config))

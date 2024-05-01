@@ -118,7 +118,10 @@ pub fn main() -> anyhow::Result<()> {
 fn get_local_backend_config(root_dir: impl AsRef<Path>) -> local::Config {
     return local::Config {
         root_path: root_dir.as_ref().to_owned(),
-        ignore_prefixes: vec![crate::context::CONFIG_DIR.to_string()],
+        ignore_globs: vec![
+            crate::context::CONFIG_DIR.to_owned(),
+            format!("{}/**", crate::context::CONFIG_DIR),
+        ],
         calculate_hashes: true,
     };
 }
