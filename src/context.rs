@@ -13,7 +13,7 @@ use std::{
 };
 use tokio::runtime::Handle as TokioHandle;
 
-pub const CONFIG_DIR: &str = ".basicdrive";
+pub const CONFIG_DIR: &str = ".push-pull-drive";
 pub const DATABASE_NAME: &str = "database.sqlite3";
 
 #[derive(Clone)]

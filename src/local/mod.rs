@@ -84,6 +84,9 @@ impl<H: FileHasher> LocalBackend<H> {
     }
 
     /// cpath is still needed because it is returned as part of the metadata. Otherwise, it is ignored.
+    ///
+    /// Note that this function might calculate the hash of the file and is therefore somewhat CPU bound. You should
+    /// take care to not overwhelm the spawn_blocking executor with too many concurrent calls to this function.
     fn read_file_impl_for_open_file(
         &self,
         cpath: String,
@@ -92,10 +95,6 @@ impl<H: FileHasher> LocalBackend<H> {
         let metadata = file.metadata().map_err(|err| map_io_error(err, &cpath))?;
         let res = if metadata.is_file() {
             let hash = if self.config.calculate_hashes {
-                // FIXME: This is (kind of?) CPU bound work that we will execute on a spawn_blocking
-                //      tokio thread. That might honestly not be great. On the other hand, we limit concurrency
-                //      anyways so we definitely should not end up with 500 threads doing nothing but running
-                //      SHA1 so this is probably fine.
                 file.rewind().map_err(as_other_error)?;
                 self.hasher
                     .hash(&mut file)
@@ -427,7 +426,7 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
                 let _permit = cpu_sem.acquire().await;
                 spawn_blocking(move || this.read_file_impl(cpath))
                     .await
-                    .expect("spawn blocking should not fail")
+                    .unwrap()
             };
             files_to_be_processed.push(work);
         }

@@ -1,5 +1,6 @@
 pub mod commands;
 use commands::{
+    forget::{self, ForgetArgs},
     init::{self, InitBackendCmd},
     ls::{self, LsArgs},
     push_pull::{self, PushPullArgs},
@@ -66,6 +67,7 @@ enum Commands {
     /// Push local modified / new files and deletions to the remote
     Push(PushPullArgs),
     RemoteLs(LsArgs),
+    Forget(ForgetArgs),
 }
 
 trait CommandHandler {
@@ -79,8 +81,6 @@ trait CommandHandler {
 //  - if one of two folders is empty, delete it.
 //  - otherwise print a link to the web interface of google drive so the user may fix it themselves.
 pub fn main() -> anyhow::Result<()> {
-    // console_subscriber::init();
-
     let cli = Cli::parse();
     let wd = match cli.dir {
         Some(wd) => wd.into(),
@@ -154,6 +154,7 @@ impl<C: Ctx> CommandHandler for C {
             Commands::RemoteLs(args) => ls::remote_ls(self, args),
             Commands::Status(args) => status::local_status(self, args),
             Commands::RemoteStatus(args) => status::remote_status(self, args),
+            Commands::Forget(args) => forget::forget(self, args),
         }
     }
 }
