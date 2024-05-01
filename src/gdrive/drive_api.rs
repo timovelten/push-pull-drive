@@ -110,7 +110,7 @@ static FILE_FIELDS_QUERY: Lazy<[(&'static str, &'static str); 1]> = Lazy::new(||
     [("fields", fields_str)]
 });
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct File {
     pub id: String,
@@ -129,7 +129,7 @@ pub struct File {
     pub more: Option<MoreFileFields>,
 }
 
-#[derive(Deserialize, Debug, PartialEq)]
+#[derive(Deserialize, Debug, PartialEq, Clone)]
 #[serde(untagged)]
 pub enum MoreFileFields {
     #[serde(rename_all = "camelCase")]
@@ -144,24 +144,6 @@ pub enum MoreFileFields {
         #[serde(deserialize_with = "from_str")]
         size: u64,
     },
-}
-
-impl File {
-    pub fn as_fileinfo(self, cpath: String) -> Option<FileInfo> {
-        match self.more {
-            Some(MoreFileFields::BinaryFile {
-                sha1_checksum,
-                size,
-                ..
-            }) => Some(FileInfo {
-                cpath,
-                size,
-                modified: self.modified_time,
-                hash: hex_must_decode(sha1_checksum),
-            }),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -472,7 +454,7 @@ impl DriveApi {
         let resumable_session_url = resp.headers().get("Location").unwrap().to_str().unwrap();
 
         let value = self.upload(resumable_session_url, src, len).await?;
-        Ok(serde_json::from_value(value).map_err(|err| ApiError::Other(err.into()))?)
+        serde_json::from_value(value).map_err(|err| ApiError::Other(err.into()))
     }
 
     pub async fn files_update_upload<R: AsyncRead + Send>(
@@ -500,7 +482,7 @@ impl DriveApi {
         let resumable_session_url = resp.headers().get("Location").unwrap().to_str().unwrap();
 
         let value = self.upload(resumable_session_url, src, len).await?;
-        Ok(serde_json::from_value(value).map_err(|err| ApiError::Other(err.into()))?)
+        serde_json::from_value(value).map_err(|err| ApiError::Other(err.into()))
     }
 
     pub async fn files_update(&self, id: &str, update_req: FilesReq) -> anyhow::Result<()> {

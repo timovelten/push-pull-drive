@@ -38,10 +38,7 @@ pub fn subpaths(cpath: &str) -> impl DoubleEndedIterator<Item = &str> {
     };
 
     let indices_raw = cpath.match_indices('/').map(|(i, _)| Some(i));
-    let indices = [Some(0)]
-        .into_iter()
-        .chain(indices_raw)
-        .chain([end].into_iter());
+    let indices = [Some(0)].into_iter().chain(indices_raw).chain([end]);
 
     indices.filter_map(|maybe_i| maybe_i.map(|i| &cpath[..i]))
 }

@@ -4,6 +4,9 @@ use anyhow::anyhow;
 pub use config::*;
 use walkdir::WalkDir;
 
+use self::file_hasher::{FileHasher, Sha1Hasher};
+use crate::file_repository::Error as FileRepositoryError;
+use crate::file_repository::Result as FileRepositoryResult;
 use crate::{
     file_repository::FileRepository, paths, util::SemaphoreGuarded, DirectoryInfo, FileInfo,
     PathInfo,
@@ -13,7 +16,7 @@ use std::{
     fs::File,
     io::{ErrorKind, Seek},
     path::{Path, PathBuf},
-    pin::Pin,
+    pin::{pin, Pin},
     sync::Arc,
     thread::available_parallelism,
 };
@@ -24,10 +27,6 @@ use tokio::{
     task::spawn_blocking,
 };
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
-
-use self::file_hasher::{FileHasher, Sha1Hasher};
-use crate::file_repository::Error as FileRepositoryError;
-use crate::file_repository::Result as FileRepositoryResult;
 
 const CONCURRENCY_LIMIT: usize = 16;
 
@@ -126,7 +125,7 @@ impl<H: FileHasher> LocalBackend<H> {
                 file,
             )
         } else {
-            // For now, we ignore symlinks by return NotAllowed...
+            // For now, we ignore symlinks by returning NotAllowed...
             return Err(FileRepositoryError::NotAllowed {
                 cpath: cpath.to_owned(),
             });
@@ -281,39 +280,36 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
         _len: u64,
     ) -> FileRepositoryResult<FileInfo> {
         let _permit = self.aquire_permit().await;
+        let mut src = pin!(src.compat());
         if self.config.is_ignored(cpath) {
             return Err(FileRepositoryError::NotAllowed {
                 cpath: cpath.to_owned(),
             });
         }
-        let local_path = self.config.get_local_path_from_relative_name(cpath);
 
-        let mut dir = local_path.to_owned();
-        dir.pop();
+        // We are optimistic: Start writing the file to a temporary location
+        // and maybe fail later when we cannot move it for whatever reason...
+        let config = self.config.clone();
+        let (mut tmp_file, tmp_file_path) = spawn_blocking(move || {
+            // Use the temp file crate to at least more or less make sure that we do not leave the file behind.
+            let (f, guard) = tempfile::NamedTempFile::new_in(&config.root_path)
+                .expect("failed to create temp file")
+                .into_parts();
+            (tokio::fs::File::from_std(f), guard)
+        })
+        .await
+        .unwrap();
 
-        // Make sure the directories exist..
-        tokio::fs::create_dir_all(dir)
+        log::info!("Writing to temp path {:?}", tmp_file_path);
+
+        tokio::io::copy(&mut src, &mut tmp_file)
             .await
             .map_err(as_other_error)?;
+        drop(src);
+        tmp_file.sync_all().await.unwrap();
 
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .read(true)
-            .truncate(true)
-            .open(local_path)
-            .await
-            .map_err(|err| map_io_error(err, cpath))?;
-
-        let mut src = Box::pin(src.compat());
-        tokio::io::copy(&mut src, &mut file)
-            .await
-            .map_err(as_other_error)?;
-        file.sync_all().await.unwrap();
-
-        // Finally, we need to set the modified time, and return the files metadata (if the caller wanted us too).
-        // To do so, go back to std-land.
-        let file = file.into_std().await;
+        // We need to set the modified time, and return the files metadata. To do so, go back to std-land.
+        let file = tmp_file.into_std().await;
         let me = self.clone();
         let cp = cpath.to_owned();
         let (PathInfo::File(info), _) = spawn_blocking(move || {
@@ -328,6 +324,28 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
         else {
             unreachable!()
         };
+
+        // Make sure the directories exist..
+        let local_path = self.config.get_local_path_from_relative_name(cpath);
+        tokio::fs::create_dir_all(local_path.parent().unwrap())
+            .await
+            .map_err(as_other_error)?;
+
+        // Make sure the file exists..
+        let _ = tokio::fs::OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create(true)
+            .truncate(false)
+            .open(&local_path)
+            .await
+            .map_err(|err| map_io_error(err, cpath))?;
+
+        // Actually rename. This should succeed now that we have created the file.
+        spawn_blocking(|| tmp_file_path.persist(local_path))
+            .await
+            .unwrap()
+            .map_err(as_other_error)?;
 
         Ok(info)
     }

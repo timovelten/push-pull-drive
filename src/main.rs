@@ -53,7 +53,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Adds files to myapp
     Init {
         #[command(subcommand)]
         backend: InitBackendCmd,
@@ -74,15 +73,13 @@ trait CommandHandler {
 }
 
 // TODO: When deleting a file, do not leave behind orphaned (empty) directories
-// TODO: Handle long windows filenames. Probably like this
-// TODO: Rename to basic drive
-// https://gal.hagever.com/posts/windows-long-paths-in-rust
+// TODO: Handle long windows filenames. Probably like this https://gal.hagever.com/posts/windows-long-paths-in-rust
 // TODO: Have a command like maintenance fix-duplicates that fixes "two files/folders having the same name" by
 //  - if two files have the same name and sha1 hash, just delete one of them
 //  - if one of two folders is empty, delete it.
-//  - otherwise print a link to the web interface of google drive so the user may fix it himself.
+//  - otherwise print a link to the web interface of google drive so the user may fix it themselves.
 pub fn main() -> anyhow::Result<()> {
-    console_subscriber::init();
+    // console_subscriber::init();
 
     let cli = Cli::parse();
     let wd = match cli.dir {
@@ -93,7 +90,7 @@ pub fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .expect("building runtime should not fail");
+        .expect("failed to build tokio runtime");
 
     let shell = Arc::new(Shell::new());
     let target = if let Some(path) = cli.log {

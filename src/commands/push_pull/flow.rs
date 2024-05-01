@@ -298,13 +298,20 @@ where
         conflicts: Vec<Conflict>,
     ) -> anyhow::Result<PushPullState> {
         let mut changes: Vec<ChangeRequest> = changes.into_iter().map(Into::into).collect();
+        let has_conflicts = conflicts.len() > 0;
 
         for conflict in conflicts {
             // "conservative" for us means to make less changes. So (for now anyway) conservative
             // means to just skip this change.
             match conflict {
                 Conflict::BothModified { src, dst: _ } => match self.args.conflict_resolution {
-                    ConflictResolution::Interactive => todo!("Interactive conflict resolution"),
+                    ConflictResolution::Interactive => {
+                        writeln!(
+                            self.stderr(),
+                            "Conflict: File {} is modified in both the source and the destination.",
+                            src.cpath()
+                        )?;
+                    }
                     ConflictResolution::Normal | ConflictResolution::Aggressive => {
                         changes.push(src.into());
                     }
@@ -312,7 +319,9 @@ where
                 },
                 Conflict::IsADirectory { src, contents: _ } => {
                     match self.args.conflict_resolution {
-                        ConflictResolution::Interactive => todo!("Interactive conflict resolution"),
+                        ConflictResolution::Interactive => {
+                            writeln!(self.stderr(), "Conflict: {} is a file in the source, and a directory in the destination.", src.cpath())?;
+                        }
                         ConflictResolution::Normal => {
                             writeln!(
                                 self.stderr(),
@@ -328,8 +337,14 @@ where
                         ConflictResolution::Conservative => continue,
                     }
                 }
-                Conflict::SubpathIsFile { src, file: _ } => match self.args.conflict_resolution {
-                    ConflictResolution::Interactive => todo!("Interactive conflict resolution"),
+                Conflict::SubpathIsFile { src, file } => match self.args.conflict_resolution {
+                    ConflictResolution::Interactive => {
+                        writeln!(
+                            self.stderr(),
+                            "Conflict: {} was changed in the source, but {} is a file in the destination",
+                            src.cpath(), file.cpath()
+                        )?;
+                    }
                     ConflictResolution::Normal => {
                         writeln!(
                             self.stderr(),
@@ -347,6 +362,10 @@ where
             }
         }
 
+        if has_conflicts && self.args.conflict_resolution == ConflictResolution::Interactive {
+            todo!("Interactive conflict resolution is not yet implemented. Run again with --conflict-resolution argument");
+        }
+
         Ok(PushPullState::Commit { changes })
     }
 
@@ -355,6 +374,8 @@ where
         changes: &[ChangeRequest],
         progress: &ProgressSender,
     ) -> anyhow::Result<()> {
+        log::info!("Committing deletions");
+
         // Deletions should be quick, just do them in sequence.
         for (id, change) in changes.iter().enumerate() {
             let ChangeRequest::DeleteFile { cpath } = change else {
@@ -375,6 +396,8 @@ where
         changes: &[ChangeRequest],
         progress: &ProgressSender,
     ) -> Result<(), Vec<anyhow::Error>> {
+        log::info!("Committing modifications and file creations");
+
         let mut change_futures = FuturesUnordered::new();
 
         for (id, change) in changes.iter().enumerate() {

@@ -1,12 +1,10 @@
 mod async_read;
 mod shell;
 
-use std::fmt::Display;
-
 pub use async_read::InspectAsyncReader;
-pub use shell::*;
-
 use http::Request;
+pub use shell::*;
+use std::fmt::Display;
 use tokio::sync::OwnedSemaphorePermit;
 
 pub struct WithoutNewlines<'a>(pub &'a str);

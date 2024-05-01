@@ -34,6 +34,7 @@ use futures::AsyncRead;
 use futures::StreamExt;
 use std::collections::VecDeque;
 use std::fmt::Write;
+use std::ops::Deref;
 use std::pin::Pin;
 use std::{
     collections::HashMap,
@@ -52,6 +53,9 @@ pub struct GDriveBackend {
     /// make sure to always grab ALL available permits when performing a deletion of a directory.
     sem: Arc<tokio::sync::Semaphore>,
 
+    /// Calling mkdir_all concurrently really does not work, so we need to prevent it.
+    mkdir_lock: Arc<tokio::sync::Mutex<()>>,
+
     client: reqwest::Client,
 
     /// Google drive does not use paths. Instead, it identifies files using ids.
@@ -60,7 +64,7 @@ pub struct GDriveBackend {
     /// For this, we assume that this object is generally short lived and pretend
     /// like concurrent modification is not an issue (someone could move the folder,
     /// for example. Then the cached ID would point to another path now.).
-    id_cache: Mutex<TimedCache<String, Arc<String>>>,
+    file_cache: Mutex<TimedCache<String, Arc<drive_api::File>>>,
 
     credential: GoogleCredential,
 }
@@ -68,13 +72,20 @@ pub struct GDriveBackend {
 impl FileRepository for Arc<GDriveBackend> {
     type Reader = Pin<Box<dyn AsyncRead + Send>>;
 
+    // As a rule of thumb: All functions in this impl should start by aquiring the permits they need (i.e. an api instance).
+    // All "private functions" in the impl should take the permit as a parameter.
+
     async fn read_dir(&self, cpath: &str, up_to_depth: u32) -> Result<Vec<PathInfo>> {
         const BATCH_SIZE: usize = 12;
 
         // Another day, another (sort-of) BFS!
         let mut ret = Vec::new();
 
-        let id = self.get_drive_id(cpath, true).await?.as_ref().to_owned();
+        let id = self
+            .drive_file_by_cpath_cached(cpath, &*self.api().await?)
+            .await?
+            .id
+            .to_owned();
         let mut queue = vec![(
             id,
             DirectoryInfo {
@@ -99,8 +110,9 @@ impl FileRepository for Arc<GDriveBackend> {
             for chunk in queue.chunks(BATCH_SIZE) {
                 fts.push(async move {
                     let mut ret = Vec::new();
+                    let api = self.api().await?;
                     let files = self
-                        .read_dirs(chunk.iter().map(|(x, _)| x.as_str()), &*self.make_drive_api(false).await?)
+                        .read_dirs(chunk.iter().map(|(x, _)| x.as_str()), api.deref())
                         .await?;
 
                     for file in files {
@@ -163,11 +175,13 @@ impl FileRepository for Arc<GDriveBackend> {
     }
 
     async fn get_metadata(&self, cpath: &str) -> Result<PathInfo> {
-        let api = self.make_drive_api(false).await?;
+        let api = self.api().await?;
 
-        let drive_id = self.get_drive_id(cpath, false).await?;
-
-        let info = match api.files_get(&drive_id).await {
+        let drive_id = &self
+            .drive_file_by_cpath_cached(cpath, api.deref())
+            .await?
+            .id;
+        let info = match api.files_get(drive_id).await {
             Ok(file) => match file.more {
                 Some(MoreFileFields::BinaryFile {
                     sha1_checksum,
@@ -196,11 +210,11 @@ impl FileRepository for Arc<GDriveBackend> {
 
     async fn read_file(&self, cpath: &str) -> Result<(FileInfo, Self::Reader)> {
         let cpath = cpath.to_owned();
-        log::debug!("Reading file at {cpath}");
-        let file = self
-            .drive_file_by_cpath(&cpath, &*self.make_drive_api(false).await?)
-            .await?;
-        log::debug!("Got file at {cpath}");
+        let api = self.api().await?;
+        log::info!("Reading file at {cpath}");
+        let cache_size = self.file_cache.lock().unwrap().cache_size();
+        log::info!("Cache size: {}", cache_size);
+        let file = self.drive_file_by_cpath(&cpath, api.deref()).await?;
         match file.more {
             Some(MoreFileFields::BinaryFile {
                 head_revision_id,
@@ -214,9 +228,7 @@ impl FileRepository for Arc<GDriveBackend> {
                     hash: hex_must_decode(sha1_checksum),
                 };
 
-                let body = self
-                    .make_drive_api(false)
-                    .await?
+                let body = api
                     .files_get_alt_media(&file.id, Some(&head_revision_id))
                     .await
                     .map_err(|err| Error::Other(err.into()))?;
@@ -236,15 +248,17 @@ impl FileRepository for Arc<GDriveBackend> {
         len: u64,
     ) -> Result<FileInfo> {
         let cpath = cpath.to_owned();
-        let info = match self
-            .drive_file_by_cpath(&cpath, &*self.make_drive_api(false).await?)
-            .await
-        {
-            Ok(file) => as_fileinfo(file, cpath)?,
+        let api = self.api().await?;
+        let info = match self.drive_file_by_cpath(&cpath, &api).await {
+            Ok(file) => to_fileinfo(file, cpath)?,
             Err(Error::NotFound { .. }) => {
                 // No such file exists, create it!
-                let file = self.create_file(&cpath, src, len).await?;
-                as_fileinfo(file, cpath)?
+                let file = self
+                    .create_file(&cpath, src, len, &api)
+                    .await?
+                    .as_ref()
+                    .clone();
+                to_fileinfo(file, cpath)?
             }
             Err(err) => return Err(err),
         };
@@ -255,14 +269,16 @@ impl FileRepository for Arc<GDriveBackend> {
     async fn delete_file(&self, cpath: &str) -> Result<()> {
         // To be sure, we require deletions to have exclusive access (I'm not sure if weird things might
         // otherwise happen if we delete a directory and the files in it at the same time or something like that)
-        let id = self.get_drive_id(cpath, false).await?;
+        let api = self.api().await?;
+        let id = &self
+            .drive_file_by_cpath_cached(cpath, api.deref())
+            .await?
+            .id;
 
         // Delete from cache early (what if the deletion happens, but still returns an error for whatever reason. Deleting from
         // cache does not break anything in any case...)
         self.delete_from_cache(cpath);
-        self.make_drive_api(true)
-            .await?
-            .files_delete(&id)
+        api.files_delete(id)
             .await
             .map_err(|err| Error::Other(err.into()))?;
 
@@ -270,18 +286,20 @@ impl FileRepository for Arc<GDriveBackend> {
     }
 
     async fn set_modified_time(&self, cpath: &str, modtime: time::OffsetDateTime) -> Result<()> {
-        let id = self.get_drive_id(cpath, false).await?;
-
-        self.make_drive_api(false)
+        let api = self.api().await?;
+        let id = &self
+            .drive_file_by_cpath_cached(cpath, api.deref())
             .await?
-            .files_update(
-                &id,
-                FilesReq {
-                    modified_time: Some(modtime),
-                    ..Default::default()
-                },
-            )
-            .await;
+            .id;
+
+        api.files_update(
+            id,
+            FilesReq {
+                modified_time: Some(modtime),
+                ..Default::default()
+            },
+        )
+        .await;
 
         Ok(())
     }
@@ -293,63 +311,59 @@ impl GDriveBackend {
 
         Self {
             sem: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS as usize)),
+            mkdir_lock: Arc::new(tokio::sync::Mutex::new(())),
             credential,
             client,
-            id_cache: Mutex::new(TimedCache::with_lifespan(60)),
+            file_cache: Mutex::new(TimedCache::with_lifespan(15)),
         }
+    }
+
+    async fn get_token(&self) -> Result<oauth2::AccessToken> {
+        self.credential
+            .get_or_refresh_token()
+            .await
+            .map_err(Error::Other)
     }
 
     /// It is important to drop the type returned by this as fast as possible, and not keep it around.
     /// Otherwise, it is very easy to deadlock the program.
-    async fn make_drive_api(&self, exclusive: bool) -> Result<SemaphoreGuarded<DriveApi>> {
-        let permit = if exclusive {
-            self.sem
-                .clone()
-                .acquire_many_owned(MAX_CONCURRENT_CONNECTIONS)
-                .await
-                .unwrap()
-        } else {
-            self.sem.clone().acquire_owned().await.unwrap()
-        };
-        let token = self
-            .credential
-            .get_or_refresh_token()
-            .await
-            .map_err(Error::Other)?;
-        let inner = DriveApi::new(self.client.clone(), token);
-
+    async fn api(&self) -> Result<SemaphoreGuarded<DriveApi>> {
+        let permit = self.sem.clone().acquire_owned().await.unwrap();
+        let inner = DriveApi::new(self.client.clone(), self.get_token().await?);
         Ok(SemaphoreGuarded { permit, inner })
     }
 
-    fn cache_id(&self, cpath: &str, id: &str) {
-        log::trace!("Caching drive id: {id} => {cpath}");
-        let val = Arc::new(id.to_owned());
-        self.id_cache
+    fn cache_file(&self, cpath: &str, file: drive_api::File) -> Arc<drive_api::File> {
+        log::trace!("Caching drive file: {} => {cpath}", file.id);
+        let val = Arc::new(file);
+        let ret = val.clone();
+        self.file_cache
             .lock()
             .unwrap()
             .cache_set(cpath.to_owned(), val);
+
+        ret
     }
 
-    fn get_cached_id(&self, cpath: &str) -> Option<Arc<String>> {
-        self.id_cache.lock().unwrap().cache_get(cpath).cloned()
+    fn get_cached_file(&self, cpath: &str) -> Option<Arc<drive_api::File>> {
+        self.file_cache.lock().unwrap().cache_get(cpath).cloned()
     }
 
     fn delete_from_cache(&self, cpath: &str) {
-        self.id_cache.lock().unwrap().cache_remove(cpath);
+        self.file_cache.lock().unwrap().cache_remove(cpath);
     }
 
-    async fn get_drive_id(&self, cpath: &str, force_refresh: bool) -> Result<Arc<String>> {
-        if !force_refresh {
-            // If we are not forced to refresh, we may return a cached result
-            if let Some(ret) = self.get_cached_id(cpath) {
-                return Ok(ret);
-            }
+    async fn drive_file_by_cpath_cached(
+        &self,
+        cpath: &str,
+        api: &DriveApi,
+    ) -> Result<Arc<drive_api::File>> {
+        if let Some(ret) = self.get_cached_file(cpath) {
+            Ok(ret)
+        } else {
+            let ret = self.drive_file_by_cpath(cpath, api).await?;
+            Ok(Arc::new(ret))
         }
-
-        // If we get here, we were either forced to refresh or did not find the id.
-        let api = self.make_drive_api(false).await?;
-        let ret = self.drive_file_by_cpath(cpath, &api).await?.id;
-        Ok(Arc::new(ret))
     }
 
     /// Try and find a drive_file by cpath. The return value of this function is always computed "from scratch",
@@ -360,8 +374,6 @@ impl GDriveBackend {
     /// - If a subpath of of cpath could not be found, this will return `Error::NotFound { cpath: subpath }`
     /// - If a subpath of cpath is not a directory, this will return `Error::NotADirectory { cpath: subpath }`
     async fn drive_file_by_cpath(&self, cpath: &str, api: &DriveApi) -> Result<drive_api::File> {
-        // TODO: Replace this by a recursive version that can efficiently use the cache (and e.g. not calculates the root_file every time...)
-
         // In Google Drive, the root folder has an actual id (e.g. '0AGqh_9UFaLFoUk9PVA') and the "virtual" id
         // 'root' by which it can be accessed almost anywhere. Unfortunately, we need the actual id,
         // since the 'parents' field of a file contains the actual id (and not 'root'). We use this
@@ -373,7 +385,7 @@ impl GDriveBackend {
             .await
             .map_err(|err| Error::Other(err.into()))?;
         debug_assert_eq!(root_file.parents, None);
-        self.cache_id("", &root_file.id);
+        self.cache_file("", root_file.clone());
 
         if cpath.is_empty() {
             return Ok(root_file);
@@ -393,14 +405,12 @@ impl GDriveBackend {
             }
 
             let files = self.read_dirs([current_file.id], api).await?;
-            log::debug!("Looking for {} in {}", next_file_name, current_cpath);
-
             let mut next_file = None;
 
             for file in files {
                 // Note that we know at this point that the cpath of file is current_cpath/{file.name}
                 let file_cpath = append_to_relative_name(&current_cpath, &file.name);
-                self.cache_id(&file_cpath, &file.id);
+                self.cache_file(&file_cpath, file.clone());
 
                 if file.name == next_file_name {
                     if next_file.is_some() {
@@ -435,18 +445,21 @@ impl GDriveBackend {
     /// Creates the given relative name and returns its id. If this path
     /// already exists and is the path of a file (and not a folder) this returns
     /// `Error::NotAFolder`.
-    async fn mkdir_all(&self, cpath: &str) -> Result<String> {
+    ///
+    /// It is important that mkdir_all is NOT called concurrently with itself. For this reason,
+    /// the caller should aquire all permits (`self.api_exclusive()`) to call this function.
+    async fn mkdir_all(&self, cpath: &str, api: &DriveApi) -> Result<Arc<drive_api::File>> {
         log::debug!("creating folder(s) {}", cpath);
+        let _guard = self.mkdir_lock.lock().await;
 
         /// It is important that we take an exclusive lock here! We particularly want to avoid
         /// any other mkdir_all running at the same time as us (anything else would more or less probably work...)
-        let api = self.make_drive_api(true).await?;
         loop {
             /// Try and build up the thing!
-            match self.drive_file_by_cpath(cpath, &api).await {
+            match self.drive_file_by_cpath_cached(cpath, api).await {
                 Ok(file) => {
                     if file.is_folder() {
-                        return Ok(file.id);
+                        return Ok(file);
                     } else {
                         return Err(Error::NotADirectory {
                             cpath: cpath.to_owned(),
@@ -454,26 +467,29 @@ impl GDriveBackend {
                     }
                 }
                 Err(Error::NotFound { cpath: subpath }) => {
+                    // We rely on the correct error here. It should return the "smallest" possible subpath that was not found
+                    // (i.e. after chopping off the last bit from that path, the remaining path should be valid)
+
                     log::debug!("mkdir_all encountered a NotFound for {}", subpath);
 
                     let (parent, name) = pop_cpath(&subpath);
-                    let parent_id = self.get_drive_id(parent, false).await?;
+                    let parent_id = &self.drive_file_by_cpath_cached(parent, api).await?.id;
 
                     // subpath was not found, so create it!
                     let req =
                         FilesReq::new_create_folder(name.to_owned(), parent_id.as_str().to_owned());
-                    let file_id = api
+                    let created_file = api
                         .files_create(req)
                         .await
                         .map_err(|err| Error::Other(err.into()))?;
-                    log::debug!("Created folder {} with id {}", subpath, file_id.id);
+                    log::debug!("Created folder {} with id {}", subpath, created_file.id);
 
-                    self.cache_id(&subpath, &file_id.id);
+                    self.cache_file(&subpath, created_file.clone());
 
                     // We could loop once more here and let the other match arm end the loop too, but that would only cost us
                     // one more api call...
                     if subpath == cpath {
-                        return Ok(file_id.id);
+                        return Ok(Arc::new(created_file));
                     }
                 }
                 // Other errors (i.e. if a subpath is a file or something like that) we cannot deal with
@@ -527,18 +543,18 @@ impl GDriveBackend {
         cpath: &str,
         src: R,
         len: u64,
-    ) -> Result<drive_api::File> {
+        api: &DriveApi,
+    ) -> Result<Arc<drive_api::File>> {
         // We need to create the file. For that, we need to place it in the right path
         let (parent, filename) = pop_cpath(cpath);
-        let parent_id = self.mkdir_all(parent).await?;
-
+        let parent_file = self.mkdir_all(parent, api).await?;
         let file = self
-            .make_drive_api(false)
+            .api()
             .await?
             .files_create_upload(
                 FilesReq {
                     name: Some(filename.to_string()),
-                    parents: Some(vec![parent_id]),
+                    parents: Some(vec![parent_file.id.clone()]),
                     ..Default::default()
                 },
                 src,
@@ -547,13 +563,12 @@ impl GDriveBackend {
             .await
             .map_err(|err| Error::Other(err.into()))?;
 
-        self.cache_id(cpath, &file.id);
-
-        Ok(file)
+        let ret = self.cache_file(cpath, file);
+        Ok(ret)
     }
 }
 
-fn as_pathinfo(file: drive_api::File, cpath: String) -> (Option<PathInfo>, String) {
+fn to_pathinfo(file: drive_api::File, cpath: String) -> (Option<PathInfo>, String) {
     let info = match file.more {
         Some(MoreFileFields::BinaryFile {
             sha1_checksum,
@@ -577,15 +592,13 @@ fn as_pathinfo(file: drive_api::File, cpath: String) -> (Option<PathInfo>, Strin
 /// This is a somewhat opinated function that turns a google drive file into a FileInfo. Notably, it returns `Error::IsADirectory`
 /// if the file is a directory, and `Error::NotAllowed`, if it is neither a binary file nor a directory (i.e. google docs document or something
 /// like that)
-fn as_fileinfo(file: drive_api::File, cpath: String) -> Result<FileInfo> {
-    match as_pathinfo(file, cpath.to_owned()).0 {
+fn to_fileinfo(file: drive_api::File, cpath: String) -> Result<FileInfo> {
+    match to_pathinfo(file, cpath.to_owned()).0 {
         Some(PathInfo::File(info)) => Ok(info),
-        Some(PathInfo::Dir(DirectoryInfo { cpath })) => return Err(Error::IsADirectory { cpath }),
-        None => {
-            return Err(Error::NotAllowed {
-                cpath: cpath.to_owned(),
-            })
-        }
+        Some(PathInfo::Dir(DirectoryInfo { cpath })) => Err(Error::IsADirectory { cpath }),
+        None => Err(Error::NotAllowed {
+            cpath: cpath.to_owned(),
+        }),
     }
 }
 
@@ -630,11 +643,13 @@ mod test {
         let backend = setup();
         let content = "Hallo".as_bytes().to_owned();
         let len = content.len() as u64;
+        let api = backend.api().await.unwrap();
         let value = backend
             .create_file(
                 "testdir/anotherdir/andanother/testfile",
                 futures::io::Cursor::new(content),
                 len,
+                api.deref(),
             )
             .await
             .unwrap();
