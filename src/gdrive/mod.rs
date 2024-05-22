@@ -5,6 +5,7 @@ mod credential;
 mod drive_api;
 mod extensions;
 pub mod oauth;
+use self::drive_api::File;
 use self::drive_api::FileId;
 use self::drive_api::FilesReq;
 use crate::append_to_cpath_in_place;
@@ -250,14 +251,21 @@ impl FileRepository for Arc<GDriveBackend> {
         let cpath = cpath.to_owned();
         let api = self.api().await?;
         let info = match self.drive_file_by_cpath(&cpath, &api).await {
-            Ok(file) => to_fileinfo(file, cpath)?,
+            Ok(file) => {
+                // The file already exists, update it.
+                let file = self.update_file(file, src, len, &api).await?;
+                to_fileinfo(file, cpath)?
+            }
             Err(Error::NotFound { .. }) => {
                 // No such file exists, create it!
+                log::debug!("Tried to write to drive path {cpath} but it does not exist. Creating it.");
+
                 let file = self
                     .create_file(&cpath, src, len, &api)
                     .await?
                     .as_ref()
                     .clone();
+
                 to_fileinfo(file, cpath)?
             }
             Err(err) => return Err(err),
@@ -565,6 +573,11 @@ impl GDriveBackend {
 
         let ret = self.cache_file(cpath, file);
         Ok(ret)
+    }
+
+    async fn update_file<R: AsyncRead + Send>(&self, file: File, src: R, len: u64, api: &DriveApi) -> Result<File> {
+        api.files_update_upload(&file.id, src, len).await
+            .map_err(|err| Error::Other(err.into()))
     }
 }
 

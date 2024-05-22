@@ -12,10 +12,11 @@ use std::{
 };
 use tokio::{sync::mpsc, time::timeout};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 enum ProgressUpdate {
     Start { id: usize },
     Done { id: usize },
+    Failed { id: usize }
 }
 
 #[derive(Clone)]
@@ -31,6 +32,10 @@ impl ProgressSender {
 
     pub async fn notify_start(&self, id: usize) {
         let _ = self.sender.send(ProgressUpdate::Start { id }).await;
+    }
+
+    pub async fn notify_failed(&self, id: usize) {
+        let _ = self.sender.send(ProgressUpdate::Failed { id }).await;
     }
 
     /// Note: However this is implemented, it is fast and synchronous (so that it can be called often)!
@@ -95,6 +100,8 @@ impl<'a> ProgressReceiver<'a> {
         receiver: mpsc::Receiver<ProgressUpdate>,
         total_bytes_read: Arc<AtomicU64>,
     ) -> Self {
+        // Careful: This can be zero (for example, if there are only deletions or maybe all files have zero bytes for some reason).
+        // Do not divide by it unchecked.
         let total_bytes = changes
             .iter()
             .filter_map(|change| match change {
@@ -121,7 +128,9 @@ impl<'a> ProgressReceiver<'a> {
         let remaining = self.total_bytes.saturating_sub(bytes_read);
         let throughput = self.throughput.update_and_get(bytes_read) as u64;
 
-        let percentage = 100 * bytes_read / self.total_bytes;
+        let percentage = (100 * bytes_read)
+            .checked_div(self.total_bytes)
+            .unwrap_or(0);
         let (rem, rem_unit) = human_readable_bytes(remaining);
         let (thru, thru_unit) = human_readable_bytes(throughput);
         let status_line =
@@ -158,7 +167,18 @@ impl<'a> ProgressReceiver<'a> {
                     )?;
                     self.print_progress_line(shell)?;
                 }
-                Ok(Some(_)) => {}
+                Ok(Some(ProgressUpdate::Failed { id })) => {
+                    self.done += 1;
+                    writeln!(
+                        shell.err(),
+                        "({} / {}) Failed: {}",
+                        self.done,
+                        self.changes.len(),
+                        &self.changes[id],
+                    )?;
+                    self.print_progress_line(shell)?;
+                }
+                Ok(Some(ProgressUpdate::Start { .. })) => {},
                 Ok(None) => break,
                 Err(_) => {
                     // Timeout has elapsed. Let's show a progress update.

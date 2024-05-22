@@ -104,9 +104,11 @@ pub(super) async fn status_of_dir(
 /// Determine if we should a file 'changed' based on an old, and a current `FileInfo`
 fn is_changed(old: &FileInfo, new: &FileInfo) -> bool {
     const EPSILON: Duration = Duration::from_millis(10);
+    assert_eq!(old.cpath, new.cpath);
 
     // Size has changed, so the file has definitely changed.
     if old.size != new.size {
+        log::trace!("{} is changed due to size: {} --> {}", old.cpath, old.size, new.size);
         return true;
     }
 
@@ -114,12 +116,14 @@ fn is_changed(old: &FileInfo, new: &FileInfo) -> bool {
     // 10 Milliseconds more recent (Filesystems do not store nanosecond precision
     // timestamps)
     if new.modified - old.modified >= EPSILON {
+        log::trace!("{} is changed due to modified time: {} --> {}", old.cpath, old.modified, new.modified);
         return true;
     }
 
     // We use an empty Vec to indicate missing hashes, so if either one is empty,
     // we cant draw any information from the hashes
     if !old.hash.is_empty() && !new.hash.is_empty() && old.hash != new.hash {
+        log::trace!("{} is changed due to hash: {:x?} --> {:x?}", old.cpath, old.hash, new.hash);
         return true;
     }
 

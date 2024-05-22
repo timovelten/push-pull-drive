@@ -410,7 +410,14 @@ where
             let this = self.clone();
             let progress = progress.clone();
             change_futures.push(async move {
-                tokio::spawn(async move { this.handle_update(info, id, progress).await })
+                tokio::spawn(async move { 
+                        let res = this.handle_update(info, id, &progress).await;
+                        match res {
+                            Ok(_) => progress.notify_done(id).await,
+                            Err(_) => progress.notify_failed(id).await,
+                        };
+                        res
+                    })
                     .await
                     .unwrap()
             });
@@ -419,6 +426,7 @@ where
         let mut errors = Vec::new();
         while let Some(res) = change_futures.next().await {
             if let Err(err) = res {
+                log::error!("An error ocurred: {}", err);
                 errors.push(err);
             }
         }
@@ -488,12 +496,16 @@ where
     }
 
     /// Given a single FileChange, handle it however we need to. This is the heart of push_pull_commit.
+    /// Note that this only sends notify_start and notify_bytes_read. notify_done or notify_failed are sent outside of this
+    /// function.
     async fn handle_update(
         &self,
         FileInfo { cpath, .. }: FileInfo,
         id: usize,
-        progress: ProgressSender,
+        progress: &ProgressSender,
     ) -> anyhow::Result<()> {
+        log::info!("Handling update to file {cpath}");
+
         // We might retry this once, if we think that we can fix the error by deleting some empty directories.
         for is_retry in [false, true] {
             if is_retry {
@@ -522,7 +534,7 @@ where
             let to_info = match write_result {
                 Ok(info) => info,
                 Err(err) if !is_retry => {
-                    println!("Got error: {}. Retrying.", err);
+                    log::error!("Got error: {}. Retrying.", err);
                     continue;
                 }
                 Err(err) => return Err(err.into()),
@@ -531,8 +543,6 @@ where
             // We have just pulled a file from `from` and pushed it to `to`. We therefore need to update both sides.
             self.tracked_files().update(from_info, self.from_side)?;
             self.tracked_files().update(to_info, !self.from_side)?;
-
-            progress.notify_done(id).await;
 
             break;
         }

@@ -273,12 +273,12 @@ impl DriveApi {
                 Err(err) => (ApiError::HttpError(err), true),
             };
 
+            log::warn!("A request to {} failed: {}", req.uri(), err);
+
             let should_retry = retryable && retries <= MAXIMUM_RETRIES;
             if !should_retry {
                 return Err(err);
             }
-
-            log::warn!("Request failed: {}", err);
 
             let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..=1000));
             // Note: For the third fourth try, retries is 3 and we wait 16 seconds
