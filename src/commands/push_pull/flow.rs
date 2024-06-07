@@ -15,6 +15,7 @@ use futures::stream::FuturesUnordered;
 use futures::StreamExt as _;
 use std::io::Write;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 #[allow(dead_code)]
 enum Conflict {
@@ -187,7 +188,12 @@ where
     A: FileRepository,
     B: FileRepository,
 {
-    pub(super) fn new_pull(local: B, remote: A, args: PushPullArgs, ctx: ExecutionEnvironment) -> Self {
+    pub(super) fn new_pull(
+        local: B,
+        remote: A,
+        args: PushPullArgs,
+        ctx: ExecutionEnvironment,
+    ) -> Self {
         PushPullFlow {
             args,
             ctx,
@@ -197,7 +203,12 @@ where
         }
     }
 
-    pub(super) fn new_push(local: A, remote: B, args: PushPullArgs, ctx: ExecutionEnvironment) -> Self {
+    pub(super) fn new_push(
+        local: A,
+        remote: B,
+        args: PushPullArgs,
+        ctx: ExecutionEnvironment,
+    ) -> Self {
         PushPullFlow {
             args,
             ctx,
@@ -298,7 +309,7 @@ where
         conflicts: Vec<Conflict>,
     ) -> anyhow::Result<PushPullState> {
         let mut changes: Vec<ChangeRequest> = changes.into_iter().map(Into::into).collect();
-        let has_conflicts = conflicts.len() > 0;
+        let has_conflicts = !conflicts.is_empty();
 
         for conflict in conflicts {
             // "conservative" for us means to make less changes. So (for now anyway) conservative
@@ -400,6 +411,12 @@ where
 
         let mut change_futures = FuturesUnordered::new();
 
+        // LAZY: Maybe allow the user to change this via a config setting too...
+        let concurrency_limit = A::CONCURRENCY_LIMIT.min(B::CONCURRENCY_LIMIT);
+        log::info!("Using concurrency limit {concurrency_limit}");
+
+        let sem = Arc::new(Semaphore::new(concurrency_limit));
+
         for (id, change) in changes.iter().enumerate() {
             let (ChangeRequest::CreateFile { info } | ChangeRequest::UpdateFile { info }) =
                 change.clone()
@@ -409,17 +426,21 @@ where
 
             let this = self.clone();
             let progress = progress.clone();
+            let sem = sem.clone();
             change_futures.push(async move {
-                tokio::spawn(async move { 
-                        let res = this.handle_update(info, id, &progress).await;
-                        match res {
-                            Ok(_) => progress.notify_done(id).await,
-                            Err(_) => progress.notify_failed(id).await,
-                        };
-                        res
-                    })
-                    .await
-                    .unwrap()
+                tokio::spawn(async move {
+                    let _permit = sem.acquire().await.unwrap(); // Semaphore is not closed
+
+                    let res = this.handle_update(info, id, &progress).await;
+                    match res {
+                        Ok(_) => progress.notify_done(id).await,
+                        Err(_) => progress.notify_failed(id).await,
+                    };
+                    
+                    res
+                })
+                .await
+                .unwrap()
             });
         }
 

@@ -5,7 +5,6 @@ pub use async_read::InspectAsyncReader;
 use http::Request;
 pub use shell::*;
 use std::fmt::Display;
-use tokio::sync::OwnedSemaphorePermit;
 
 pub struct WithoutNewlines<'a>(pub &'a str);
 
@@ -15,28 +14,6 @@ impl Display for WithoutNewlines<'_> {
             write!(f, "{}", line)?;
         }
         Ok(())
-    }
-}
-
-/// Utility type we use to keep the semaphore permit around
-/// as long as its inner type is not dropped.
-#[derive(Debug)]
-pub struct SemaphoreGuarded<T> {
-    pub permit: OwnedSemaphorePermit,
-    pub inner: T,
-}
-
-impl<T> std::ops::Deref for SemaphoreGuarded<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl<T> std::ops::DerefMut for SemaphoreGuarded<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
     }
 }
 

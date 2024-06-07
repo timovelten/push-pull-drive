@@ -8,7 +8,7 @@ use self::file_hasher::{FileHasher, Sha1Hasher};
 use crate::file_repository::Error as FileRepositoryError;
 use crate::file_repository::Result as FileRepositoryResult;
 use crate::{
-    file_repository::FileRepository, paths, util::SemaphoreGuarded, DirectoryInfo, FileInfo,
+    file_repository::FileRepository, paths, DirectoryInfo, FileInfo,
     PathInfo,
 };
 use futures::{stream::FuturesUnordered, AsyncRead, StreamExt};
@@ -17,24 +17,21 @@ use std::{
     fs::File,
     io::{ErrorKind, Seek},
     path::{Path, PathBuf},
-    pin::{pin, Pin},
+    pin::pin,
     sync::Arc,
     thread::available_parallelism,
 };
 use time::OffsetDateTime;
-use tokio::{fs::File as TokioFile, sync::SemaphorePermit};
+use tokio::fs::File as TokioFile;
 use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::Semaphore,
     task::spawn_blocking,
 };
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
-const CONCURRENCY_LIMIT: usize = 16;
-
 #[derive(Debug, Clone)]
 pub struct LocalBackend<H = Sha1Hasher> {
     config: Arc<Config>,
-    permits: Arc<Semaphore>,
     hasher: H,
 }
 
@@ -63,24 +60,8 @@ impl<H: FileHasher> LocalBackend<H> {
     pub fn new(config: Config, hasher: H) -> Self {
         Self {
             config: Arc::new(config),
-            permits: Arc::new(Semaphore::new(CONCURRENCY_LIMIT)),
             hasher,
         }
-    }
-
-    async fn aquire_owned_permit(&self) -> OwnedSemaphorePermit {
-        self.permits
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("Semaphore should not be closed")
-    }
-
-    async fn aquire_permit(&self) -> SemaphorePermit {
-        self.permits
-            .acquire()
-            .await
-            .expect("Semaphore should not be closed")
     }
 
     /// cpath is still needed because it is returned as part of the metadata. Otherwise, it is ignored.
@@ -247,10 +228,10 @@ impl Config {
 }
 
 impl<H: FileHasher> FileRepository for LocalBackend<H> {
-    type Reader = Pin<SemaphoreGuarded<Compat<TokioFile>>>;
+    type Reader = Compat<TokioFile>;
+    const CONCURRENCY_LIMIT: usize = 16;
 
     async fn read_file(&self, cpath: &str) -> FileRepositoryResult<(FileInfo, Self::Reader)> {
-        let permit = self.aquire_owned_permit().await;
         let me = self.clone();
         let cp = cpath.to_owned();
         let (PathInfo::File(info), file) = spawn_blocking(move || me.read_file_impl(cp))
@@ -262,12 +243,7 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
             });
         };
 
-        let reader = SemaphoreGuarded {
-            permit,
-            inner: TokioFile::from_std(file).compat(),
-        };
-
-        Ok((info, Pin::new(reader)))
+        Ok((info, TokioFile::from_std(file).compat()))
     }
 
     async fn write_file<R: AsyncRead + Send>(
@@ -277,7 +253,6 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
         src: R,
         _len: u64,
     ) -> FileRepositoryResult<FileInfo> {
-        let _permit = self.aquire_permit().await;
         let mut src = pin!(src.compat());
         if self.config.is_ignored(cpath) {
             return Err(FileRepositoryError::NotAllowed {
@@ -303,7 +278,13 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
         tokio::io::copy(&mut src, &mut tmp_file)
             .await
             .map_err(as_other_error)?;
+
+        // Drop the source as early as possible. It is conceivable that our call tracks how long
+        // the source reader is around (via the drop trait) and maybe terminate a connection or something.
+        // (Though Clippy complains because, currently, all types we use this with have trivial drop implementation)
+        #[allow(clippy::drop_non_drop)]
         drop(src);
+
         tmp_file.sync_all().await.unwrap();
 
         // We need to set the modified time, and return the files metadata. To do so, go back to std-land.
@@ -349,8 +330,6 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
     }
 
     async fn delete_file(&self, cpath: &str) -> FileRepositoryResult<()> {
-        let _permit = self.aquire_permit().await;
-
         let local_path = self.config.get_local_path_from_relative_name(cpath);
 
         // Pretend it is a file first. If that fails, try to delete a directory there...
@@ -377,8 +356,6 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
         cpath: &str,
         modtime: OffsetDateTime,
     ) -> FileRepositoryResult<()> {
-        let _permit = self.aquire_permit().await;
-
         let cpath = cpath.to_owned();
         let local_path = self.config.get_local_path_from_relative_name(&cpath);
         spawn_blocking(move || {

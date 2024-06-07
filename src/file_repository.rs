@@ -34,6 +34,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
     type Reader: AsyncReader;
 
+    /// Implementations should indicate how many concurrent jobs they allow. This is needed because
+    /// e.g. Google drive does definitely now allow arbitrarily many concurrent connections.
+    /// Maybe we will make this more fine grained in the future. Callers should honor this value, at leats
+    /// on a "best effort" basis.
+    const CONCURRENCY_LIMIT: usize;
+
     /// Return all files and folders contained in the directory at `cpath` up to the specified `depth`. Note that if called
     /// with `depth` 0, this should return an empty list. With `depth` 1, this returns all the immediate children (but not the directory itself!).
     /// Use `u32::MAX` as `depth` to return all files and subfolders.

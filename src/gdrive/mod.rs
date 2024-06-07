@@ -19,7 +19,7 @@ use crate::util::hex_must_decode;
 use crate::DirectoryInfo;
 use crate::{
     append_to_relative_name, file_repository::FileRepository, gdrive::drive_api::DriveApi,
-    pop_cpath, util::SemaphoreGuarded, FileInfo, PathInfo,
+    pop_cpath, FileInfo, PathInfo,
 };
 use anyhow::Context;
 use anyhow::{anyhow, bail};
@@ -44,16 +44,8 @@ use std::{
 use thiserror::Error;
 use tokio::{sync::Semaphore, task::block_in_place};
 
-/// Google does not really like too many concurrent connections. In my personal testing,
-/// the limit seemed to be somewhere below 10.
-const MAX_CONCURRENT_CONNECTIONS: u32 = 8;
-
 #[derive(Debug)]
 pub struct GDriveBackend {
-    /// See [`MAX_CONCURRENT_CONNECTIONS`]. To avoid nasty race conditions between concurrent deletions,
-    /// make sure to always grab ALL available permits when performing a deletion of a directory.
-    sem: Arc<tokio::sync::Semaphore>,
-
     /// Calling mkdir_all concurrently really does not work, so we need to prevent it.
     mkdir_lock: Arc<tokio::sync::Mutex<()>>,
 
@@ -73,6 +65,10 @@ pub struct GDriveBackend {
 impl FileRepository for Arc<GDriveBackend> {
     type Reader = Pin<Box<dyn AsyncRead + Send>>;
 
+    /// Google does not really like too many concurrent connections. In my personal testing,
+    /// the limit seemed to be somewhere below 10.
+    const CONCURRENCY_LIMIT: usize = 8;
+
     // As a rule of thumb: All functions in this impl should start by aquiring the permits they need (i.e. an api instance).
     // All "private functions" in the impl should take the permit as a parameter.
 
@@ -83,7 +79,7 @@ impl FileRepository for Arc<GDriveBackend> {
         let mut ret = Vec::new();
 
         let id = self
-            .drive_file_by_cpath_cached(cpath, &*self.api().await?)
+            .drive_file_by_cpath_cached(cpath, &self.api().await?)
             .await?
             .id
             .to_owned();
@@ -113,7 +109,7 @@ impl FileRepository for Arc<GDriveBackend> {
                     let mut ret = Vec::new();
                     let api = self.api().await?;
                     let files = self
-                        .read_dirs(chunk.iter().map(|(x, _)| x.as_str()), api.deref())
+                        .read_dirs(chunk.iter().map(|(x, _)| x.as_str()), &api)
                         .await?;
 
                     for file in files {
@@ -179,7 +175,7 @@ impl FileRepository for Arc<GDriveBackend> {
         let api = self.api().await?;
 
         let drive_id = &self
-            .drive_file_by_cpath_cached(cpath, api.deref())
+            .drive_file_by_cpath_cached(cpath, &api)
             .await?
             .id;
         let info = match api.files_get(drive_id).await {
@@ -215,7 +211,7 @@ impl FileRepository for Arc<GDriveBackend> {
         log::info!("Reading file at {cpath}");
         let cache_size = self.file_cache.lock().unwrap().cache_size();
         log::info!("Cache size: {}", cache_size);
-        let file = self.drive_file_by_cpath(&cpath, api.deref()).await?;
+        let file = self.drive_file_by_cpath(&cpath, &api).await?;
         match file.more {
             Some(MoreFileFields::BinaryFile {
                 head_revision_id,
@@ -279,7 +275,7 @@ impl FileRepository for Arc<GDriveBackend> {
         // otherwise happen if we delete a directory and the files in it at the same time or something like that)
         let api = self.api().await?;
         let id = &self
-            .drive_file_by_cpath_cached(cpath, api.deref())
+            .drive_file_by_cpath_cached(cpath, &api)
             .await?
             .id;
 
@@ -296,7 +292,7 @@ impl FileRepository for Arc<GDriveBackend> {
     async fn set_modified_time(&self, cpath: &str, modtime: time::OffsetDateTime) -> Result<()> {
         let api = self.api().await?;
         let id = &self
-            .drive_file_by_cpath_cached(cpath, api.deref())
+            .drive_file_by_cpath_cached(cpath, &api)
             .await?
             .id;
 
@@ -318,7 +314,6 @@ impl GDriveBackend {
         let client = reqwest::Client::builder().build().unwrap();
 
         Self {
-            sem: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS as usize)),
             mkdir_lock: Arc::new(tokio::sync::Mutex::new(())),
             credential,
             client,
@@ -335,10 +330,9 @@ impl GDriveBackend {
 
     /// It is important to drop the type returned by this as fast as possible, and not keep it around.
     /// Otherwise, it is very easy to deadlock the program.
-    async fn api(&self) -> Result<SemaphoreGuarded<DriveApi>> {
-        let permit = self.sem.clone().acquire_owned().await.unwrap();
-        let inner = DriveApi::new(self.client.clone(), self.get_token().await?);
-        Ok(SemaphoreGuarded { permit, inner })
+    async fn api(&self) -> Result<DriveApi> {
+        let api = DriveApi::new(self.client.clone(), self.get_token().await?);
+        Ok(api)
     }
 
     fn cache_file(&self, cpath: &str, file: drive_api::File) -> Arc<drive_api::File> {
@@ -662,7 +656,7 @@ mod test {
                 "testdir/anotherdir/andanother/testfile",
                 futures::io::Cursor::new(content),
                 len,
-                api.deref(),
+                &api,
             )
             .await
             .unwrap();
