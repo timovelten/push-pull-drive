@@ -10,7 +10,7 @@ use crate::{hex_must_decode, FileInfo};
 
 use super::extensions::RequestBuilderExt;
 use super::extensions::UrlExt;
-use super::Error;
+use super::{Error, GoogleCredential};
 use anyhow::{anyhow, Context};
 use futures::{AsyncRead, AsyncReadExt, TryStreamExt};
 use http::{Request, StatusCode};
@@ -197,17 +197,22 @@ impl FilesReq {
 /// need to be passed to each function here in any case. It should not be kept
 /// around and is generally extremely short lived.
 #[derive(Debug)]
-pub struct DriveApi {
+pub struct DriveApi<'a> {
     client: reqwest::Client,
-    token: AccessToken,
+    credential: &'a GoogleCredential,
 }
 
-impl DriveApi {
+impl<'a> DriveApi<'a> {
     // Chunksize of 20 MiB seems like a reasonable choice.
     const CHUNKSIZE: usize = (256 * 1024 * 4) * 20;
 
-    pub fn new(client: reqwest::Client, token: AccessToken) -> Self {
-        Self { client, token }
+    pub fn new(client: reqwest::Client, credential: &'a GoogleCredential) -> Self {
+        Self { client, credential }
+    }
+
+    async fn token(&self) -> Result<AccessToken, ApiError> {
+        self.credential.get_or_refresh_token().await
+            .map_err(ApiError::Other)
     }
 
     async fn send_retry<B: Clone + Into<reqwest::Body>>(
@@ -333,7 +338,7 @@ impl DriveApi {
             ]);
 
         let req = Request::get(url.to_string())
-            .bearer_auth(self.token.secret())
+            .bearer_auth(&self.token().await?)
             .body(EMPTY_BODY)
             .expect("request is valid");
 
@@ -365,7 +370,7 @@ impl DriveApi {
             .with_query_pairs(&*FILE_FIELDS_QUERY);
 
         let req = Request::get(url.to_string())
-            .bearer_auth(self.token.secret())
+            .bearer_auth(&self.token().await?)
             .body(EMPTY_BODY)
             .expect(REQUEST_IS_VALID);
 
@@ -376,7 +381,7 @@ impl DriveApi {
         &self,
         id: &str,
         revision_id: Option<&str>,
-    ) -> Result<Box<dyn AsyncRead + Unpin + Send>, ApiError> {
+    ) -> Result<Box<dyn AsyncRead + Send>, ApiError> {
         let url = if let Some(revision_id) = revision_id {
             format!("https://www.googleapis.com/drive/v3/files/{id}/revisions/{revision_id}")
         } else {
@@ -393,7 +398,7 @@ impl DriveApi {
         // which we would probably have to deal with and b) if the file has zero bytes, the range header
         // bytes=0- results in 416 Content Range Not Satisfiable (which we had to work around...)
         let req = Request::get(url.to_string())
-            .bearer_auth(self.token.secret())
+            .bearer_auth(&self.token().await?)
             .body(EMPTY_BODY)
             .expect(REQUEST_IS_VALID);
 
@@ -411,7 +416,7 @@ impl DriveApi {
         let url = Url::parse(&format!("https://www.googleapis.com/drive/v3/files/{id}")).unwrap();
 
         let req = Request::delete(url.to_string())
-            .bearer_auth(self.token.secret())
+            .bearer_auth(&self.token().await?)
             .body(EMPTY_BODY)
             .expect(REQUEST_IS_VALID);
 
@@ -426,7 +431,7 @@ impl DriveApi {
             .with_query_pairs(&*FILE_FIELDS_QUERY);
 
         let req = Request::post(url.to_string())
-            .bearer_auth(self.token.secret())
+            .bearer_auth(&self.token().await?)
             .json_body(&create_request)
             .expect(REQUEST_IS_VALID);
 
@@ -445,7 +450,7 @@ impl DriveApi {
                 .with_query_pairs(&*FILE_FIELDS_QUERY);
 
         let req = Request::post(url.to_string())
-            .bearer_auth(self.token.secret())
+            .bearer_auth(&self.token().await?)
             .json_body(&create_request)
             .expect(REQUEST_IS_VALID);
 
@@ -473,7 +478,7 @@ impl DriveApi {
             // Note that we could send a non empty object here, but for now,
             // we don't. We use another API request to change metadata.
             .header(http::header::CONTENT_TYPE, "application/json")
-            .bearer_auth(self.token.secret())
+            .bearer_auth(&self.token().await?)
             .body("{}")
             .expect(REQUEST_IS_VALID);
 
@@ -491,7 +496,7 @@ impl DriveApi {
             .with_query_pairs(&*FILE_FIELDS_QUERY);
 
         let req = Request::patch(url.to_string())
-            .bearer_auth(self.token.secret())
+            .bearer_auth(&self.token().await?)
             .json_body(&update_req)?;
 
         let file_id: FileId = self.send_retry(req).await?.json().await?;

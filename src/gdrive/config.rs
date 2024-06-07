@@ -1,4 +1,4 @@
-use super::{FatAccessToken, GDriveBackend, GoogleCredential};
+use super::{FatAccessToken, GDriveClient, GDriveRepo, GoogleCredential};
 use crate::{context::ExecutionEnvironment, gdrive::oauth};
 use anyhow::{anyhow, Context as _};
 use oauth2::{AccessToken, ClientId, ClientSecret, RefreshToken};
@@ -79,7 +79,7 @@ pub fn init(
     Ok(())
 }
 
-pub fn load(ctx: &ExecutionEnvironment) -> anyhow::Result<Option<Arc<GDriveBackend>>> {
+pub fn load(ctx: &ExecutionEnvironment) -> anyhow::Result<Option<GDriveRepo>> {
     if ctx.key_value_store.get(KEY_BACKEND)?.as_deref() == Some(GDRIVE_BACKEND) {
         Ok(Some(load_internal(ctx)?))
     } else {
@@ -87,7 +87,7 @@ pub fn load(ctx: &ExecutionEnvironment) -> anyhow::Result<Option<Arc<GDriveBacke
     }
 }
 
-fn load_internal(ctx: &ExecutionEnvironment) -> anyhow::Result<Arc<GDriveBackend>> {
+fn load_internal(ctx: &ExecutionEnvironment) -> anyhow::Result<GDriveRepo> {
     log::debug!("Loading google drive backend");
 
     // Read what we previously saved from the database
@@ -150,5 +150,7 @@ fn load_internal(ctx: &ExecutionEnvironment) -> anyhow::Result<Arc<GDriveBackend
         },
     );
 
-    Ok(Arc::new(GDriveBackend::new(credential)))
+    Ok(GDriveRepo {
+        inner: Arc::new(GDriveClient::new(credential))
+    })
 }

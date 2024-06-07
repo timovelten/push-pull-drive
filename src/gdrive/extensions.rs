@@ -1,3 +1,4 @@
+use oauth2::AccessToken;
 use serde::Serialize;
 use url::Url;
 pub trait UrlExt {
@@ -23,14 +24,14 @@ impl UrlExt for Url {
 }
 
 pub trait RequestBuilderExt {
-    fn bearer_auth(self, token: &str) -> Self;
+    fn bearer_auth(self, token: &AccessToken) -> Self;
 
     fn json_body<T: ?Sized + Serialize>(self, value: &T) -> anyhow::Result<http::Request<Vec<u8>>>;
 }
 
 impl RequestBuilderExt for http::request::Builder {
-    fn bearer_auth(self, token: &str) -> Self {
-        self.header(http::header::AUTHORIZATION, format!("Bearer {}", token))
+    fn bearer_auth(self, token: &AccessToken) -> Self {
+        self.header(http::header::AUTHORIZATION, format!("Bearer {}", token.secret()))
     }
 
     fn json_body<T: ?Sized + Serialize>(
