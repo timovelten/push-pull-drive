@@ -1,5 +1,5 @@
 use crate::{
-    context::{Ctx, FullContext},
+    context::{Context, Ctx},
     db::{Side, TrackedFilesRepository},
     file_repository::FileRepository,
     util::Shell,
@@ -14,33 +14,33 @@ pub struct StatusArgs {
     pub ignore_index: bool,
 }
 
-pub fn local_status(ctx: &impl Ctx, args: StatusArgs) -> anyhow::Result<()> {
-    let FullContext { ctx, local, .. } = ctx.get();
+pub fn local_status(ctx: &impl Context, args: StatusArgs) -> anyhow::Result<()> {
+    let Ctx { env, local, .. } = ctx.get();
     let status_of_dir_future = status_of_dir(
-        ctx.tracked_files_or_ignore(args.ignore_index),
+        env.tracked_files_or_ignore(args.ignore_index),
         local,
-        ctx.wd(),
+        env.wd(),
         Side::Local,
     );
-    ctx.shell.print_transient("Reading directories...")?;
-    let (_, report) = ctx.handle.block_on(status_of_dir_future)?;
+    env.shell.print_transient("Reading directories...")?;
+    let (_, report) = env.handle.block_on(status_of_dir_future)?;
 
-    print_status(&ctx.shell, &report);
+    print_status(&env.shell, &report);
     Ok(())
 }
 
-pub fn remote_status(ctx: &impl Ctx, args: StatusArgs) -> anyhow::Result<()> {
-    let FullContext { ctx, remote, .. } = ctx.get();
+pub fn remote_status(ctx: &impl Context, args: StatusArgs) -> anyhow::Result<()> {
+    let Ctx { env, remote, .. } = ctx.get();
     let status_of_dir_future = status_of_dir(
-        ctx.tracked_files_or_ignore(args.ignore_index),
+        env.tracked_files_or_ignore(args.ignore_index),
         remote,
-        ctx.wd(),
+        env.wd(),
         Side::Remote,
     );
-    ctx.shell.print_transient("Reading directories...")?;
-    let (_, report) = ctx.handle.block_on(status_of_dir_future)?;
+    env.shell.print_transient("Reading directories...")?;
+    let (_, report) = env.handle.block_on(status_of_dir_future)?;
 
-    print_status(&ctx.shell, &report);
+    print_status(&env.shell, &report);
     Ok(())
 }
 

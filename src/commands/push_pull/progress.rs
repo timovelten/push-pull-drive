@@ -14,6 +14,7 @@ use tokio::{sync::mpsc, time::timeout};
 
 #[derive(Debug)]
 enum ProgressUpdate {
+    #[allow(dead_code)]
     Start { id: usize },
     Done { id: usize },
     Failed { id: usize }

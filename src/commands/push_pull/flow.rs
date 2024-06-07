@@ -4,7 +4,7 @@ use crate::util::{InspectAsyncReader, WithoutNewlines};
 use crate::FileInfo;
 use crate::{
     commands::status::status_of_dir,
-    context::AppContext,
+    context::ExecutionEnvironment,
     db::{Side, TrackedFilesRepository},
     file_repository::FileRepository,
     util::find_common_prefix,
@@ -96,7 +96,7 @@ impl PushPullState {
 #[derive(Clone)]
 pub(super) struct PushPullFlow<A, B> {
     args: PushPullArgs,
-    ctx: AppContext,
+    ctx: ExecutionEnvironment,
     from: A,
     to: B,
     from_side: Side,
@@ -187,7 +187,7 @@ where
     A: FileRepository,
     B: FileRepository,
 {
-    pub(super) fn new_pull(local: B, remote: A, args: PushPullArgs, ctx: AppContext) -> Self {
+    pub(super) fn new_pull(local: B, remote: A, args: PushPullArgs, ctx: ExecutionEnvironment) -> Self {
         PushPullFlow {
             args,
             ctx,
@@ -197,7 +197,7 @@ where
         }
     }
 
-    pub(super) fn new_push(local: A, remote: B, args: PushPullArgs, ctx: AppContext) -> Self {
+    pub(super) fn new_push(local: A, remote: B, args: PushPullArgs, ctx: ExecutionEnvironment) -> Self {
         PushPullFlow {
             args,
             ctx,

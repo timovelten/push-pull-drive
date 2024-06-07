@@ -1,5 +1,5 @@
 use self::flow::PushPullFlow;
-use crate::context::{Ctx, FullContext};
+use crate::context::{Context, Ctx};
 use clap::ValueEnum;
 
 mod flow;
@@ -22,17 +22,17 @@ pub enum ConflictResolution {
     Conservative,
 }
 
-pub fn push(ctx: &impl Ctx, args: PushPullArgs) -> anyhow::Result<()> {
-    let FullContext { ctx, local, remote } = ctx.get();
-    let flow = PushPullFlow::new_push(local.clone(), remote.clone(), args, ctx.clone());
+pub fn push(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> {
+    let Ctx { env, local, remote } = ctx.get();
+    let flow = PushPullFlow::new_push(local.clone(), remote.clone(), args, env.clone());
     flow.execute()?;
 
     Ok(())
 }
 
-pub fn pull(ctx: &impl Ctx, args: PushPullArgs) -> anyhow::Result<()> {
-    let FullContext { ctx, local, remote } = ctx.get();
-    let flow = PushPullFlow::new_pull(local.clone(), remote.clone(), args, ctx.clone());
+pub fn pull(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> {
+    let Ctx { env, local, remote } = ctx.get();
+    let flow = PushPullFlow::new_pull(local.clone(), remote.clone(), args, env.clone());
     flow.execute()?;
 
     Ok(())

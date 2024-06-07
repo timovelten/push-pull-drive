@@ -1,6 +1,6 @@
 use anyhow::anyhow;
 
-use crate::context::AppContext;
+use crate::context::ExecutionEnvironment;
 
 use super::LocalBackend;
 
@@ -14,7 +14,7 @@ pub struct LocalInitArgs {
     path: String,
 }
 
-pub fn init(ctx: &AppContext, args: LocalInitArgs) -> anyhow::Result<()> {
+pub fn init(ctx: &ExecutionEnvironment, args: LocalInitArgs) -> anyhow::Result<()> {
     ctx.key_value_store.put(KEY_BACKEND, LOCAL_BACKEND)?;
     ctx.key_value_store.put(KEY_LOCAL_PATH, &args.path)?;
 
@@ -25,7 +25,7 @@ pub fn init(ctx: &AppContext, args: LocalInitArgs) -> anyhow::Result<()> {
 // folder. In this case, the hasher is fixed (a particular implementation of FileRepository can have
 // only one hasher associated with it) as SHA1.
 
-pub fn load(ctx: &AppContext) -> anyhow::Result<Option<LocalBackend>> {
+pub fn load(ctx: &ExecutionEnvironment) -> anyhow::Result<Option<LocalBackend>> {
     if ctx.key_value_store.get(KEY_BACKEND)?.as_deref() == Some(LOCAL_BACKEND) {
         Ok(Some(load_internal(ctx)?))
     } else {
@@ -33,7 +33,7 @@ pub fn load(ctx: &AppContext) -> anyhow::Result<Option<LocalBackend>> {
     }
 }
 
-fn load_internal(ctx: &AppContext) -> anyhow::Result<LocalBackend> {
+fn load_internal(ctx: &ExecutionEnvironment) -> anyhow::Result<LocalBackend> {
     log::debug!("Loading local backend");
 
     let local_path = ctx

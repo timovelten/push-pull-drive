@@ -16,8 +16,13 @@ use tokio::runtime::Handle as TokioHandle;
 pub const CONFIG_DIR: &str = ".push-pull-drive";
 pub const DATABASE_NAME: &str = "database.sqlite3";
 
+/// This contains the whole application context except for the two backends we use
+/// as source and destination. In other words, this struct can be intialized whenever that
+/// database is created (but might itself not be initialized).
+/// 
+/// The "full" context is defined below.
 #[derive(Clone)]
-pub struct AppContext {
+pub struct ExecutionEnvironment {
     pub shell: Arc<Shell>,
     /// Working directory. This is a "context path" of the current working directory
     /// (NOT the OS provided working directory.)
@@ -29,7 +34,7 @@ pub struct AppContext {
     pub handle: tokio::runtime::Handle,
 }
 
-impl AppContext {
+impl ExecutionEnvironment {
     #[allow(dead_code)]
     pub fn key_value_store(&self) -> &dyn KeyValueStore {
         &*self.key_value_store
@@ -52,31 +57,32 @@ impl AppContext {
     }
 }
 
-pub struct FullContext<R: FileRepository> {
-    pub ctx: AppContext,
+/// Full context needed for most operations
+#[derive(Clone)]
+pub struct Ctx<R: FileRepository> {
+    pub env: ExecutionEnvironment,
     pub local: LocalBackend,
     pub remote: R,
 }
 
-impl<R: FileRepository> FullContext<R> {
-    pub fn new(ctx: AppContext, local: LocalBackend, remote: R) -> Self {
-        Self { ctx, local, remote }
+impl<R: FileRepository> Ctx<R> {
+    pub fn new(env: ExecutionEnvironment, local: LocalBackend, remote: R) -> Self {
+        Self { env, local, remote }
     }
 }
 
-/// This Trait exists purely out of convenience. We want to be able to simpl write
-/// function arguments as
-/// `ctx: &impl Ctx` instead of `<R: FileRepository>(ctx: &FullContext<R>)`.
-pub trait Ctx {
+/// This trait makes it so that we do not have to carry around the generic parameters
+/// of Ctx everywhere. We can just take an `impl Context` arg and be done.
+pub trait Context {
     type Remote: FileRepository;
 
-    fn get(&self) -> &FullContext<Self::Remote>;
+    fn get(&self) -> &Ctx<Self::Remote>;
 }
 
-impl<R: FileRepository> Ctx for FullContext<R> {
+impl<R: FileRepository> Context for Ctx<R> {
     type Remote = R;
 
-    fn get(&self) -> &FullContext<Self::Remote> {
+    fn get(&self) -> &Ctx<Self::Remote> {
         self
     }
 }
@@ -85,7 +91,7 @@ pub fn find_context<P: AsRef<Path>>(
     wd: P,
     shell: Arc<Shell>,
     handle: TokioHandle,
-) -> anyhow::Result<AppContext> {
+) -> anyhow::Result<ExecutionEnvironment> {
     // Traverse ancestors of the current workign directory to try and find the next valid root...
     for root_dir in wd.as_ref().ancestors() {
         let config_dir = root_dir.join(CONFIG_DIR);
@@ -104,7 +110,7 @@ pub fn find_context<P: AsRef<Path>>(
 
         let wd = paths::relative_name(root_dir, &wd)?;
         log::info!("Root directory is {root_dir:?}, relative working directory is {wd}");
-        return Ok(AppContext {
+        return Ok(ExecutionEnvironment {
             shell,
             wd,
             key_value_store,

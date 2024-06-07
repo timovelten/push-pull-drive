@@ -1,5 +1,5 @@
 use crate::{
-    context::{self, AppContext},
+    context::{self, ExecutionEnvironment},
     db::SqliteDatabase,
     gdrive::{self, config::GoogleDriveInitArgs},
     local::{self, LocalInitArgs},
@@ -38,7 +38,7 @@ pub fn init(
     // Open or create the dabase
     let db: Arc<SqliteDatabase> = Arc::new(SqliteDatabase::new_from_path(db_path, true)?);
 
-    let ctx: AppContext = AppContext {
+    let ctx: ExecutionEnvironment = ExecutionEnvironment {
         shell,
         wd: "".to_owned(),
         key_value_store: db.clone(),

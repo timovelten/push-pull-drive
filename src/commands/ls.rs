@@ -1,6 +1,6 @@
 use crate::{
     append_to_relative_name,
-    context::{Ctx, FullContext},
+    context::{Context, Ctx},
     file_repository::FileRepository,
     DirectoryInfo, FileInfo, PathInfo,
 };
@@ -19,19 +19,19 @@ pub struct LsArgs {
 }
 
 pub fn remote_ls(
-    ctx: &impl Ctx,
+    ctx: &impl Context,
     LsArgs {
         path,
         depth,
         details,
     }: LsArgs,
 ) -> anyhow::Result<()> {
-    let FullContext { ctx, remote, .. } = ctx.get();
+    let Ctx { env, remote, .. } = ctx.get();
 
-    ctx.shell.print_transient("Reading directory...")?;
+    env.shell.print_transient("Reading directory...")?;
 
-    let path = append_to_relative_name(ctx.wd(), path.as_deref().unwrap_or(""));
-    let mut contents = ctx
+    let path = append_to_relative_name(env.wd(), path.as_deref().unwrap_or(""));
+    let mut contents = env
         .handle
         .block_on(remote.read_dir(&path, depth.unwrap_or(1)))?;
 
@@ -51,16 +51,16 @@ pub fn remote_ls(
             PathInfo::Dir(DirectoryInfo {
                 cpath: relative_name,
             }) => {
-                writeln!(ctx.shell.out(), "{}/", relative_name)?;
+                writeln!(env.shell.out(), "{}/", relative_name)?;
             }
             PathInfo::File(FileInfo {
                 cpath, size, hash, ..
             }) => {
                 if details {
                     let short_hash = hex::encode(&hash[..hash.len().min(4)]);
-                    writeln!(ctx.shell.out(), "{cpath} [{size} b, Hash: {short_hash}]")?;
+                    writeln!(env.shell.out(), "{cpath} [{size} b, Hash: {short_hash}]")?;
                 } else {
-                    writeln!(ctx.shell.out(), "{cpath}")?;
+                    writeln!(env.shell.out(), "{cpath}")?;
                 }
             }
         }

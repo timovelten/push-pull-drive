@@ -1,5 +1,5 @@
 use super::{FatAccessToken, GDriveBackend, GoogleCredential};
-use crate::{context::AppContext, gdrive::oauth};
+use crate::{context::ExecutionEnvironment, gdrive::oauth};
 use anyhow::{anyhow, Context as _};
 use oauth2::{AccessToken, ClientId, ClientSecret, RefreshToken};
 use std::fs::File;
@@ -27,7 +27,7 @@ pub struct GoogleDriveInitArgs {
 }
 
 pub fn init(
-    ctx: &AppContext,
+    ctx: &ExecutionEnvironment,
     GoogleDriveInitArgs { secrets_path }: GoogleDriveInitArgs,
 ) -> anyhow::Result<()> {
     let f = File::open(secrets_path)?;
@@ -79,7 +79,7 @@ pub fn init(
     Ok(())
 }
 
-pub fn load(ctx: &AppContext) -> anyhow::Result<Option<Arc<GDriveBackend>>> {
+pub fn load(ctx: &ExecutionEnvironment) -> anyhow::Result<Option<Arc<GDriveBackend>>> {
     if ctx.key_value_store.get(KEY_BACKEND)?.as_deref() == Some(GDRIVE_BACKEND) {
         Ok(Some(load_internal(ctx)?))
     } else {
@@ -87,7 +87,7 @@ pub fn load(ctx: &AppContext) -> anyhow::Result<Option<Arc<GDriveBackend>>> {
     }
 }
 
-fn load_internal(ctx: &AppContext) -> anyhow::Result<Arc<GDriveBackend>> {
+fn load_internal(ctx: &ExecutionEnvironment) -> anyhow::Result<Arc<GDriveBackend>> {
     log::debug!("Loading google drive backend");
 
     // Read what we previously saved from the database

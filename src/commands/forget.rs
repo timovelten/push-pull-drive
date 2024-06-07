@@ -1,6 +1,6 @@
 use crate::{
     append_to_relative_name,
-    context::{Ctx, FullContext},
+    context::{Context, Ctx},
     db::Side,
 };
 
@@ -10,19 +10,19 @@ pub struct ForgetArgs {
     path: String,
 }
 
-pub fn forget(ctx: &impl Ctx, ForgetArgs { path }: ForgetArgs) -> anyhow::Result<()> {
-    let FullContext { ctx, .. } = ctx.get();
+pub fn forget(ctx: &impl Context, ForgetArgs { path }: ForgetArgs) -> anyhow::Result<()> {
+    let Ctx { env, .. } = ctx.get();
     let path = path.trim();
 
     let cpath = if path == "." {
-        ctx.wd.to_owned()
+        env.wd.to_owned()
     } else {
-        append_to_relative_name(&ctx.wd, path)
+        append_to_relative_name(&env.wd, path)
     };
 
-    let files = ctx.tracked_files.get_all(&cpath, Side::Local)?;
+    let files = env.tracked_files.get_all(&cpath, Side::Local)?;
     for file in files {
-        ctx.tracked_files.delete(&file.cpath)?;
+        env.tracked_files.delete(&file.cpath)?;
     }
 
     Ok(())
