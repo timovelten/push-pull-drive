@@ -10,18 +10,16 @@ pub mod oauth;
 use self::drive_api::File;
 use self::drive_api::FileId;
 use self::drive_api::FilesReq;
-use crate::append_to_cpath_in_place;
 use crate::file_repository::AsyncReader;
 use crate::file_repository::Error;
 use crate::file_repository::Result;
 use crate::gdrive::drive_api::MoreFileFields;
-use crate::paths::filename;
-use crate::paths::subpaths;
+use crate::paths::RPath;
 use crate::util::hex_must_decode;
 use crate::DirectoryInfo;
 use crate::{
-    append_to_relative_name, file_repository::FileRepository, gdrive::drive_api::DriveApi,
-    pop_cpath, FileInfo, PathInfo,
+    file_repository::FileRepository, gdrive::drive_api::DriveApi,
+    FileInfo, PathInfo,
 };
 use anyhow::Context;
 use anyhow::{anyhow, bail};
@@ -61,17 +59,17 @@ impl FileRepository for GDriveRepo {
 
     delegate! {
         to self.inner {
-            async fn read_dir(&self, cpath: &str, up_to_depth: u32) -> Result<Vec<PathInfo>>;
+            async fn read_dir(&self, path: &RPath, up_to_depth: u32) -> Result<Vec<PathInfo>>;
 
-            async fn get_metadata(&self, cpath: &str) -> Result<PathInfo>;
+            async fn get_metadata(&self, path: &RPath) -> Result<PathInfo>;
 
-            async fn delete_file(&self, cpath: &str) -> Result<()>;
+            async fn delete_file(&self, path: &RPath) -> Result<()>;
 
-            async fn set_modified_time(&self, cpath: &str, modtime: time::OffsetDateTime) -> Result<()>;
+            async fn set_modified_time(&self, path: &RPath, modtime: time::OffsetDateTime) -> Result<()>;
 
             async fn write_file<R: AsyncReader>(
                 &self,
-                cpath: &str,
+                path: &RPath,
                 modified_time: Option<time::OffsetDateTime>,
                 src: R,
                 len: u64,
@@ -79,8 +77,8 @@ impl FileRepository for GDriveRepo {
         }
     }
 
-    async fn read_file(&self, cpath: &str) -> Result<(FileInfo, Self::Reader)> {
-        let (info, reader) = self.inner.read_file(cpath).await?;
+    async fn read_file(&self, path: &RPath) -> Result<(FileInfo, Self::Reader)> {
+        let (info, reader) = self.inner.read_file(path).await?;
         Ok((info, Box::into_pin(reader)))
     }
 }

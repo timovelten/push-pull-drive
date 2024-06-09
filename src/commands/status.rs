@@ -1,9 +1,5 @@
 use crate::{
-    context::{Context, Ctx},
-    db::{Side, TrackedFilesRepository},
-    file_repository::FileRepository,
-    util::Shell,
-    FileChange, FileInfo, PathInfo,
+    context::{Context, Ctx}, db::{Side, TrackedFilesRepository}, file_repository::FileRepository, paths::RPath, util::Shell, FileChange, FileInfo, PathInfo
 };
 use std::io::Write;
 use std::{collections::HashMap, time::Duration};
@@ -51,7 +47,7 @@ pub fn remote_status(ctx: &impl Context, args: StatusArgs) -> anyhow::Result<()>
 pub(super) async fn status_of_dir(
     db: &(impl TrackedFilesRepository + ?Sized),
     repo: &impl FileRepository,
-    dir: &str,
+    dir: &RPath,
     side: Side,
 ) -> anyhow::Result<(Vec<PathInfo>, Vec<FileChange>)> {
     let mut ret: Vec<FileChange> = Vec::new();
@@ -63,13 +59,13 @@ pub(super) async fn status_of_dir(
     // The ones that remain at the are files that we deleted.
     let mut all_tracked_files = all_tracked_files_vec
         .into_iter()
-        .map(|info: FileInfo| (info.cpath.clone(), info))
+        .map(|info: FileInfo| (info.rpath.clone(), info))
         .collect::<HashMap<_, _>>();
 
     // Swallow NotFound errors...
     let all_files_in_repo = match repo.read_dir(dir, u32::MAX).await {
         Ok(res) => res,
-        Err(crate::file_repository::Error::NotFound { cpath }) if cpath == dir => {
+        Err(crate::file_repository::Error::NotFound { rpath }) if rpath.as_rpath() == dir => {
             return Ok(Default::default())
         }
         Err(err) => return Err(err.into()),
@@ -77,7 +73,7 @@ pub(super) async fn status_of_dir(
 
     for file in &all_files_in_repo {
         if let PathInfo::File(info) = file {
-            let tracked_file = all_tracked_files.remove(&info.cpath);
+            let tracked_file = all_tracked_files.remove(&info.rpath);
             match tracked_file {
                 Some(tracked_info) if is_changed(&tracked_info, info) => {
                     ret.push(FileChange::Modified(info.clone()));
@@ -95,7 +91,7 @@ pub(super) async fn status_of_dir(
 
     // The files remaining in all_tracked_files were deleted.
     for (_, info) in all_tracked_files {
-        ret.push(FileChange::Deleted { cpath: info.cpath })
+        ret.push(FileChange::Deleted { rpath: info.rpath })
     }
 
     Ok((all_files_in_repo, ret))
@@ -104,11 +100,11 @@ pub(super) async fn status_of_dir(
 /// Determine if we should a file 'changed' based on an old, and a current `FileInfo`
 fn is_changed(old: &FileInfo, new: &FileInfo) -> bool {
     const EPSILON: Duration = Duration::from_millis(10);
-    assert_eq!(old.cpath, new.cpath);
+    assert_eq!(old.rpath, new.rpath);
 
     // Size has changed, so the file has definitely changed.
     if old.size != new.size {
-        log::trace!("{} is changed due to size: {} --> {}", old.cpath, old.size, new.size);
+        log::trace!("{} is changed due to size: {} --> {}", old.rpath, old.size, new.size);
         return true;
     }
 
@@ -116,14 +112,14 @@ fn is_changed(old: &FileInfo, new: &FileInfo) -> bool {
     // 10 Milliseconds more recent (Filesystems do not store nanosecond precision
     // timestamps)
     if new.modified - old.modified >= EPSILON {
-        log::trace!("{} is changed due to modified time: {} --> {}", old.cpath, old.modified, new.modified);
+        log::trace!("{} is changed due to modified time: {} --> {}", old.rpath, old.modified, new.modified);
         return true;
     }
 
     // We use an empty Vec to indicate missing hashes, so if either one is empty,
     // we cant draw any information from the hashes
     if !old.hash.is_empty() && !new.hash.is_empty() && old.hash != new.hash {
-        log::trace!("{} is changed due to hash: {:x?} --> {:x?}", old.cpath, old.hash, new.hash);
+        log::trace!("{} is changed due to hash: {:x?} --> {:x?}", old.rpath, old.hash, new.hash);
         return true;
     }
 
@@ -134,9 +130,9 @@ fn is_changed(old: &FileInfo, new: &FileInfo) -> bool {
 fn print_status(shell: &Shell, changes: &[FileChange]) {
     for change in changes {
         let _ = match change {
-            FileChange::New(info) => writeln!(shell.err(), "New: {}", info.cpath),
-            FileChange::Modified(info) => writeln!(shell.err(), "Modified: {}", info.cpath),
-            FileChange::Deleted { cpath } => writeln!(shell.err(), "Deleted: {}", cpath),
+            FileChange::New(info) => writeln!(shell.err(), "New: {}", info.rpath),
+            FileChange::Modified(info) => writeln!(shell.err(), "Modified: {}", info.rpath),
+            FileChange::Deleted { rpath } => writeln!(shell.err(), "Deleted: {}", rpath),
         };
     }
 }

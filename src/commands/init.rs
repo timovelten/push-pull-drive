@@ -1,9 +1,5 @@
 use crate::{
-    context::{self, ExecutionEnvironment},
-    db::SqliteDatabase,
-    gdrive::{self, config::GoogleDriveInitArgs},
-    local::{self, LocalInitArgs},
-    util::Shell,
+    context::{self, ExecutionEnvironment}, db::SqliteDatabase, gdrive::{self, config::GoogleDriveInitArgs}, local::{self, LocalInitArgs}, paths::RPath, util::Shell
 };
 use std::{io::ErrorKind, path::Path, sync::Arc};
 use tokio::runtime::Handle as RuntimeHandle;
@@ -40,7 +36,7 @@ pub fn init(
 
     let ctx: ExecutionEnvironment = ExecutionEnvironment {
         shell,
-        wd: "".to_owned(),
+        wd: RPath::ROOT.to_owned(),
         key_value_store: db.clone(),
         tracked_files: db,
         root_dir: root_dir.to_owned(),

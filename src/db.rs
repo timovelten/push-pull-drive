@@ -1,4 +1,4 @@
-use crate::FileInfo;
+use crate::{paths::{RPath, RPathBuf}, FileInfo};
 use anyhow::bail;
 use const_format::concatcp;
 use rusqlite::{named_params, Connection, OpenFlags, OptionalExtension, Row};
@@ -30,14 +30,14 @@ pub trait KeyValueStore: Send + Sync {
 pub trait TrackedFilesRepository: Send + Sync {
     fn update(&self, info: FileInfo, side: Side) -> anyhow::Result<()>;
 
-    fn get_all(&self, cpath_dir: &str, side: Side) -> anyhow::Result<Vec<FileInfo>>;
+    fn get_all(&self, dir_path: &RPath, side: Side) -> anyhow::Result<Vec<FileInfo>>;
 
-    fn delete(&self, cpath: &str) -> anyhow::Result<()>;
+    fn delete(&self, path: &RPath) -> anyhow::Result<()>;
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackedFile {
-    pub cpath: String,
+    pub path: RPathBuf,
     pub size: u64,
     pub modified: time::OffsetDateTime,
     pub local_hash: Vec<u8>,
@@ -102,12 +102,12 @@ impl SqliteDatabase {
             BEGIN;
             DROP TABLE IF EXISTS tracked_files;
             CREATE TABLE tracked_files (
-                cpath 	        TEXT,
+                rpath 	        BLOB,
                 size    		INTEGER,
                 modified		DATETIME,
                 local_hash      BLOB,
                 remote_hash     BLOB,
-                PRIMARY KEY (cpath)
+                PRIMARY KEY (rpath)
             );
             
             DROP TABLE IF EXISTS config;
@@ -126,7 +126,7 @@ impl SqliteDatabase {
 
     fn tracked_file_from_row(row: &Row<'_>) -> rusqlite::Result<TrackedFile> {
         Ok(TrackedFile {
-            cpath: row.get("cpath")?,
+            path: row.get("rpath")?,
             size: row.get("size")?,
             modified: row.get("modified")?,
             local_hash: row
@@ -143,16 +143,17 @@ impl SqliteDatabase {
     // There is not that many, so it shouldn't be too hard. Also the tests probably save you.
     //
 
-    /// Returns all tracked files with cpaths of the form cpath_dir/* (so all the files in that
-    /// directory essentially)
-    pub fn get_all_tracked_files<F, T>(&self, cpath_dir: &str, op: F) -> rusqlite::Result<Vec<T>>
+    /// Returns all tracked files with rpaths that start with the given prefix and an additional
+    /// separator (i.e. if prefix == "test" then return all files that have rpath "test/**". Of course,
+    /// the real separator is a null byte currently) 
+    pub fn get_all_tracked_files<F, T>(&self, prefix: &RPath, op: F) -> rusqlite::Result<Vec<T>>
     where
         F: Fn(TrackedFile) -> T,
     {
         const QUERY: &str =
-            "SELECT cpath, size, modified, local_hash, remote_hash FROM tracked_files";
+            "SELECT rpath, size, modified, local_hash, remote_hash FROM tracked_files";
         const CONSTRAINED_QUERY: &str =
-            concatcp!(QUERY, " WHERE cpath >= :lower AND cpath < :upper");
+            concatcp!(QUERY, " WHERE rpath >= :lower AND rpath < :upper");
         // Some pain and suffering went into this function. We need sqlite to find all strings that
         // match a certain prefix. One might think that using GLOB is a good idea. It is now however,
         // as we cannot guarantee that the special wildcard symbol '*' does not appear in paths.
@@ -165,15 +166,15 @@ impl SqliteDatabase {
         // 3) Go with the kind of hacky (but well-defined!) solution we have chosen here.
         let db = self.db.lock().unwrap();
 
-        if !cpath_dir.is_empty() {
+        if !prefix.is_empty() {
             // Thanks to this person https://stackoverflow.com/a/20423673
             // This solution relies on the fact that, by default, SQLITE just uses lexiocraphic order on the bytes
             // (by way of memcmp), and stores string as UTF-8 (a superset of ascii). This should avoid a full table scan
-            // (if there is an index on the path)
-            assert_eq!('0', char::from_u32('/' as u32 + 1).unwrap()); // This assert is optimized out..
+            // (if there is an index on the path).
+            let next_char_after_sep = char::from_u32(RPath::SEP as u32 + 1).unwrap();
             let params = named_params! {
-                ":lower": format!("{cpath_dir}/"),
-                ":upper": format!("{cpath_dir}0")
+                ":lower": format!("{prefix}{}", RPath::SEP),
+                ":upper": format!("{prefix}{}", next_char_after_sep)
             };
 
             db.prepare_cached(CONSTRAINED_QUERY)?
@@ -187,10 +188,10 @@ impl SqliteDatabase {
     }
 
     #[allow(dead_code)]
-    pub fn get_tracked_file(&self, cpath: &str) -> rusqlite::Result<Option<TrackedFile>> {
+    pub fn get_tracked_file(&self, path: &RPath) -> rusqlite::Result<Option<TrackedFile>> {
         let db = self.db.lock().unwrap();
-        let res = db.prepare_cached("SELECT cpath, size, modified, local_hash, remote_hash FROM tracked_files WHERE cpath = :cpath")?
-            .query_row(named_params! { ":cpath": cpath }, Self::tracked_file_from_row)
+        let res = db.prepare_cached("SELECT rpath, size, modified, local_hash, remote_hash FROM tracked_files WHERE rpath = :rpath")?
+            .query_row(named_params! { ":rpath": path }, Self::tracked_file_from_row)
             .optional()?;
 
         Ok(res)
@@ -205,10 +206,10 @@ impl SqliteDatabase {
         match side {
             None => {
                 let mut s = db.prepare_cached(
-                    "INSERT OR REPLACE INTO tracked_files (cpath, size, modified, local_hash, remote_hash) VALUES (:cpath, :size, :modified, :local_hash, :remote_hash)"
+                    "INSERT OR REPLACE INTO tracked_files (rpath, size, modified, local_hash, remote_hash) VALUES (:rpath, :size, :modified, :local_hash, :remote_hash)"
                 )?;
                 s.execute(named_params! {
-                    ":cpath": t.cpath,
+                    ":rpath": t.path,
                     ":size": t.size,
                     ":modified": t.modified,
                     ":local_hash": t.local_hash,
@@ -217,10 +218,10 @@ impl SqliteDatabase {
             }
             Some(Side::Local) => {
                 let mut s = db.prepare_cached(
-                    "INSERT OR REPLACE INTO tracked_files (cpath, size, modified, local_hash) VALUES (:cpath, :size, :modified, :local_hash)"
+                    "INSERT OR REPLACE INTO tracked_files (rpath, size, modified, local_hash) VALUES (:rpath, :size, :modified, :local_hash)"
                 )?;
                 s.execute(named_params! {
-                    ":cpath": t.cpath,
+                    ":rpath": t.path,
                     ":size": t.size,
                     ":modified": t.modified,
                     ":local_hash": t.local_hash
@@ -228,10 +229,10 @@ impl SqliteDatabase {
             }
             Some(Side::Remote) => {
                 let mut s = db.prepare_cached(
-                    "INSERT OR REPLACE INTO tracked_files (cpath, size, modified, remote_hash) VALUES (:cpath, :size, :modified, :remote_hash)
+                    "INSERT OR REPLACE INTO tracked_files (rpath, size, modified, remote_hash) VALUES (:rpath, :size, :modified, :remote_hash)
                 ")?;
                 s.execute(named_params! {
-                    ":cpath": t.cpath,
+                    ":rpath": t.path,
                     ":size": t.size,
                     ":modified": t.modified,
                     ":remote_hash": t.remote_hash
@@ -243,11 +244,11 @@ impl SqliteDatabase {
     }
 
     /// This will not return an error if the specified entry does not exist.
-    pub fn delete_tracked_file(&self, cpath: &str) -> rusqlite::Result<()> {
+    pub fn delete_tracked_file(&self, path: &RPath) -> rusqlite::Result<()> {
         let db = self.db.lock().unwrap();
-        let mut stmt = db.prepare_cached("DELETE FROM tracked_files WHERE cpath = :cpath")?;
+        let mut stmt = db.prepare_cached("DELETE FROM tracked_files WHERE rpath = :rpath")?;
 
-        stmt.execute(named_params! { ":cpath": cpath })?;
+        stmt.execute(named_params! { ":rpath": path })?;
 
         Ok(())
     }
@@ -281,7 +282,7 @@ impl TrackedFilesRepository for SqliteDatabase {
         };
 
         let updated = TrackedFile {
-            cpath: info.cpath,
+            path: info.rpath,
             size: info.size,
             modified: info.modified,
             local_hash,
@@ -293,9 +294,9 @@ impl TrackedFilesRepository for SqliteDatabase {
         Ok(())
     }
 
-    fn get_all(&self, cpath_dir: &str, side: Side) -> anyhow::Result<Vec<FileInfo>> {
-        let ret = self.get_all_tracked_files(cpath_dir, |tf| FileInfo {
-            cpath: tf.cpath,
+    fn get_all(&self, dir_rpath: &RPath, side: Side) -> anyhow::Result<Vec<FileInfo>> {
+        let ret = self.get_all_tracked_files(dir_rpath, |tf| FileInfo {
+            rpath: tf.path,
             size: tf.size,
             modified: tf.modified,
             hash: match side {
@@ -306,8 +307,8 @@ impl TrackedFilesRepository for SqliteDatabase {
         Ok(ret)
     }
 
-    fn delete(&self, cpath: &str) -> anyhow::Result<()> {
-        self.delete_tracked_file(cpath)?;
+    fn delete(&self, path: &RPath) -> anyhow::Result<()> {
+        self.delete_tracked_file(path)?;
         Ok(())
     }
 }
@@ -324,7 +325,9 @@ impl KeyValueStore for SqliteDatabase {
 
 #[cfg(test)]
 mod tests {
-    use time::macros::datetime;
+    use time::{macros::datetime, OffsetDateTime};
+
+    use crate::paths::RPath;
 
     use super::*;
 
@@ -353,12 +356,12 @@ mod tests {
     fn file_tracking() {
         let repo = empty_in_memory_repository();
 
-        let cpath = "somedir/that/contains/file";
-        let res = repo.get_tracked_file(cpath).unwrap();
+        let rpath = RPath::new("somedir/that/contains/file");
+        let res = repo.get_tracked_file(rpath).unwrap();
         assert!(res.is_none());
 
         let tf = TrackedFile {
-            cpath: cpath.into(),
+            path: rpath.to_owned(),
             size: 42069,
             modified: datetime!(2019-12-01 0:00 UTC),
             local_hash: "a0acb1671c1f8829404636476b221cd417fe89bf"
@@ -369,20 +372,20 @@ mod tests {
 
         repo.update_tracked_file(tf.clone(), None).unwrap();
 
-        let tf_retrieved = repo.get_tracked_file(cpath).unwrap();
+        let tf_retrieved = repo.get_tracked_file(rpath).unwrap();
 
         assert_eq!(tf_retrieved, Some(tf));
 
-        repo.delete_tracked_file(cpath).unwrap();
+        repo.delete_tracked_file(rpath).unwrap();
 
-        let tf3 = repo.get_tracked_file(cpath).unwrap();
+        let tf3 = repo.get_tracked_file(rpath).unwrap();
         assert!(tf3.is_none());
     }
 
     fn update_sided_impl(side: Side) {
         let db = empty_in_memory_repository();
         let example_info = FileInfo {
-            cpath: "somedir/that/contains/file".to_owned(),
+            rpath: "somedir/that/contains/file".parse().unwrap(),
             size: 42,
             modified: datetime!(2019-12-01 0:00 UTC),
             hash: "sadjhasdjhg".to_owned().into_bytes(),
@@ -391,7 +394,7 @@ mod tests {
         db.update(example_info.clone(), side).unwrap();
 
         let retrieved = db
-            .get_all("somedir/that/contains", side)
+            .get_all(&"somedir/that/contains".parse::<RPathBuf>().unwrap(), side)
             .unwrap()
             .into_iter()
             .next()
@@ -417,5 +420,37 @@ mod tests {
             x.is_err(),
             "new_from_path should fail early for non existing paths"
         )
+    }
+
+    #[test]
+    fn get_all_tracked_files_works() {
+        let db = empty_in_memory_repository();
+
+        let tf = TrackedFile {
+            path: RPath::single("test").to_owned(),
+            size: 42, 
+            modified: OffsetDateTime::UNIX_EPOCH,
+            local_hash: vec![],
+            remote_hash: vec![]
+        };
+
+        let tf1 = TrackedFile {
+            path: RPathBuf::from_components(["test", "file1"]),
+            ..tf.clone()
+        };
+        let tf2 = TrackedFile {
+            path: RPathBuf::from_components(["test", "file2"]),
+            ..tf.clone()
+        };
+
+        db.update_tracked_file(tf, None).unwrap();
+        db.update_tracked_file(tf1.clone(), None).unwrap();
+        db.update_tracked_file(tf2.clone(), None).unwrap();
+
+        let mut tfs = db.get_all_tracked_files(RPath::single("test"), |x| x)
+            .unwrap();
+        tfs.sort_by(|x, y| x.path.cmp(&y.path));
+
+        assert_eq!(tfs, [tf1, tf2]);
     }
 }

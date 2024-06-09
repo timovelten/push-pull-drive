@@ -6,6 +6,8 @@ use http::Request;
 pub use shell::*;
 use std::fmt::Display;
 
+use crate::paths::RPath;
+
 pub struct WithoutNewlines<'a>(pub &'a str);
 
 impl Display for WithoutNewlines<'_> {
@@ -52,9 +54,9 @@ pub fn clone_request<T: Clone>(req: &Request<T>) -> Request<T> {
 }
 
 /// Returns the greatest index i such that a[..i] == b[..i] is a prefix of b.
-pub fn find_common_prefix(a: &str, b: &str) -> usize {
-    let mut b_chars = b.chars();
-    for (i, x) in a.char_indices() {
+pub fn find_common_prefix(a: &RPath, b: &RPath) -> usize {
+    let mut b_chars = b.as_str().chars();
+    for (i, x) in a.as_str().char_indices() {
         match b_chars.next() {
             Some(y) if x == y => continue,
             _ => return i,
@@ -71,13 +73,6 @@ pub fn hex_must_decode(s: impl AsRef<[u8]>) -> Vec<u8> {
 #[cfg(test)]
 mod test {
     use super::*;
-
-    #[test]
-    fn test_common_prefix() {
-        assert_eq!(find_common_prefix("abcdefgh", "abc"), 3);
-        assert_eq!(find_common_prefix("abcdefg", "bcd"), 0);
-        assert_eq!(find_common_prefix("äü😀äallo", "äü😀"), "äü😀".len());
-    }
 
     #[test]
     fn test_human_readable_bytes() {

@@ -1,15 +1,17 @@
+use crate::paths::{RPath, RPathBuf};
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum FileChange {
     New(FileInfo),
     Modified(FileInfo),
-    Deleted { cpath: String },
+    Deleted { rpath: RPathBuf },
 }
 
 impl FileChange {
-    pub fn cpath(&self) -> &String {
+    pub fn rpath(&self) -> &RPath {
         match self {
-            FileChange::New(info) | FileChange::Modified(info) => &info.cpath,
-            FileChange::Deleted { cpath } => cpath,
+            FileChange::New(info) | FileChange::Modified(info) => &info.rpath,
+            FileChange::Deleted { rpath } => rpath,
         }
     }
 
@@ -22,7 +24,7 @@ impl FileChange {
     }
 
     pub fn is_deleted(&self) -> bool {
-        matches!(self, FileChange::Deleted { cpath: _ })
+        matches!(self, FileChange::Deleted { rpath: _ })
     }
 }
 
@@ -42,17 +44,17 @@ impl PathInfo {
         }
     }
 
-    pub fn cpath(&self) -> &str {
+    pub fn rpath(&self) -> &RPath {
         match self {
-            PathInfo::Dir(DirectoryInfo { cpath }) => cpath.as_str(),
-            PathInfo::File(FileInfo { cpath, .. }) => cpath.as_str(),
+            PathInfo::Dir(DirectoryInfo { rpath }) => rpath.as_rpath(),
+            PathInfo::File(FileInfo { rpath, .. }) => rpath.as_rpath(),
         }
     }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FileInfo {
-    pub cpath: String,
+    pub rpath: RPathBuf,
     pub size: u64,
     pub modified: time::OffsetDateTime,
     /// This value should typically only be compared to other FileInfo's created by the same
@@ -65,5 +67,5 @@ pub struct FileInfo {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DirectoryInfo {
-    pub cpath: String,
+    pub rpath: RPathBuf,
 }

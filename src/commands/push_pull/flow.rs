@@ -1,5 +1,6 @@
 use super::progress::{make_progress, ProgressSender};
 use super::{ConflictResolution, PushPullArgs};
+use crate::paths::{RPath, RPathBuf};
 use crate::util::{InspectAsyncReader, WithoutNewlines};
 use crate::FileInfo;
 use crate::{
@@ -7,7 +8,6 @@ use crate::{
     context::ExecutionEnvironment,
     db::{Side, TrackedFilesRepository},
     file_repository::FileRepository,
-    util::find_common_prefix,
     FileChange,
 };
 use either::Either;
@@ -19,7 +19,7 @@ use tokio::sync::Semaphore;
 
 #[allow(dead_code)]
 enum Conflict {
-    /// The file at src.cpath() == dst.cpath() has been modified in both the target and the source since
+    /// The file at src.rpath() == dst.rpath() has been modified in both the target and the source since
     /// the last push / pull.
     BothModified { src: FileChange, dst: FileChange },
     /// The src file a/b/c was changed, but the dst contains changes [a/b/c/d1, a/b/c/d2, ...], i.e. a/b/c is a non-empty directory
@@ -37,8 +37,8 @@ enum Conflict {
 // For now, we do not have that though and all these represent changes we intend to make on the dst side.
 #[derive(PartialEq, Clone, Debug)]
 pub(super) enum ChangeRequest {
-    DeleteFile { cpath: String },
-    DeleteDir { cpath: String },
+    DeleteFile { rpath: RPathBuf },
+    DeleteDir { rpath: RPathBuf },
     CreateFile { info: FileInfo },
     UpdateFile { info: FileInfo },
 }
@@ -48,7 +48,7 @@ impl From<FileChange> for ChangeRequest {
         match value {
             FileChange::New(info) => ChangeRequest::CreateFile { info },
             FileChange::Modified(info) => ChangeRequest::UpdateFile { info },
-            FileChange::Deleted { cpath } => ChangeRequest::DeleteFile { cpath },
+            FileChange::Deleted { rpath } => ChangeRequest::DeleteFile { rpath },
         }
     }
 }
@@ -57,17 +57,17 @@ impl std::fmt::Display for ChangeRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Note: It is somewhat important that whatever we return contains no line-breaks (so as to not break the asthetic...)
         match self {
-            ChangeRequest::DeleteFile { cpath } => {
-                write!(f, "Delete {}", WithoutNewlines(cpath))?;
+            ChangeRequest::DeleteFile { rpath } => {
+                write!(f, "Delete {}", WithoutNewlines(rpath.as_str()))?;
             }
-            ChangeRequest::DeleteDir { cpath } => {
-                write!(f, "Delete {}", WithoutNewlines(cpath))?;
+            ChangeRequest::DeleteDir { rpath } => {
+                write!(f, "Delete {}", WithoutNewlines(rpath.as_str()))?;
             }
             ChangeRequest::CreateFile { info } => {
-                write!(f, "Create {}", WithoutNewlines(&info.cpath))?;
+                write!(f, "Create {}", WithoutNewlines(info.rpath.as_str()))?;
             }
             ChangeRequest::UpdateFile { info } => {
-                write!(f, "Update {}", WithoutNewlines(&info.cpath))?;
+                write!(f, "Update {}", WithoutNewlines(info.rpath.as_str()))?;
             }
         };
 
@@ -103,36 +103,35 @@ pub(super) struct PushPullFlow<A, B> {
     from_side: Side,
 }
 
-/// Find a common directory that is a prefix of all cpaths in the slice. Note that this panics
-/// if the slice is empty.
-fn common_cpath_directory_prefix(changes: &[FileChange]) -> &str {
-    let mut common_prefix = changes[0].cpath().as_str();
-    for change in &changes[1..] {
-        let prefix_len = find_common_prefix(common_prefix, change.cpath());
-        if prefix_len < common_prefix.len() {
-            common_prefix = &change.cpath()[..prefix_len];
-        }
+/// Find a common directory that is a prefix of all rpath in the slice. Note that this panics
+/// if the slice is empty. Also note that this
+fn common_rpath_directory_prefix(changes: &[FileChange]) -> &RPath {
+    if changes.is_empty() {
+        return RPath::ROOT
     }
 
-    // Make sure that what we return is actually a directory
-    match common_prefix.rfind('/') {
-        Some(k) => &common_prefix[..k],
-        None => "",
+    // Make sure to start with a valid directory. That way, this will always return an actual directory
+    // even if called with twice the same path, or only one path.
+    let (mut common_prefix, _filename) = changes[0].rpath().split_right();
+
+    for change in &changes[1..] {
+        common_prefix = common_prefix.intersect(change.rpath());
     }
+    common_prefix
 }
 
 fn sort_filechanges(changes: &mut [FileChange]) {
-    changes.sort_by(|a, b| a.cpath().cmp(b.cpath()))
+    changes.sort_by(|a, b| a.rpath().cmp(b.rpath()))
 }
 
 /// Return `Either::Left(from_change)` if there are no conflicts, or `Either::Right(...)` and the conflict that was found.
-/// This function assumes that to_changes is sorted by cpath (as it uses binary search internally).
+/// This function assumes that to_changes is sorted by rpath (as it uses binary search internally).
 /// Use [`sort_filechanges`].
 fn either_okay_or_conflict(
     from_change: FileChange,
     to_changes: &[FileChange],
 ) -> Either<FileChange, Conflict> {
-    match to_changes.binary_search_by(|probe| probe.cpath().cmp(from_change.cpath())) {
+    match to_changes.binary_search_by(|probe| probe.rpath().cmp(from_change.rpath())) {
         Ok(i) => {
             let their_change = &to_changes[i];
             if !their_change.is_deleted() {
@@ -143,16 +142,16 @@ fn either_okay_or_conflict(
             }
         }
         Err(i) => {
-            // Due to the way binary search works, to_changes[i].cpath() must be strictly larger than from_change.cpath().
+            // Due to the way binary search works, to_changes[i].rpath() must be strictly larger than from_change.rpath().
 
-            // Check if from_change is the prefix of any change in the destination (i.e. if from_change.cpath() is a directory in the target
+            // Check if from_change is the prefix of any change in the destination (i.e. if from_change.rpath() is a directory in the target
             // that has changes).
             let mut prefixes = Vec::new();
 
             #[allow(clippy::needless_range_loop)]
             for j in i..to_changes.len() {
                 let their_change = &to_changes[j];
-                if their_change.cpath().starts_with(from_change.cpath()) {
+                if their_change.rpath().starts_with(from_change.rpath()) {
                     if !their_change.is_deleted() {
                         prefixes.push(their_change.clone())
                     }
@@ -169,9 +168,9 @@ fn either_okay_or_conflict(
                 });
             }
 
-            // Check if from_change is the suffix of any change in the destination (i.e. a subpath of from_change.cpath()
+            // Check if from_change is the suffix of any change in the destination (i.e. a subpath of from_change.rpath()
             // is contained in to_changes)
-            if i > 0 && from_change.cpath().starts_with(to_changes[i - 1].cpath()) {
+            if i > 0 && from_change.rpath().starts_with(to_changes[i - 1].rpath()) {
                 return Either::Right(Conflict::SubpathIsFile {
                     src: from_change,
                     file: to_changes[i - 1].clone(),
@@ -278,7 +277,7 @@ where
 
         // Optimization for a somewhat common case: If only files from a certain subdirectory were changed,
         // find that subdirectory. This potentially allows us to not list less remote files, which is good.
-        let better_wd = common_cpath_directory_prefix(&from_changes);
+        let better_wd = common_rpath_directory_prefix(&from_changes);
         log::debug!("Using optimized working directory {better_wd} for querying remote..");
 
         // Determine all files in the "better working directory" and check if they have changed
@@ -320,7 +319,7 @@ where
                         writeln!(
                             self.stderr(),
                             "Conflict: File {} is modified in both the source and the destination.",
-                            src.cpath()
+                            src.rpath()
                         )?;
                     }
                     ConflictResolution::Normal | ConflictResolution::Aggressive => {
@@ -331,18 +330,18 @@ where
                 Conflict::IsADirectory { src, contents: _ } => {
                     match self.args.conflict_resolution {
                         ConflictResolution::Interactive => {
-                            writeln!(self.stderr(), "Conflict: {} is a file in the source, and a directory in the destination.", src.cpath())?;
+                            writeln!(self.stderr(), "Conflict: {} is a file in the source, and a directory in the destination.", src.rpath())?;
                         }
                         ConflictResolution::Normal => {
                             writeln!(
                                 self.stderr(),
                                 "Conflict: Consider deleting the directory {} in the destination. For now, this change will be ignored.",
-                                src.cpath()
+                                src.rpath()
                             )?;
                         }
                         ConflictResolution::Aggressive => {
                             changes.push(ChangeRequest::DeleteDir {
-                                cpath: src.cpath().to_owned(),
+                                rpath: src.rpath().to_owned(),
                             });
                         }
                         ConflictResolution::Conservative => continue,
@@ -353,19 +352,19 @@ where
                         writeln!(
                             self.stderr(),
                             "Conflict: {} was changed in the source, but {} is a file in the destination",
-                            src.cpath(), file.cpath()
+                            src.rpath(), file.rpath()
                         )?;
                     }
                     ConflictResolution::Normal => {
                         writeln!(
                             self.stderr(),
                             "Conflict: Consider deleting the file {} in the destination. For now, this change will be ignored.",
-                            src.cpath()
+                            src.rpath()
                         )?;
                     }
                     ConflictResolution::Aggressive => {
                         changes.push(ChangeRequest::DeleteFile {
-                            cpath: src.cpath().to_owned(),
+                            rpath: src.rpath().to_owned(),
                         });
                     }
                     ConflictResolution::Conservative => continue,
@@ -389,12 +388,12 @@ where
 
         // Deletions should be quick, just do them in sequence.
         for (id, change) in changes.iter().enumerate() {
-            let ChangeRequest::DeleteFile { cpath } = change else {
+            let ChangeRequest::DeleteFile { rpath } = change else {
                 continue;
             };
 
-            self.to.delete_file(cpath).await?;
-            self.tracked_files().delete(cpath)?;
+            self.to.delete_file(rpath).await?;
+            self.tracked_files().delete(rpath)?;
 
             progress.notify_done(id).await;
         }
@@ -521,11 +520,11 @@ where
     /// function.
     async fn handle_update(
         &self,
-        FileInfo { cpath, .. }: FileInfo,
+        FileInfo { rpath, .. }: FileInfo,
         id: usize,
         progress: &ProgressSender,
     ) -> anyhow::Result<()> {
-        log::info!("Handling update to file {cpath}");
+        log::info!("Handling update to file {rpath}");
 
         // We might retry this once, if we think that we can fix the error by deleting some empty directories.
         for is_retry in [false, true] {
@@ -534,12 +533,12 @@ where
                 // (which might include "expensive" API calls we do not want to do for every file always)
                 log::warn!(
                     "Trying to delete orphaned directory at {} to make change suceed.",
-                    &cpath
+                    &rpath
                 );
-                self.to.delete_orphaned_directory(&cpath).await?;
+                self.to.delete_orphaned_directory(&rpath).await?;
             }
 
-            let (from_info, reader) = self.from.read_file(&cpath).await?;
+            let (from_info, reader) = self.from.read_file(&rpath).await?;
             let len = from_info.size;
 
             progress.notify_start(id).await;
@@ -549,7 +548,7 @@ where
             });
             let write_result = self
                 .to
-                .write_file(&cpath, Some(from_info.modified), reader, len)
+                .write_file(&rpath, Some(from_info.modified), reader, len)
                 .await;
 
             let to_info = match write_result {
@@ -580,7 +579,7 @@ mod test {
 
     fn f(s: &str) -> FileInfo {
         FileInfo {
-            cpath: s.to_owned(),
+            rpath: s.parse().unwrap(),
             size: 42,
             modified: OffsetDateTime::now_utc(),
             hash: Default::default(),
@@ -594,16 +593,16 @@ mod test {
             FileChange::New(f("documents/2024/letter")),
             FileChange::Modified(f("documents/2024/cv")),
             FileChange::Deleted {
-                cpath: "documents/template".to_owned(),
+                rpath: "documents/template".parse().unwrap(),
             },
             FileChange::New(f("videos/test/vid.mp4")),
             FileChange::New(f("videos/test/vid2.mkv")),
             FileChange::Modified(f("videos/test/another.mkv")),
             FileChange::Deleted {
-                cpath: "tmp/file1".to_owned(),
+                rpath: "tmp/file1".parse().unwrap(),
             },
             FileChange::Deleted {
-                cpath: "tmp/file2".to_owned(),
+                rpath: "tmp/file2".parse().unwrap(),
             },
         ];
         sort_filechanges(&mut ret);
@@ -629,7 +628,7 @@ mod test {
         ) else {
             panic!();
         };
-        assert_eq!(dst.cpath(), "documents/2024/letter");
+        assert_eq!(dst.rpath(), &*"documents/2024/letter".parse::<RPathBuf>().unwrap());
     }
 
     #[test]
@@ -670,6 +669,6 @@ mod test {
         ) else {
             panic!()
         };
-        assert_eq!(file.cpath(), "documents/2024/cv");
+        assert_eq!(file.rpath(), &*"documents/2024/cv".parse::<RPathBuf>().unwrap());
     }
 }

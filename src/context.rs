@@ -2,7 +2,7 @@ use crate::{
     db::{KeyValueStore, Side, SqliteDatabase, TrackedFilesRepository},
     file_repository::FileRepository,
     local::LocalBackend,
-    paths,
+    paths::{RPath, RPathBuf},
     util::Shell,
     FileInfo,
 };
@@ -24,9 +24,8 @@ pub const DATABASE_NAME: &str = "database.sqlite3";
 #[derive(Clone)]
 pub struct ExecutionEnvironment {
     pub shell: Arc<Shell>,
-    /// Working directory. This is a "context path" of the current working directory
-    /// (NOT the OS provided working directory.)
-    pub wd: String,
+    /// Working directory as RPath
+    pub wd: RPathBuf,
     /// Root dir. That is, the directory that contains the config directory
     pub root_dir: PathBuf,
     pub key_value_store: Arc<dyn KeyValueStore>,
@@ -52,7 +51,7 @@ impl ExecutionEnvironment {
         }
     }
 
-    pub fn wd(&self) -> &str {
+    pub fn wd(&self) -> &RPath {
         &self.wd
     }
 }
@@ -108,7 +107,7 @@ pub fn find_context<P: AsRef<Path>>(
         let key_value_store: Arc<dyn KeyValueStore> = db.clone();
         let tracked_files: Arc<dyn TrackedFilesRepository> = db;
 
-        let wd = paths::relative_name(root_dir, &wd)?;
+        let wd = RPathBuf::try_from_path(root_dir, &wd)?;
         log::info!("Root directory is {root_dir:?}, relative working directory is {wd}");
         return Ok(ExecutionEnvironment {
             shell,
@@ -130,11 +129,11 @@ impl TrackedFilesRepository for IgnoreTrackedFilesRepo {
         Ok(())
     }
 
-    fn get_all(&self, _cpath_dir: &str, _side: Side) -> anyhow::Result<Vec<FileInfo>> {
+    fn get_all(&self, _dir_path: &RPath, _side: Side) -> anyhow::Result<Vec<FileInfo>> {
         Ok(Vec::new())
     }
 
-    fn delete(&self, _cpath: &str) -> anyhow::Result<()> {
+    fn delete(&self, _path: &RPath) -> anyhow::Result<()> {
         Ok(())
     }
 }

@@ -1,4 +1,10 @@
-use std::fmt::Write;
+use glob_match::glob_match;
+use rusqlite::types::FromSql;
+use rusqlite::ToSql;
+use std::borrow::Borrow;
+use std::convert::Infallible;
+use std::fmt::Display;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -13,94 +19,326 @@ pub enum Error {
     PathIsNotSubpathOf { base: PathBuf, path: PathBuf },
 }
 
-fn strip_leading_separator(path: &Path) -> &Path {
-    let ret = match path.strip_prefix("/") {
-        Ok(path) => path,
-        Err(_) => path,
-    };
-
-    // TODO: If we ever support windows, also strip backslashes here.
-
-    ret
+#[derive(Clone, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
+pub struct RPathBuf {
+    inner: String,
 }
 
-/// Returns all the subpaths of a path. Note that this ALWAYS included the empty path as
-/// the first subpath.
-pub fn subpaths(cpath: &str) -> impl DoubleEndedIterator<Item = &str> {
-    // This is not 'hand written' to avoid us having to think about how one can
-    // efficiently implement both next and next_back.
-    // As a result, the code is kind of cryptic. Check the tests to see how it should work..
-    let end = if cpath.is_empty() {
-        // If the string is empty to begin with, we need to avoid emitting the empty subpath twice.
-        None
-    } else {
-        Some(cpath.len())
-    };
+impl RPathBuf {
+    const SEP: char = RPath::SEP;
 
-    let indices_raw = cpath.match_indices('/').map(|(i, _)| Some(i));
-    let indices = [Some(0)].into_iter().chain(indices_raw).chain([end]);
-
-    indices.filter_map(|maybe_i| maybe_i.map(|i| &cpath[..i]))
-}
-
-/// Convert a path to what we refer to as a "relative name" relative to the given base_path.
-pub fn relative_name<P: AsRef<Path>, Q: AsRef<Path>>(
-    base_path: P,
-    path: Q,
-) -> Result<String, Error> {
-    // TODO: Make this more robust, i.e. perhaps handle paths that contains dots etc.
-    let base_path = base_path.as_ref();
-    let path = path.as_ref();
-
-    if !base_path.is_absolute() || !path.is_absolute() {
-        return Err(Error::PathNotAbsolute(path.to_owned()));
+    pub fn from_sep(s: &str, sep: char) -> Self {
+        Self::from_components(s.split(sep))
     }
 
-    if let Ok(relative_path) = path.strip_prefix(base_path) {
-        // There is definitely still a leading separator
-        let relative_path = strip_leading_separator(relative_path);
+    pub fn from_components<'a, I: IntoIterator<Item = &'a str>>(components: I) -> Self {
+        let mut ret = Self::new();
+        for component in components {
+            ret.push_single(component);
+        }
+        ret
+    }
 
-        Ok(relative_path
-            .to_str()
-            .ok_or(Error::PathContainsInvalidUnicode)?
-            .to_owned())
-    } else {
-        Err(Error::PathIsNotSubpathOf {
-            base: base_path.to_owned(),
-            path: path.to_owned(),
-        })
+    pub fn push(&mut self, other: &RPath) {
+        // Make sure to not add empty segments (we disallow those)
+        if other.is_empty() {
+            return;
+        }
+
+        if !self.is_empty() {
+            self.inner.push(Self::SEP);
+        }
+
+        self.inner.push_str(&other.inner)
+    }
+
+    pub fn push_single(&mut self, other: &str) {
+        self.push(RPath::single(other));
+    }
+
+    pub fn new() -> Self {
+        Self {
+            inner: String::new(),
+        }
+    }
+
+    pub fn try_from_path<P: AsRef<Path>, Q: AsRef<Path>>(
+        base_path: P,
+        path: Q,
+    ) -> Result<Self, Error> {
+        let base_path = base_path.as_ref();
+        let path = path.as_ref();
+
+        if !base_path.is_absolute() || !path.is_absolute() {
+            return Err(Error::PathNotAbsolute(path.to_owned()));
+        }
+
+        let base_components = base_path
+            .components()
+            .map(Some)
+            .chain(std::iter::repeat(None));
+        let components = path.components();
+
+        let mut ret = RPathBuf::new();
+        for (a, b) in base_components.zip(components) {
+            match a {
+                Some(a) if a != b => {
+                    return Err(Error::PathIsNotSubpathOf {
+                        base: base_path.to_owned(),
+                        path: path.to_owned(),
+                    })
+                }
+                Some(_) => {}
+                None => {
+                    // Base path is exhausted, this is the part we care about
+                    ret.push_single(b.as_os_str().to_str().unwrap())
+                }
+            }
+        }
+
+        Ok(ret)
+    }
+
+    pub fn into_string(self) -> String {
+        self.inner
+    }
+
+    pub fn as_rpath(&self) -> &RPath {
+        self
     }
 }
 
-pub fn append_to_cpath_in_place(base_cpath: &mut String, s: &str) {
-    if base_cpath.is_empty() {
-        write!(base_cpath, "{}", s).unwrap();
-        return;
-    }
+impl Deref for RPathBuf {
+    type Target = RPath;
 
-    if s.is_empty() {
-        return;
-    }
-
-    write!(base_cpath, "/{}", s).unwrap();
-}
-
-pub fn append_to_relative_name(relative_name: &str, filename: &str) -> String {
-    let mut ret = relative_name.to_owned();
-    append_to_cpath_in_place(&mut ret, filename);
-    ret
-}
-
-pub fn pop_cpath(cpath: &str) -> (&str, &str) {
-    match cpath.rsplit_once('/') {
-        Some((base, last)) => (base, last),
-        None => ("", cpath),
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        RPath::new(&self.inner)
     }
 }
 
-pub fn filename(relative_name: &str) -> &str {
-    let (_, ret) = pop_cpath(relative_name);
-    ret
+impl Borrow<RPath> for RPathBuf {
+    fn borrow(&self) -> &RPath {
+        self.deref()
+    }
+}
+
+impl ToOwned for RPath {
+    type Owned = RPathBuf;
+
+    fn to_owned(&self) -> Self::Owned {
+        RPathBuf {
+            inner: self.inner.to_owned(),
+        }
+    }
+}
+
+/// A valid RPath (relative path) is
+/// - A valid utf8 string
+/// - Has 'components' of byte length greather than zero, that are separated by 0 bytes. In particular, it does not start or end with a 0 byte
+/// - The following characters are illegal in components:
+#[repr(transparent)]
+#[derive(Hash, PartialEq, Eq, Ord, PartialOrd, Debug)]
+pub struct RPath {
+    inner: str,
+}
+
+impl RPath {
+    pub const SEP: char = '\x00';
+    pub const SEP_STR: &'static str = "\x00";
+    pub const ROOT: &'static Self = RPath::new_unchecked("");
+
+    // The "unchecked" will not lead to unsaftey in the rust sense. It might lead to incorrect program
+    // behavior though.
+    #[inline(always)]
+    pub const fn new_unchecked(s: &str) -> &RPath {
+        unsafe {
+            // SAFTEY: RPath is repr(transparent) (see also the impl of str::from_utf8_unchecked)
+            std::mem::transmute(s)
+        }
+    }
+
+    pub fn new(s: &str) -> &RPath {
+        Self::new_unchecked(s)
+    }
+
+    pub fn single(s: &str) -> &RPath {
+        assert!(!s.contains(Self::SEP), "A single component must not contain the separator character {:x}", Self::SEP as u32);
+        Self::new(s)
+    }
+
+    pub fn split_at(&self) -> (&RPath, &RPath) {
+        todo!()
+    }
+
+    pub fn split_right(&self) -> (&RPath, &str) {
+        match self.inner.rsplit_once(Self::SEP) {
+            Some((base, last)) => (RPath::new(base), last),
+            None => (RPath::new(""), &self.inner),
+        }
+    }
+
+    pub fn filename(&self) -> &str {
+        let (_, filename) = self.split_right();
+        filename
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub fn join(&self, other: &RPath) -> RPathBuf {
+        let mut buf = self.to_owned();
+        buf.push(other);
+
+        buf
+    }
+
+    pub fn join_single(&self, other: &str) -> RPathBuf {
+        let mut buf = self.to_owned();
+        buf.push_single(other);
+
+        buf
+    }
+
+    /// Returns all the subpaths of a path. Note that this ALWAYS included the empty path as
+    /// the first subpath.
+    pub fn subpaths(&self) -> impl DoubleEndedIterator<Item = &RPath> {
+        // I really want to avoid having to write the next_back implementation myself,
+        // so we have to leverage the std libraray in a kind of awkward way
+
+        // We emit the empty string once at the beginning. Avoid emitting it again at the end
+        // in case the string is empty.
+        let end = match self.is_empty() {
+            true => None,
+            false => Some(self.len()),
+        };
+
+        let indices_raw = self.inner.match_indices(Self::SEP).map(|(i, _)| Some(i));
+        let indices = [Some(0)]
+            .into_iter()
+            .chain(indices_raw)
+            .chain([end])
+            .flatten();
+
+        indices.map(|i| RPath::new_unchecked(&self.inner[..i]))
+    }
+
+    pub fn components(&self) -> impl DoubleEndedIterator<Item = &str> {
+        self.inner.split(Self::SEP)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.inner
+    }
+
+    pub fn matches_glob(&self, glob: &str) -> bool {
+        glob_match(glob, &self.inner)
+    }
+
+    pub fn with_separator(&self, sep: char) -> Result<String, String> {
+        let mut ret = String::new();
+
+        let mut failed = false;
+        for c in self.components() {
+            failed |= c.contains(sep);
+
+            if !ret.is_empty() {
+                ret.push(sep);
+            }
+
+            ret.push_str(c);
+        }
+
+        if failed {
+            Err(ret)
+        } else {
+            Ok(ret)
+        }
+    }
+
+    pub fn slice(&self, range: std::ops::Range<usize>) -> &Self {
+        Self::new(&self.inner[range])
+    }
+
+    /// This is the longest subpath of self (as defined by `.subpaths`) that is also
+    /// a subpath of other. In that sense, the path returned by this will be a directory
+    pub fn intersect<'a>(&'a self, other: &Self) -> &'a Self {
+        let mut ret = RPath::ROOT;
+        for (x, y) in self.subpaths().zip(other.subpaths()) {
+            if x == y {
+                ret = x;
+            } else {
+                break;
+            }
+        }
+
+        ret
+    }
+
+    pub fn starts_with(&self, other: &Self) -> bool {
+        self.inner.starts_with(&other.inner)
+    }
+}
+
+impl Display for RPathBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut first = true;
+        for comp in self.components() {
+            if !first {
+                write!(f, "/")?;
+            }
+
+            write!(f, "{}", comp)?;
+
+            first = false;
+        }
+
+        Ok(())
+    }
+}
+
+impl Display for RPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.with_separator('/') {
+            Ok(res) => write!(f, "{res}")?,
+            Err(res) => write!(f, "[Component contained separator '/'] {res} ")?
+        }
+
+        Ok(())
+    }
+}
+
+impl FromSql for RPathBuf {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        let inner: String = <String as FromSql>::column_result(value)?;
+        Ok(RPathBuf { inner })
+    }
+}
+
+impl ToSql for RPath {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        <str as ToSql>::to_sql(&self.inner)
+    }
+}
+
+impl ToSql for RPathBuf {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        self.as_rpath().to_sql()
+    }
+}
+
+impl std::str::FromStr for RPathBuf {
+    type Err = Infallible;
+
+    /// Take a conventionelly separated string (i.e. )
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(RPathBuf::from_sep(s, '/'))
+    }
 }
 
 #[cfg(test)]
@@ -110,13 +348,12 @@ mod test {
     #[test]
     pub fn to_relative_name_test() {
         assert_eq!(
-            relative_name("/tmp/test", "/tmp/test/hallo/123").unwrap(),
-            "hallo/123"
+            RPathBuf::try_from_path("/tmp/test", "/tmp/test/hallo/123").unwrap(),
+            RPathBuf::from_components(["hallo", "123"])
         );
-        assert_eq!(relative_name("/tmp/test", "/tmp/test").unwrap(), "");
         assert_eq!(
-            relative_name("/tmp//test", "/tmp/test/hallo/123").unwrap(),
-            "hallo/123"
+            RPathBuf::try_from_path("/tmp//test", "/tmp/test/hallo/123").unwrap(),
+            RPathBuf::from_components(["hallo", "123"])
         );
     }
 
@@ -124,19 +361,20 @@ mod test {
     pub fn identity() {
         // Make sure that passing in the same path twice works.
         // We unwrap that at some points.
-        assert_eq!(relative_name("/tmp/test", "/tmp/test").unwrap(), "");
+        let res = RPathBuf::try_from_path("/tmp/test", "/tmp/test").unwrap();
+        assert_eq!(&*res, RPath::ROOT);
     }
 
     #[test]
     pub fn subpaths_works() {
-        let cpath = "videos/2024/good_ones/test.mkv";
-        let res = subpaths(cpath).collect::<Vec<_>>();
-        let should_be = vec![
-            "",
-            "videos",
-            "videos/2024",
-            "videos/2024/good_ones",
-            "videos/2024/good_ones/test.mkv",
+        let rpath: RPathBuf = "videos/2024/good_ones/test.mkv".parse().unwrap();
+        let res = rpath.subpaths().map(|x| x.to_owned()).collect::<Vec<_>>();
+        let should_be: Vec<RPathBuf> = vec![
+            "".parse().unwrap(),
+            "videos".parse().unwrap(),
+            "videos/2024".parse().unwrap(),
+            "videos/2024/good_ones".parse().unwrap(),
+            "videos/2024/good_ones/test.mkv".parse().unwrap(),
         ];
 
         assert_eq!(res, should_be);
@@ -144,7 +382,7 @@ mod test {
 
     #[test]
     pub fn subpath_works_for_empty() {
-        let res = subpaths("").collect::<Vec<_>>();
-        assert_eq!(res, vec![""]);
+        let res = RPath::ROOT.subpaths().collect::<Vec<_>>();
+        assert_eq!(res, vec![RPath::ROOT]);
     }
 }

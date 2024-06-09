@@ -12,12 +12,12 @@ use context::{find_context, ExecutionEnvironment, Context, Ctx};
 
 mod fileinfo;
 pub use fileinfo::*;
+use paths::RPath;
 
 pub mod local;
 use crate::local::LocalBackend;
 
 pub mod paths;
-pub use paths::{append_to_cpath_in_place, append_to_relative_name, pop_cpath};
 
 mod util;
 pub use util::*;
@@ -118,9 +118,8 @@ pub fn main() -> anyhow::Result<()> {
 fn get_local_backend_config(root_dir: impl AsRef<Path>) -> local::Config {
     return local::Config {
         root_path: root_dir.as_ref().to_owned(),
-        ignore_globs: vec![
-            crate::context::CONFIG_DIR.to_owned(),
-            format!("{}/**", crate::context::CONFIG_DIR),
+        ignore_prefixes: vec![
+            RPath::single(crate::context::CONFIG_DIR).to_owned(),
         ],
         calculate_hashes: true,
     };
