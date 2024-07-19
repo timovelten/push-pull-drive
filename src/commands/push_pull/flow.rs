@@ -58,16 +58,16 @@ impl std::fmt::Display for ChangeRequest {
         // Note: It is somewhat important that whatever we return contains no line-breaks (so as to not break the asthetic...)
         match self {
             ChangeRequest::DeleteFile { rpath } => {
-                write!(f, "Delete {}", WithoutNewlines(rpath.as_str()))?;
+                write!(f, "Delete {}", WithoutNewlines(&rpath.to_string()))?;
             }
             ChangeRequest::DeleteDir { rpath } => {
-                write!(f, "Delete {}", WithoutNewlines(rpath.as_str()))?;
+                write!(f, "Delete {}", WithoutNewlines(&rpath.to_string()))?;
             }
             ChangeRequest::CreateFile { info } => {
-                write!(f, "Create {}", WithoutNewlines(info.rpath.as_str()))?;
+                write!(f, "Create {}", WithoutNewlines(&info.rpath.to_string()))?;
             }
             ChangeRequest::UpdateFile { info } => {
-                write!(f, "Update {}", WithoutNewlines(info.rpath.as_str()))?;
+                write!(f, "Update {}", WithoutNewlines(&info.rpath.to_string()))?;
             }
         };
 

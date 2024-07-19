@@ -133,10 +133,12 @@ impl ToOwned for RPath {
     }
 }
 
-/// A valid RPath (relative path) is
-/// - A valid utf8 string
-/// - Has 'components' of byte length greather than zero, that are separated by 0 bytes. In particular, it does not start or end with a 0 byte
-/// - The following characters are illegal in components:
+/// A valid RPath (relative path) is has "components" each of which
+/// - Does not contain a null byte
+/// - Is valid utf8
+/// - Is not .. or .
+/// - Is not empty
+/// We enforce these rules in the "Builder" type RPathBuf.
 #[repr(transparent)]
 #[derive(Hash, PartialEq, Eq, Ord, PartialOrd, Debug)]
 pub struct RPath {
@@ -144,9 +146,9 @@ pub struct RPath {
 }
 
 impl RPath {
-    pub const SEP: char = '\x00';
-    pub const SEP_STR: &'static str = "\x00";
     pub const ROOT: &'static Self = RPath::new_unchecked("");
+    pub const SEP: char = '\x01';
+    pub const SEP_STR: &'static str = "\x01";
 
     // The "unchecked" will not lead to unsaftey in the rust sense. It might lead to incorrect program
     // behavior though.
@@ -230,10 +232,6 @@ impl RPath {
 
     pub fn components(&self) -> impl DoubleEndedIterator<Item = &str> {
         self.inner.split(Self::SEP)
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.inner
     }
 
     pub fn matches_glob(&self, glob: &str) -> bool {
@@ -335,7 +333,12 @@ impl ToSql for RPathBuf {
 impl std::str::FromStr for RPathBuf {
     type Err = Infallible;
 
-    /// Take a conventionelly separated string (i.e. )
+    /// This function takes a string that has '/' separated components and turns it into a
+    /// a valid RPathBuf. Do note the following restrictions:
+    /// - The string must not start with a '/'
+    /// - We use backslash to escape slashes. From left to right \/ is replaced by a slash, \\ is replaced by a single backslash. 
+    ///   If no such substitution can be done anymore, and a free-standing backslash is left over, this is a syntax error.
+    /// - We normalize away occurrences of . and .. if possible
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(RPathBuf::from_sep(s, '/'))
     }
