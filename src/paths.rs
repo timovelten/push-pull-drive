@@ -169,10 +169,6 @@ impl RPath {
         Self::new(s)
     }
 
-    pub fn split_at(&self) -> (&RPath, &RPath) {
-        todo!()
-    }
-
     pub fn split_right(&self) -> (&RPath, &str) {
         match self.inner.rsplit_once(Self::SEP) {
             Some((base, last)) => (RPath::new(base), last),
@@ -263,7 +259,7 @@ impl RPath {
         Self::new(&self.inner[range])
     }
 
-    /// This is the longest subpath of self (as defined by `.subpaths`) that is also
+    /// This is the longest subpath of self (as defined by [Self::subpaths]) that is also
     /// a subpath of other. In that sense, the path returned by this will be a directory
     pub fn intersect<'a>(&'a self, other: &Self) -> &'a Self {
         let mut ret = RPath::ROOT;

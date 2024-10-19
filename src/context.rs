@@ -17,7 +17,7 @@ pub const CONFIG_DIR: &str = ".push-pull-drive";
 pub const DATABASE_NAME: &str = "database.sqlite3";
 
 /// This contains the whole application context except for the two backends we use
-/// as source and destination. In other words, this struct can be intialized whenever that
+/// as source and destination. In other words, this struct can be intialized whenever the
 /// database is created (but might itself not be initialized).
 /// 
 /// The "full" context is defined below.

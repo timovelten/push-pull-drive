@@ -2,6 +2,7 @@ use crate::{paths::{RPath, RPathBuf}, FileInfo};
 use anyhow::bail;
 use const_format::concatcp;
 use rusqlite::{named_params, Connection, OpenFlags, OptionalExtension, Row};
+use static_assertions::assert_obj_safe;
 use std::{path::Path, sync::Mutex};
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -26,6 +27,7 @@ pub trait KeyValueStore: Send + Sync {
 
     fn put(&self, key: &str, value: &str) -> anyhow::Result<()>;
 }
+assert_obj_safe!(KeyValueStore);
 
 pub trait TrackedFilesRepository: Send + Sync {
     fn update(&self, info: FileInfo, side: Side) -> anyhow::Result<()>;
@@ -34,6 +36,7 @@ pub trait TrackedFilesRepository: Send + Sync {
 
     fn delete(&self, path: &RPath) -> anyhow::Result<()>;
 }
+assert_obj_safe!(TrackedFilesRepository);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackedFile {
@@ -155,7 +158,7 @@ impl SqliteDatabase {
         const CONSTRAINED_QUERY: &str =
             concatcp!(QUERY, " WHERE rpath >= :lower AND rpath < :upper");
         // Some pain and suffering went into this function. We need sqlite to find all strings that
-        // match a certain prefix. One might think that using GLOB is a good idea. It is now however,
+        // match a certain prefix. One might think that using GLOB is a good idea. It is not however,
         // as we cannot guarantee that the special wildcard symbol '*' does not appear in paths.
         // Then, one might think that SQLITE's LIKE would work. That, however, does case insensitive comparisons
         // by default, and PRAGMA case_sensitive_like is deprecated since 3.44.

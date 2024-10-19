@@ -1,9 +1,11 @@
+use std::fmt::Display;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crossterm::cursor::MoveToColumn;
 use crossterm::execute;
 use crossterm::terminal::{Clear, ClearType};
+use static_assertions::assert_impl_all;
 
 pub struct Shell {
     inner: Mutex<ShellImpl>,
@@ -15,9 +17,7 @@ impl Default for Shell {
     }
 }
 
-const fn _assert_send_sync<T: Send + Sync>() {}
-
-const _: () = _assert_send_sync::<Shell>();
+assert_impl_all!(Shell: Send, Sync);
 
 impl Shell {
     pub fn new() -> Self {
@@ -27,9 +27,11 @@ impl Shell {
     }
 
     /// This prints a line that is "transient" in the sense that anything that is
-    /// printed after it will overwrite it. In order for this to work correctly,
-    /// s must not contain any newline characters.
-    pub fn print_transient(&self, s: &str) -> io::Result<()> {
+    /// printed after it will overwrite it. This will break if s contains any newlines,
+    /// or really any other terminal control characters.
+    /// 
+    /// To strip out new line characters, consider using [WithoutNewlines].
+    pub fn print_transient(&self, s: impl Display) -> io::Result<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.clear_if_needed();
 

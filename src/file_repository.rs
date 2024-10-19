@@ -32,12 +32,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// the capabilities of an underlying server. This can be implemented with a semaphore.
 ///
 /// Implementations should be cheaply cloneable, potentially by being wrapped inside of an Arc.
+/// 
+/// Note that this trait is not object safe.
 pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
     type Reader: AsyncReader;
 
     /// Implementations should indicate how many concurrent jobs they allow. This is needed because
-    /// e.g. Google drive does definitely now allow arbitrarily many concurrent connections.
-    /// Maybe we will make this more fine grained in the future. Callers should honor this value, at leats
+    /// e.g. Google drive does definitely not allow arbitrarily many concurrent connections.
+    /// Maybe we will make this more fine grained in the future. Callers should honor this value, at least
     /// on a "best effort" basis.
     const CONCURRENCY_LIMIT: usize;
 
