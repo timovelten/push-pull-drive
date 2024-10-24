@@ -1,5 +1,5 @@
 use crate::{paths::{RPath, RPathBuf}, FileInfo};
-use anyhow::bail;
+use anyhow::{bail, Context};
 use const_format::concatcp;
 use rusqlite::{named_params, Connection, OpenFlags, OptionalExtension, Row};
 use static_assertions::assert_obj_safe;
@@ -26,6 +26,13 @@ pub trait KeyValueStore: Send + Sync {
     fn get(&self, key: &str) -> anyhow::Result<Option<String>>;
 
     fn put(&self, key: &str, value: &str) -> anyhow::Result<()>;
+
+    fn must_get(&self, key: &str) -> anyhow::Result<String> {
+        match self.get(key)? {
+            Some(res) => Ok(res),
+            None => Err(anyhow::anyhow!("No value for key {key}"))
+        }
+    }
 }
 assert_obj_safe!(KeyValueStore);
 
@@ -318,7 +325,8 @@ impl TrackedFilesRepository for SqliteDatabase {
 
 impl KeyValueStore for SqliteDatabase {
     fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
-        self.get_value(key).map_err(Into::into)
+        self.get_value(key)
+            .with_context(|| format!("Tried to retrieve value for key `{key}`)"))
     }
 
     fn put(&self, key: &str, value: &str) -> anyhow::Result<()> {

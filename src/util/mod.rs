@@ -2,7 +2,6 @@ mod async_read;
 mod shell;
 
 pub use async_read::InspectAsyncReader;
-use http::Request;
 pub use shell::*;
 use std::fmt::Display;
 
@@ -27,28 +26,6 @@ pub fn human_readable_bytes(bs: u64) -> (f64, &'static str) {
     let magnitude = 1 << (10 * i);
 
     (bs as f64 / magnitude as f64, UNITS[i])
-}
-
-pub fn clone_request<T: Clone>(req: &Request<T>) -> Request<T> {
-    if !req.extensions().is_empty() {
-        panic!("cloning requests with extensions is unsupported")
-    }
-
-    let method = req.method().clone();
-    let uri = req.uri().clone();
-    let version = req.version();
-    let headers = req.headers().clone();
-    let body = req.body().clone();
-
-    let mut ret = Request::builder()
-        .method(method)
-        .uri(uri)
-        .version(version)
-        .body(body)
-        .unwrap();
-
-    *ret.headers_mut() = headers;
-    ret
 }
 
 pub fn hex_must_decode(s: impl AsRef<[u8]>) -> Vec<u8> {

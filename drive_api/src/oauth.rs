@@ -9,16 +9,26 @@ use oauth2::{
     Scope, TokenResponse,
 };
 use oauth2::{reqwest::http_client, AuthUrl, ClientId, ClientSecret, RevocationUrl, TokenUrl};
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use url::Url;
 
 use super::FatAccessToken;
 
+// Note: We intentionally do not have a debug implementation for this type (so that we do not
+// print the client secret. Though doing so in this specific context also wouldn't be the end
+// of the world)
+#[derive(Clone, Deserialize, Serialize)]
+pub struct ClientConfig {
+    pub client_secret: String,
+    pub client_id: String,
+}
+
 /// oauth2 BasicClient with Google's AuthUrl, TokenUrl and RevocationUrl set.
-pub fn new_google_oauth_client(client_id: ClientId, client_secret: ClientSecret) -> BasicClient {
+pub(crate) fn new_google_oauth_client(config: ClientConfig) -> BasicClient {
     let client = BasicClient::new(
-        client_id,
-        Some(client_secret),
+        ClientId::new(config.client_id),
+        Some(ClientSecret::new(config.client_secret)),
         AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string()).unwrap(),
         Some(TokenUrl::new("https://www.googleapis.com/oauth2/v3/token".to_string()).unwrap()),
     );
@@ -28,7 +38,7 @@ pub fn new_google_oauth_client(client_id: ClientId, client_secret: ClientSecret)
     )
 }
 
-pub fn sign_in(client: BasicClient) -> anyhow::Result<(FatAccessToken, RefreshToken)> {
+pub fn sign_in(client_config: ClientConfig) -> anyhow::Result<(FatAccessToken, RefreshToken)> {
     // This is very much based on the example from the oauth2 crate
     // https://github.com/ramosbugs/oauth2-rs/blob/main/examples/google.rs
 
@@ -37,6 +47,7 @@ pub fn sign_in(client: BasicClient) -> anyhow::Result<(FatAccessToken, RefreshTo
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
 
+    let client = new_google_oauth_client(client_config);
     let client = client.set_redirect_uri(
         RedirectUrl::new(format!("http://localhost:{}", port)).expect("invalid redirect url"),
     );

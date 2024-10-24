@@ -1,35 +1,5 @@
 #![allow(unused)]
-
-mod client;
-pub mod config;
-mod credential;
-mod drive_api;
-mod extensions;
-pub mod oauth;
-
-use self::drive_api::File;
-use self::drive_api::FileId;
-use self::drive_api::FilesReq;
-use crate::file_repository::AsyncReader;
-use crate::file_repository::Error;
-use crate::file_repository::Result;
-use crate::gdrive::drive_api::MoreFileFields;
-use crate::paths::RPath;
-use crate::util::hex_must_decode;
-use crate::DirectoryInfo;
-use crate::{
-    file_repository::FileRepository, gdrive::drive_api::DriveApi,
-    FileInfo, PathInfo,
-};
-use anyhow::Context;
-use anyhow::{anyhow, bail};
-use async_recursion::async_recursion;
-use cached::Cached;
-use cached::TimedCache;
-use cached::TimedSizedCache;
 use client::GDriveClient;
-pub use config::*;
-pub use credential::{FatAccessToken, GoogleCredential};
 use delegate::delegate;
 use futures::stream::FuturesUnordered;
 use futures::stream::Next;
@@ -45,6 +15,17 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{sync::Semaphore, task::block_in_place};
+
+pub mod config;
+mod client;
+
+pub use config::{load, init};
+
+use crate::file_repository::AsyncReader;
+use crate::file_repository::{FileRepository, Error, Result};
+use crate::paths::RPath;
+use crate::FileInfo;
+use crate::PathInfo;
 
 #[derive(Clone, Debug)]
 pub struct GDriveRepo {

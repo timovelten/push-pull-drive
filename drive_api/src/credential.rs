@@ -1,50 +1,71 @@
+use std::sync::Arc;
+
 use anyhow::anyhow;
 use oauth2::{basic::BasicClient, AccessToken, RefreshToken, TokenResponse};
 use time::ext::NumericalDuration;
 use time::OffsetDateTime;
 use tokio::sync::Mutex as TokioMutex;
 
+use crate::oauth::{new_google_oauth_client, ClientConfig};
+
 #[derive(Debug, Clone)]
 pub struct FatAccessToken {
-    pub access_token: AccessToken,
-    pub expires: OffsetDateTime,
+    pub(crate) access_token: AccessToken,
+    pub(crate) expires: OffsetDateTime,
 }
 
 impl FatAccessToken {
-    fn needs_to_be_refreshed(&self) -> bool {
+    pub fn from_parts(access_token: String, expires: OffsetDateTime) -> Self {
+        Self {
+            access_token: AccessToken::new(access_token),
+            expires
+        }
+    }
+
+    pub fn secret(&self) -> &str {
+        self.access_token.secret()
+    }
+
+    pub fn expires(&self) -> &OffsetDateTime {
+        &self.expires
+    }
+
+    pub fn needs_to_be_refreshed(&self) -> bool {
         let now = OffsetDateTime::now_utc();
         self.expires - now < 60.seconds()
     }
 
-    fn is_expired(&self) -> bool {
+    pub fn is_expired(&self) -> bool {
         let now = OffsetDateTime::now_utc();
         self.expires <= now
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GoogleCredential {
-    /// I really don't know how to get rid of this lock. We definitely need to avoid having
-    /// two token requests in flight at once.
-    inner: TokioMutex<GoogleCredentialImpl>,
+    // I really don't know how to get rid of this lock. We definitely need to avoid having
+    // two token requests in flight at once.
+    inner: Arc<TokioMutex<GoogleCredentialImpl>>,
 }
 
 impl GoogleCredential {
     pub fn new<F: Fn(FatAccessToken) + 'static + Send>(
-        google_client: BasicClient,
-        refresh_token: RefreshToken,
+        client_config: ClientConfig,
+        refresh_token: String,
         last_token: Option<FatAccessToken>,
         new_token_callback: F,
     ) -> Self {
+        let client = new_google_oauth_client(client_config);
+
         let inner = GoogleCredentialImpl {
-            client: google_client,
-            refresh_token,
+            client,
+            refresh_token: RefreshToken::new(refresh_token),
             token: last_token,
             callback: Box::new(new_token_callback),
         };
 
         GoogleCredential {
-            inner: TokioMutex::new(inner),
+            inner: Arc::new(TokioMutex::new(inner)),
         }
     }
 
@@ -61,11 +82,9 @@ const _: () = {
 };
 
 struct GoogleCredentialImpl {
-    // Immutable state, this will not be changed after initial creation.
     client: BasicClient,
     refresh_token: RefreshToken,
     token: Option<FatAccessToken>,
-
     callback: Box<dyn Fn(FatAccessToken) + Send>,
 }
 

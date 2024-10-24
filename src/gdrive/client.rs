@@ -2,15 +2,11 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use cached::TimedCache;
+use drive_api::{DriveApi, File, FilesReq, GoogleCredential, MoreFileFields};
 use futures::{stream::FuturesUnordered, AsyncRead, StreamExt as _};
 
-use super::{
-    drive_api::{self, DriveApi, File, MoreFileFields},
-    GoogleCredential,
-};
 use crate::{
     file_repository::{Error, Result},
-    gdrive::drive_api::FilesReq,
     hex_must_decode,
     paths::{RPath, RPathBuf},
     DirectoryInfo, FileInfo, PathInfo,
@@ -57,8 +53,7 @@ fn to_fileinfo(file: drive_api::File, path: RPathBuf) -> Result<FileInfo> {
 pub(super) struct GDriveClient {
     /// Calling mkdir_all concurrently really does not work, so we need to prevent it.
     mkdir_lock: tokio::sync::Mutex<()>,
-
-    client: reqwest::Client,
+    api_client: DriveApi,
 
     /// Google drive does not use paths. Instead, it identifies files using ids.
     /// For example, there is no specific API to list all of the files in a directory (by path).
@@ -67,33 +62,17 @@ pub(super) struct GDriveClient {
     /// like concurrent modification is not an issue (someone could move the folder,
     /// for example. Then the cached ID would point to another path now.).
     file_cache: Mutex<TimedCache<RPathBuf, Arc<drive_api::File>>>,
-
-    credential: GoogleCredential,
 }
 
 impl GDriveClient {
     pub fn new(credential: GoogleCredential) -> Self {
-        let client = reqwest::Client::builder().build().unwrap();
+        let api_client = DriveApi::new(Default::default(), credential);
 
         Self {
             mkdir_lock: tokio::sync::Mutex::new(()),
-            credential,
-            client,
+            api_client,
             file_cache: Mutex::new(TimedCache::with_lifespan(15)),
         }
-    }
-
-    async fn get_token(&self) -> Result<oauth2::AccessToken> {
-        self.credential
-            .get_or_refresh_token()
-            .await
-            .map_err(Error::Other)
-    }
-
-    /// It is important to drop the type returned by this as fast as possible, and not keep it around.
-    /// Otherwise, it is very easy to deadlock the program.
-    fn api(&self) -> DriveApi<'_> {
-        DriveApi::new(self.client.clone(), &self.credential)
     }
 
     fn cache_file(&self, path: &RPath, file: drive_api::File) -> Arc<drive_api::File> {
@@ -140,7 +119,7 @@ impl GDriveClient {
         // in a single request.
         // See also: https://developers.google.com/drive/api/guides/folder
         let root_file = self
-            .api()
+            .api_client
             .files_get("root")
             .await
             .map_err(|err| Error::Other(err.into()))?;
@@ -236,7 +215,7 @@ impl GDriveClient {
                     let req =
                         FilesReq::new_create_folder(name.to_owned(), parent_id.as_str().to_owned());
                     let created_file = self
-                        .api()
+                        .api_client
                         .files_create(req)
                         .await
                         .map_err(|err| Error::Other(err.into()))?;
@@ -286,7 +265,7 @@ impl GDriveClient {
         log::debug!("Requesting files with query {query}");
 
         let files = self
-            .api()
+            .api_client
             .file_list_all(&query)
             .await
             .map_err(|err| Error::Other(err.into()))?;
@@ -306,7 +285,7 @@ impl GDriveClient {
         let (parent, filename) = path.split_right();
         let parent_file = self.mkdir_all(parent).await?;
         let file = self
-            .api()
+            .api_client
             .files_create_upload(
                 FilesReq {
                     name: Some(filename.to_string()),
@@ -324,7 +303,7 @@ impl GDriveClient {
     }
 
     async fn update_file<R: AsyncRead + Send>(&self, file: File, src: R, len: u64) -> Result<File> {
-        self.api()
+        self.api_client
             .files_update_upload(&file.id, src, len)
             .await
             .map_err(|err| Error::Other(err.into()))
@@ -332,7 +311,7 @@ impl GDriveClient {
 
     pub async fn get_metadata(&self, cpath: &RPath) -> Result<PathInfo> {
         let drive_id = &self.drive_file_by_rpath_cached(cpath).await?.id;
-        let info = match self.api().files_get(drive_id).await {
+        let info = match self.api_client.files_get(drive_id).await {
             Ok(file) => match file.more {
                 Some(MoreFileFields::BinaryFile {
                     sha1_checksum,
@@ -361,7 +340,6 @@ impl GDriveClient {
 
     pub async fn read_file(&self, path: &RPath) -> Result<(FileInfo, Box<dyn AsyncRead + Send>)> {
         let cpath = path.to_owned();
-        let api = self.api();
         log::info!("Reading file at {cpath}");
         let cache_size = self.file_cache.lock().unwrap().cache_size();
         log::info!("Cache size: {}", cache_size);
@@ -379,7 +357,8 @@ impl GDriveClient {
                     hash: hex_must_decode(sha1_checksum),
                 };
 
-                let body = api
+                let body = self
+                    .api_client
                     .files_get_alt_media(&file.id, Some(&head_revision_id))
                     .await
                     .map_err(|err| Error::Other(err.into()))?;
@@ -429,7 +408,7 @@ impl GDriveClient {
         // Delete from cache early (what if the deletion happens, but still returns an error for whatever reason. Deleting from
         // cache does not break anything in any case...)
         self.delete_from_cache(path);
-        self.api()
+        self.api_client
             .files_delete(id)
             .await
             .map_err(|err| Error::Other(err.into()))?;
@@ -444,7 +423,7 @@ impl GDriveClient {
     ) -> Result<()> {
         let id = &self.drive_file_by_rpath_cached(path).await?.id;
 
-        self.api()
+        self.api_client
             .files_update(
                 id,
                 FilesReq {
@@ -488,7 +467,6 @@ impl GDriveClient {
             for chunk in queue.chunks(BATCH_SIZE) {
                 fts.push(async move {
                     let mut ret = Vec::new();
-                    let api = self.api();
                     let files = self
                         .read_dirs(chunk.iter().map(|(x, _)| x.as_str()))
                         .await?;
@@ -554,56 +532,4 @@ impl GDriveClient {
     }
 }
 
-#[cfg(test)]
-mod test {
-    use oauth2::{ClientId, ClientSecret, RefreshToken};
 
-    use crate::gdrive::oauth;
-
-    use super::*;
-    use test_log::test;
-
-    // These are intended to be run with
-    // cargo test gdrive::test --features=gdrive-tests -- --nocapture --test-threads=1
-
-    fn setup() -> Arc<GDriveClient> {
-        let client_id = ClientId::new(std::env::var("GOOGLE_CID").unwrap());
-        let refresh_token = RefreshToken::new(std::env::var("GOOGLE_RT").unwrap());
-        let client_secret = ClientSecret::new(std::env::var("GOOGLE_SECRET").unwrap());
-
-        let client = oauth::new_google_oauth_client(client_id, client_secret);
-        let credential = GoogleCredential::new(client, refresh_token, None, |_| {
-            println!("Recevied new token");
-        });
-
-        Arc::new(GDriveClient::new(credential))
-    }
-
-    #[tokio::test]
-    #[cfg_attr(not(feature = "gdrive-tests"), ignore)]
-    async fn list_files() {
-        let backend = setup();
-        let mut res = backend.read_dir(RPath::ROOT, 2).await.unwrap();
-        res.sort_by_key(|info| info.rpath().to_owned());
-
-        for info in res {
-            println!("{}", info.rpath());
-        }
-    }
-
-    #[test(tokio::test)]
-    #[cfg_attr(not(feature = "gdrive-tests"), ignore)]
-    async fn create_file() {
-        let backend = setup();
-        let content = "Hallo".as_bytes().to_owned();
-        let len = content.len() as u64;
-        let value = backend
-            .create_file(
-                &RPathBuf::from_sep("testdir/anotherdir/andanother/testfile", '/'),
-                futures::io::Cursor::new(content),
-                len
-            )
-            .await
-            .unwrap();
-    }
-}

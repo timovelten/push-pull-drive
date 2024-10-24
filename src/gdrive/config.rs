@@ -1,19 +1,28 @@
-use super::{FatAccessToken, GDriveClient, GDriveRepo, GoogleCredential};
-use crate::{context::ExecutionEnvironment, gdrive::oauth};
+use crate::context::ExecutionEnvironment;
+use crate::gdrive::client::GDriveClient;
 use anyhow::{anyhow, Context as _};
-use oauth2::{AccessToken, ClientId, ClientSecret, RefreshToken};
+use drive_api::oauth::ClientConfig;
+use drive_api::{FatAccessToken, GoogleCredential};
+use serde::Deserialize;
 use std::fs::File;
 use std::io::Write;
 use std::sync::Arc;
 use time::OffsetDateTime;
 
-const KEY_BACKEND: &str = "backend";
-const GDRIVE_BACKEND: &str = "gdrive";
-const KEY_GDRIVE_CLIENT_SECRET: &str = "s";
-const KEY_GDRIVE_CLIENT_ID: &str = "cid";
-const KEY_GDRIVE_TOKEN: &str = "t";
-const KEY_GDRIVE_TOKEN_EXPIRES: &str = "exp";
-const KEY_GDRIVE_REFRESH_TOKEN: &str = "rt";
+use super::GDriveRepo;
+
+struct Cfg;
+
+const THIS_BACKEND: &str = "gdrive";
+
+impl Cfg {
+    pub const BACKEND: &str = "backend";
+    pub const CLIENT_SECRET: &str = "s";
+    pub const CLIENT_ID: &str = "cid";
+    pub const TOKEN: &str = "t";
+    pub const TOKEN_EXPIRES: &str = "exp";
+    pub const REFRESH_TOKEN: &str = "rt";
+}
 
 #[derive(clap::Args, Clone)]
 pub struct GoogleDriveInitArgs {
@@ -30,48 +39,40 @@ pub fn init(
     ctx: &ExecutionEnvironment,
     GoogleDriveInitArgs { secrets_path }: GoogleDriveInitArgs,
 ) -> anyhow::Result<()> {
+    #[derive(Deserialize)]
+    struct Config {
+        installed: InstalledClient,
+    }
+    #[derive(Deserialize)]
+    struct InstalledClient {
+        client_id: String,
+        client_secret: String,
+    }
+
     let f = File::open(secrets_path)?;
-    let parsed: serde_json::Value = serde_json::from_reader(f)?;
+    let parsed: Config = serde_json::from_reader(f)?;
 
-    let installed = parsed
-        .get("installed")
-        .ok_or_else(|| anyhow!("Secrets file invalid. Missing 'installed'."))?;
-
-    let client_id = ClientId::new(
-        installed
-            .get("client_id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| anyhow!("Secrets file invalid. Missing 'client_id'."))?
-            .to_owned(),
-    );
-
-    let client_secret = ClientSecret::new(
-        installed
-            .get("client_secret")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| anyhow!("Secrets file invalid. Missing 'client_secret'."))?
-            .to_owned(),
-    );
+    let client_config = ClientConfig {
+        client_secret: parsed.installed.client_secret,
+        client_id: parsed.installed.client_id,
+    };
 
     // Login the user using the OAuth device flow
-    let google_client = oauth::new_google_oauth_client(client_id.clone(), client_secret.clone());
-
-    let (fat_token, refresh_token) = oauth::sign_in(google_client)?;
+    let (fat_token, refresh_token) = drive_api::oauth::sign_in(client_config.clone())?;
 
     // Store them in the database and return
-    ctx.key_value_store.put(KEY_BACKEND, GDRIVE_BACKEND)?;
+    ctx.key_value_store.put(Cfg::BACKEND, THIS_BACKEND)?;
     ctx.key_value_store
-        .put(KEY_GDRIVE_CLIENT_ID, client_id.as_str())?;
+        .put(Cfg::CLIENT_ID, &client_config.client_id)?;
     ctx.key_value_store
-        .put(KEY_GDRIVE_CLIENT_SECRET, client_secret.secret())?;
+        .put(Cfg::CLIENT_SECRET, &client_config.client_secret)?;
 
     ctx.key_value_store
-        .put(KEY_GDRIVE_REFRESH_TOKEN, refresh_token.secret())?;
-    ctx.key_value_store
-        .put(KEY_GDRIVE_TOKEN, fat_token.access_token.secret())?;
+        .put(Cfg::REFRESH_TOKEN, refresh_token.secret())?;
+    ctx.key_value_store.put(Cfg::TOKEN, fat_token.secret())?;
     ctx.key_value_store.put(
-        KEY_GDRIVE_TOKEN_EXPIRES,
-        &format!("{}", fat_token.expires.unix_timestamp()),
+        Cfg::TOKEN_EXPIRES,
+        &format!("{}", fat_token.expires().unix_timestamp()),
     )?;
 
     writeln!(ctx.shell.err(), "Success!")?;
@@ -80,7 +81,7 @@ pub fn init(
 }
 
 pub fn load(ctx: &ExecutionEnvironment) -> anyhow::Result<Option<GDriveRepo>> {
-    if ctx.key_value_store.get(KEY_BACKEND)?.as_deref() == Some(GDRIVE_BACKEND) {
+    if ctx.key_value_store.get(Cfg::BACKEND)?.as_deref() == Some(THIS_BACKEND) {
         Ok(Some(load_internal(ctx)?))
     } else {
         Ok(None)
@@ -91,66 +92,48 @@ fn load_internal(ctx: &ExecutionEnvironment) -> anyhow::Result<GDriveRepo> {
     log::debug!("Loading google drive backend");
 
     // Read what we previously saved from the database
-    let client_id = ctx
-        .key_value_store
-        .get(KEY_GDRIVE_CLIENT_ID)?
-        .with_context(|| KEY_GDRIVE_CLIENT_ID)?;
+    let client_id = ctx.key_value_store.must_get(Cfg::CLIENT_ID)?;
+    let client_secret = ctx.key_value_store.must_get(Cfg::CLIENT_SECRET)?;
 
-    let client_secret = ctx
-        .key_value_store
-        .get(KEY_GDRIVE_CLIENT_SECRET)?
-        .with_context(|| KEY_GDRIVE_CLIENT_SECRET)?;
-
-    let last_token = ctx
-        .key_value_store
-        .get(KEY_GDRIVE_TOKEN)
-        .with_context(|| KEY_GDRIVE_REFRESH_TOKEN)?;
-    let last_token_expires = ctx
-        .key_value_store
-        .get(KEY_GDRIVE_TOKEN_EXPIRES)
-        .with_context(|| KEY_GDRIVE_TOKEN_EXPIRES)?;
-
+    // Last token may or may not exist
+    let last_token = ctx.key_value_store.get(Cfg::TOKEN)?;
+    let last_token_expires = ctx.key_value_store.get(Cfg::TOKEN_EXPIRES)?;
     let last_token = match (last_token, last_token_expires) {
         (Some(tok), Some(exp)) => {
-            let expires = OffsetDateTime::from_unix_timestamp(
-                exp.parse::<i64>()
-                    .with_context(|| "while parsing expiration date")?,
-            )
-            .expect("expiry date should be a unix timestamp");
+            let expires = exp.parse::<i64>()
+                .with_context(|| "failed to parse expiration date")
+                .and_then(|val| OffsetDateTime::from_unix_timestamp(val).with_context(|| "expiration date is not valid unix timestamp"))?;
 
-            Some(FatAccessToken {
-                access_token: AccessToken::new(tok),
-                expires,
-            })
+            Some(FatAccessToken::from_parts(tok, expires))
         }
         (_, _) => None,
     };
 
     let refresh_token = ctx
         .key_value_store
-        .get(KEY_GDRIVE_REFRESH_TOKEN)?
-        .with_context(|| KEY_GDRIVE_REFRESH_TOKEN)?;
+        .must_get(Cfg::REFRESH_TOKEN)?;
 
     // Create some objects in a DI kind of way and initialize the backend
-    let google_client =
-        oauth::new_google_oauth_client(ClientId::new(client_id), ClientSecret::new(client_secret));
+    let client_config = ClientConfig {
+        client_id,client_secret
+    };
 
     let cloned_kvs = ctx.key_value_store.clone();
     let credential: GoogleCredential = GoogleCredential::new(
-        google_client,
-        RefreshToken::new(refresh_token),
+        client_config,
+        refresh_token,
         last_token,
         move |token| {
             // Note how we fail silently here. Maybe we shouldn't (?), we'll see
-            let _ = cloned_kvs.put(KEY_GDRIVE_TOKEN, token.access_token.secret());
+            let _ = cloned_kvs.put(Cfg::TOKEN, token.secret());
             let _ = cloned_kvs.put(
-                KEY_GDRIVE_TOKEN_EXPIRES,
-                &token.expires.unix_timestamp().to_string(),
+                Cfg::TOKEN_EXPIRES,
+                &token.expires().unix_timestamp().to_string(),
             );
         },
     );
 
     Ok(GDriveRepo {
-        inner: Arc::new(GDriveClient::new(credential))
+        inner: Arc::new(GDriveClient::new(credential)),
     })
 }

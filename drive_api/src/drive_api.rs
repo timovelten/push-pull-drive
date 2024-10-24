@@ -1,25 +1,24 @@
-use std::cell::OnceCell;
 use std::fmt::Write as _;
 use std::io::ErrorKind;
 use std::pin::pin;
+use std::sync::LazyLock;
 use std::time::Duration;
 use std::{fmt::Display, str::FromStr};
 
 use crate::util::clone_request;
-use crate::{hex_must_decode, FileInfo};
 
 use super::extensions::RequestBuilderExt;
 use super::extensions::UrlExt;
-use super::{Error, GoogleCredential};
-use anyhow::{anyhow, Context};
+use super::GoogleCredential;
+use anyhow::anyhow;
 use futures::{AsyncRead, AsyncReadExt, TryStreamExt};
-use http::{Request, StatusCode};
+use http::Request;
 use oauth2::AccessToken;
-use once_cell::sync::Lazy;
 use rand::Rng;
 use serde::de::DeserializeOwned;
 use serde::{de, Deserialize};
 use serde::{Deserializer, Serialize};
+use thiserror::Error;
 use time::OffsetDateTime;
 use url::Url;
 
@@ -27,16 +26,13 @@ use url::Url;
 /// Google Drive. It does not much beyond that. In particular, it
 /// does not handle authentication by itself.
 
-// See https://stackoverflow.com/questions/44301748/how-can-i-deserialize-an-optional-field-with-custom-functions-using-serde
-// for why we need the [serde(default)]
-
 const EMPTY_BODY: &[u8] = &[];
 const REQUEST_IS_VALID: &str = "request is valid";
 
 pub const FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
 
 #[derive(Debug, Error)]
-pub(super) enum ApiError {
+pub enum ApiError {
     #[error(transparent)]
     HttpError(reqwest::Error),
     #[error(transparent)]
@@ -48,15 +44,15 @@ pub(super) enum ApiError {
 }
 
 #[derive(Deserialize, Debug)]
-pub(super) struct GoogleErrorDetails {
-    domain: String,
-    reason: String,
-    message: String,
+pub struct GoogleErrorDetails {
+    pub domain: String,
+    pub reason: String,
+    pub message: String,
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-pub(super) enum GoogleError {
+pub enum GoogleError {
     Error {
         code: u16,
         message: String,
@@ -65,22 +61,22 @@ pub(super) enum GoogleError {
 }
 
 impl GoogleError {
-    fn code(&self) -> u16 {
+    pub fn code(&self) -> u16 {
         let Self::Error { code, .. } = self;
         *code
     }
 
-    fn message(&self) -> &str {
+    pub fn message(&self) -> &str {
         let Self::Error { message, .. } = self;
         message
     }
 
-    fn errors(&self) -> &[GoogleErrorDetails] {
+    pub fn errors(&self) -> &[GoogleErrorDetails] {
         let Self::Error { errors, .. } = self;
         errors
     }
 
-    fn is_rate_limit_exceeded(&self) -> bool {
+    pub fn is_rate_limit_exceeded(&self) -> bool {
         if self.code() != 403 {
             return false;
         }
@@ -105,7 +101,7 @@ const FILE_FIELDS: [&str; 8] = [
     "headRevisionId",
     "size",
 ];
-static FILE_FIELDS_QUERY: Lazy<[(&'static str, &'static str); 1]> = Lazy::new(|| {
+static FILE_FIELDS_QUERY: LazyLock<[(&'static str, &'static str); 1]> = LazyLock::new(|| {
     let fields_str = FILE_FIELDS.join(",").leak();
     [("fields", fields_str)]
 });
@@ -197,16 +193,16 @@ impl FilesReq {
 /// need to be passed to each function here in any case. It should not be kept
 /// around and is generally extremely short lived.
 #[derive(Debug)]
-pub struct DriveApi<'a> {
+pub struct DriveApi {
     client: reqwest::Client,
-    credential: &'a GoogleCredential,
+    credential: GoogleCredential
 }
 
-impl<'a> DriveApi<'a> {
+impl DriveApi {
     // Chunksize of 20 MiB seems like a reasonable choice.
     const CHUNKSIZE: usize = (256 * 1024 * 4) * 20;
 
-    pub fn new(client: reqwest::Client, credential: &'a GoogleCredential) -> Self {
+    pub fn new(client: reqwest::Client, credential: GoogleCredential) -> Self {
         Self { client, credential }
     }
 
@@ -252,7 +248,7 @@ impl<'a> DriveApi<'a> {
                                 retries,
                             }
                         }
-                        Err(err) => ApiError::Other(anyhow!(
+                        Err(_) => ApiError::Other(anyhow!(
                             "HTTP request failed with code {}. Error: {err_str}",
                             status
                         )),
@@ -315,7 +311,7 @@ impl<'a> DriveApi<'a> {
         q: &str,
         next_page_token: Option<&str>,
     ) -> Result<FilesListResp, ApiError> {
-        static PREFIXED_FIELDS: Lazy<String> = Lazy::new(|| {
+        static PREFIXED_FIELDS: LazyLock<String> = LazyLock::new(|| {
             let mut s = "nextPageToken".to_owned();
             // The files are "nested", and therefore the fields need to be prefixed,
             // i.e. files/mimeType instead of just mimeType
@@ -609,24 +605,6 @@ fn parse_range_header(s: &str) -> (usize, usize) {
 }
 
 // Serde functions we need to serialize and deserialize the data correctly
-
-fn optional_from_str<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    T: FromStr,
-    T::Err: Display,
-    D: de::Deserializer<'de>,
-{
-    let s = <Option<String>>::deserialize(deserializer)?;
-
-    let ret: Option<T> = if let Some(s) = s {
-        Some(T::from_str(&s).map_err(de::Error::custom)?)
-    } else {
-        None
-    };
-
-    Ok(ret)
-}
-
 fn from_str<'de, T, D>(deserializer: D) -> Result<T, D::Error>
 where
     T: FromStr,
@@ -641,8 +619,6 @@ where
 
 #[cfg(test)]
 mod test {
-    use serde_json::json;
-
     use super::*;
 
     #[test]
