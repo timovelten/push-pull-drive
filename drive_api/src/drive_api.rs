@@ -50,6 +50,11 @@ pub struct GoogleErrorDetails {
     pub message: String,
 }
 
+/// I can't seem to find an official document stating that all errors of all Google APIs look
+/// like this. The Google Drive ones are (kind of) detailed here [https://developers.google.com/drive/api/guides/handle-errors].
+/// 
+/// Also the official go client api library also assumes this structure [https://github.com/googleapis/google-api-go-client/blob/e3868f25dbd081e7d28a8d75d0ea4a5364027f80/googleapi/googleapi.go#L136]
+/// so it probably is specified somehwere (at least internally).
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub enum GoogleError {
@@ -189,9 +194,6 @@ impl FilesReq {
     }
 }
 
-/// This struct just exists to extract common paramters that would
-/// need to be passed to each function here in any case. It should not be kept
-/// around and is generally extremely short lived.
 #[derive(Debug)]
 pub struct DriveApi {
     client: reqwest::Client,
@@ -691,5 +693,28 @@ mod test {
         assert_eq!(val.code(), 403);
         assert_eq!(val.message(), "User Rate Limit Exceeded");
         assert_eq!(val.errors()[0].reason, "userRateLimitExceeded");
+    }
+
+    #[test]
+    fn errors_can_be_parsed_2() {
+        let data = r#"
+            {
+                "error": {
+                "code": 400,
+                "message": "Invalid Value",
+                "errors": [
+                    {
+                    "message": "Invalid Value",
+                    "domain": "global",
+                    "reason": "invalid",
+                    "location": "q",
+                    "locationType": "parameter"
+                    }
+                ]
+                }
+            }
+        "#;
+
+        let _: GoogleError = serde_json::from_str(data).unwrap();
     }
 }
