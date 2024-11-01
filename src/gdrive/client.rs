@@ -165,7 +165,7 @@ impl GDriveClient {
             }
 
             let mut next_rpath = current_path;
-            next_rpath.push_single(next_file_name);
+            next_rpath.push(next_file_name);
 
             if let Some(next_file) = next_file {
                 current_path = next_rpath;

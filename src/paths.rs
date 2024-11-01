@@ -33,12 +33,12 @@ impl RPathBuf {
     pub fn from_components<'a, I: IntoIterator<Item = &'a str>>(components: I) -> Self {
         let mut ret = Self::new();
         for component in components {
-            ret.push_single(component);
+            ret.push(component);
         }
         ret
     }
 
-    pub fn push(&mut self, other: &RPath) {
+    pub fn extend(&mut self, other: &RPath) {
         // Make sure to not add empty segments (we disallow those)
         if other.is_empty() {
             return;
@@ -51,8 +51,8 @@ impl RPathBuf {
         self.inner.push_str(&other.inner)
     }
 
-    pub fn push_single(&mut self, other: &str) {
-        self.push(RPath::single(other));
+    pub fn push(&mut self, other: &str) {
+        self.extend(RPath::single(other));
     }
 
     pub fn new() -> Self {
@@ -90,7 +90,7 @@ impl RPathBuf {
                 Some(_) => {}
                 None => {
                     // Base path is exhausted, this is the part we care about
-                    ret.push_single(b.as_os_str().to_str().unwrap())
+                    ret.push(b.as_os_str().to_str().unwrap())
                 }
             }
         }
@@ -190,14 +190,14 @@ impl RPath {
 
     pub fn join(&self, other: &RPath) -> RPathBuf {
         let mut buf = self.to_owned();
-        buf.push(other);
+        buf.extend(other);
 
         buf
     }
 
     pub fn join_single(&self, other: &str) -> RPathBuf {
         let mut buf = self.to_owned();
-        buf.push_single(other);
+        buf.push(other);
 
         buf
     }
