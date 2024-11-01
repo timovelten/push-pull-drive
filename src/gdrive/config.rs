@@ -1,11 +1,11 @@
 use crate::context::ExecutionEnvironment;
 use crate::gdrive::client::GDriveClient;
 use anyhow::{anyhow, Context as _};
-use drive_api::oauth::ClientConfig;
+use drive_api::oauth::{new_google_oauth_client, ClientConfig};
 use drive_api::{FatAccessToken, GoogleCredential};
 use serde::Deserialize;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::Arc;
 use time::OffsetDateTime;
 
@@ -39,26 +39,12 @@ pub fn init(
     ctx: &ExecutionEnvironment,
     GoogleDriveInitArgs { secrets_path }: GoogleDriveInitArgs,
 ) -> anyhow::Result<()> {
-    #[derive(Deserialize)]
-    struct Config {
-        installed: InstalledClient,
-    }
-    #[derive(Deserialize)]
-    struct InstalledClient {
-        client_id: String,
-        client_secret: String,
-    }
-
-    let f = File::open(secrets_path)?;
-    let parsed: Config = serde_json::from_reader(f)?;
-
-    let client_config = ClientConfig {
-        client_secret: parsed.installed.client_secret,
-        client_id: parsed.installed.client_id,
-    };
+    let secrets_bytes = std::fs::read(secrets_path)?;
+    let client_config = ClientConfig::try_from_json(&secrets_bytes)?;
+    let client = new_google_oauth_client(client_config.clone());
 
     // Login the user using the OAuth device flow
-    let (fat_token, refresh_token) = drive_api::oauth::sign_in(client_config.clone())?;
+    let (fat_token, refresh_token) = drive_api::oauth::sign_in(&client)?;
 
     // Store them in the database and return
     ctx.key_value_store.put(Cfg::BACKEND, THIS_BACKEND)?;

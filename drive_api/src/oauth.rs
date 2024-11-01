@@ -24,8 +24,32 @@ pub struct ClientConfig {
     pub client_id: String,
 }
 
+impl ClientConfig {
+    /// bytes must be a utf8 encoded json file with fields `installed/client_secret` and `installed/client_id`
+    /// that contain the OAuth client secret and OAuth client id. This file can be crated by hand or downloaded
+    /// from the google cloud console afrer creating a new Desktop OAuth Client at
+    /// [https://console.cloud.google.com/apis/credentials]
+    pub fn try_from_json(bytes: &[u8]) -> serde_json::Result<Self> {
+        #[derive(Deserialize)]
+        struct Config {
+            installed: InstalledClient,
+        }
+        #[derive(Deserialize)]
+        struct InstalledClient {
+            client_id: String,
+            client_secret: String,
+        }
+
+        let cfg: Config = serde_json::from_slice(bytes)?;
+        Ok(Self {
+            client_secret: cfg.installed.client_secret,
+            client_id: cfg.installed.client_id
+        })
+    }
+}
+
 /// oauth2 BasicClient with Google's AuthUrl, TokenUrl and RevocationUrl set.
-pub(crate) fn new_google_oauth_client(config: ClientConfig) -> BasicClient {
+pub fn new_google_oauth_client(config: ClientConfig) -> BasicClient {
     let client = BasicClient::new(
         ClientId::new(config.client_id),
         Some(ClientSecret::new(config.client_secret)),
@@ -38,7 +62,8 @@ pub(crate) fn new_google_oauth_client(config: ClientConfig) -> BasicClient {
     )
 }
 
-pub fn sign_in(client_config: ClientConfig) -> anyhow::Result<(FatAccessToken, RefreshToken)> {
+/// Use [new_google_oauth_client] to construct the client.
+pub fn sign_in(client: &BasicClient) -> anyhow::Result<(FatAccessToken, RefreshToken)> {
     // This is very much based on the example from the oauth2 crate
     // https://github.com/ramosbugs/oauth2-rs/blob/main/examples/google.rs
 
@@ -47,8 +72,7 @@ pub fn sign_in(client_config: ClientConfig) -> anyhow::Result<(FatAccessToken, R
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
 
-    let client = new_google_oauth_client(client_config);
-    let client = client.set_redirect_uri(
+    let client = client.clone().set_redirect_uri(
         RedirectUrl::new(format!("http://localhost:{}", port)).expect("invalid redirect url"),
     );
 
@@ -63,7 +87,7 @@ pub fn sign_in(client_config: ClientConfig) -> anyhow::Result<(FatAccessToken, R
         .add_extra_param("access_type", "offline")
         .url();
 
-    println!("Open this URL in your browser\n\n{}\n", authorize_url);
+    eprintln!("Open this URL in your browser\n\n{}\n", authorize_url);
 
     let (code, ret_csrf_token) = listen_for_code(listener).unwrap();
 

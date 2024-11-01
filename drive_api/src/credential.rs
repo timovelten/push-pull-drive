@@ -39,6 +39,23 @@ impl FatAccessToken {
         let now = OffsetDateTime::now_utc();
         self.expires <= now
     }
+
+    pub async fn try_from_refresh_token(client: &BasicClient, rt: &RefreshToken) -> anyhow::Result<Self> {
+        let now = OffsetDateTime::now_utc();
+        let token_response = client
+            .exchange_refresh_token(rt)
+            .request_async(oauth2::reqwest::async_http_client)
+            .await
+            .map_err(|e| anyhow!(e))?;
+
+        Ok(Self {
+            access_token: token_response.access_token().clone(),
+            expires: now
+                + token_response
+                    .expires_in()
+                    .expect("expires_in field exists"),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -129,24 +146,8 @@ impl GoogleCredentialImpl {
     }
 
     pub async fn refresh_token(&mut self) -> anyhow::Result<()> {
-        let now = OffsetDateTime::now_utc();
-        let token_response = self
-            .client
-            .exchange_refresh_token(&self.refresh_token)
-            .request_async(oauth2::reqwest::async_http_client)
-            .await
-            .map_err(|e| anyhow!(e))?;
-
-        let fat_token = FatAccessToken {
-            access_token: token_response.access_token().clone(),
-            expires: now
-                + token_response
-                    .expires_in()
-                    .expect("expires_in field exists"),
-        };
-
+        let fat_token = FatAccessToken::try_from_refresh_token(&self.client, &self.refresh_token).await?;
         self.token = Some(fat_token.clone());
-
         (self.callback)(fat_token);
 
         Ok(())
