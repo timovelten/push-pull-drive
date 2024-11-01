@@ -1,4 +1,3 @@
-use glob_match::glob_match;
 use rusqlite::types::FromSql;
 use rusqlite::ToSql;
 use std::borrow::Borrow;
@@ -230,10 +229,6 @@ impl RPath {
         self.inner.split(Self::SEP)
     }
 
-    pub fn matches_glob(&self, glob: &str) -> bool {
-        glob_match(glob, &self.inner)
-    }
-
     pub fn with_separator(&self, sep: char) -> Result<String, String> {
         let mut ret = String::new();
 
@@ -253,10 +248,6 @@ impl RPath {
         } else {
             Ok(ret)
         }
-    }
-
-    pub fn slice(&self, range: std::ops::Range<usize>) -> &Self {
-        Self::new(&self.inner[range])
     }
 
     /// This is the longest subpath of self (as defined by [Self::subpaths]) that is also

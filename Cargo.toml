@@ -51,7 +51,6 @@ crossterm = "0.27.0"
 console-subscriber = "0.2.0"
 walkdir = "2.5.0"
 tempfile = "3.10.1"
-glob-match = "0.2.1"
 delegate = "0.12.0"
 static_assertions = "1.1.0"
 
