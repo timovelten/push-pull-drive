@@ -42,11 +42,7 @@ impl FileRepository for GDriveRepo {
         to self.inner {
             async fn read_dir(&self, path: &RPath, up_to_depth: u32) -> Result<Vec<PathInfo>>;
 
-            async fn get_metadata(&self, path: &RPath) -> Result<PathInfo>;
-
             async fn delete_file(&self, path: &RPath) -> Result<()>;
-
-            async fn set_modified_time(&self, path: &RPath, modtime: time::OffsetDateTime) -> Result<()>;
 
             async fn write_file<R: AsyncReader>(
                 &self,

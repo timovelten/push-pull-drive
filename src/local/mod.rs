@@ -19,7 +19,6 @@ use std::{
     sync::Arc,
     thread::available_parallelism,
 };
-use time::OffsetDateTime;
 use tokio::fs::File as TokioFile;
 use tokio::{sync::Semaphore, task::spawn_blocking};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
@@ -348,25 +347,6 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
         Ok(())
     }
 
-    async fn set_modified_time(
-        &self,
-        cpath: &RPath,
-        modtime: OffsetDateTime,
-    ) -> FileRepositoryResult<()> {
-        let cpath = cpath.to_owned();
-        let local_path = self.config.get_local_path_from_rpath(&cpath);
-        spawn_blocking(move || {
-            let f = File::open(local_path).map_err(|err| map_io_error(err, &cpath))?;
-            f.set_modified(modtime.into()).map_err(as_other_error)?;
-
-            Ok::<_, FileRepositoryError>(())
-        })
-        .await
-        .unwrap()?;
-
-        Ok(())
-    }
-
     async fn read_dir(
         &self,
         cpath: &RPath,
@@ -419,22 +399,13 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
 
         Ok(ret)
     }
-
-    async fn get_metadata(&self, cpath: &RPath) -> FileRepositoryResult<PathInfo> {
-        let me = self.clone();
-        let cpath = cpath.to_owned();
-        let (info, _) = spawn_blocking(move || me.read_file_impl(cpath))
-            .await
-            .unwrap()?;
-
-        Ok(info)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures::io::Cursor;
+    use time::OffsetDateTime;
     use std::{any::Any, fs::OpenOptions, io::Write, path::Path};
 
     fn default_config(root_path: PathBuf) -> Config {
@@ -638,16 +609,9 @@ mod tests {
         let modtime_should_be = OffsetDateTime::now_utc();
         b.write_file(
             &RPathBuf::from(["dir", "that-does-not-exist", "somefile"]),
-            None,
+            Some(modtime_should_be),
             Cursor::new(&test_bytes),
             test_bytes.len() as u64,
-        )
-        .await
-        .unwrap();
-
-        b.set_modified_time(
-            &RPathBuf::from(["dir", "that-does-not-exist", "somefile"]),
-            modtime_should_be,
         )
         .await
         .unwrap();
@@ -708,7 +672,7 @@ mod tests {
         drop(f);
 
         let res = b
-            .get_metadata(&RPathBuf::from(["dir", "subdir", "test"]))
+            .read_file(&RPathBuf::from(["dir", "subdir", "test"]))
             .await;
 
         assert!(matches!(res, Err(FileRepositoryError::NotAllowed { .. })));
@@ -726,7 +690,7 @@ mod tests {
         std::fs::create_dir_all(&ignored_dir).unwrap();
 
         let res = b
-            .get_metadata(&RPathBuf::from(["dir", "subdir"]))
+            .read_file(&RPathBuf::from(["dir", "subdir"]))
             .await;
         assert!(matches!(res, Err(FileRepositoryError::NotAllowed { .. })));
     }
@@ -744,11 +708,8 @@ mod tests {
         let path: RPathBuf = ["test"].into();
         b.write_file(&path, None, &mut cursor, 2).await.unwrap();
 
-        let info = b.get_metadata(&path).await.unwrap();
-        match info {
-            PathInfo::File(file_info) => assert!(file_info.hash.is_empty()),
-            _ => panic!("Expected a file"),
-        };
+        let (info, _) = b.read_file(&path).await.unwrap();
+        assert!(info.hash.is_empty());
     }
 
     #[tokio::test]

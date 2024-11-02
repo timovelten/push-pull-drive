@@ -4,7 +4,6 @@ use futures::AsyncRead;
 use std::fmt::Debug;
 use std::future::Future;
 use thiserror::Error;
-use time::OffsetDateTime;
 
 #[derive(Debug, Error)]
 #[allow(dead_code)]
@@ -55,8 +54,6 @@ pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
         depth: u32,
     ) -> impl Future<Output = Result<Vec<PathInfo>>> + Send;
 
-    fn get_metadata(&self, rpath: &RPath) -> impl Future<Output = Result<PathInfo>> + Send;
-
     /// Read file with the given relative name. Return a reader and the file size in bytes.
     ///
     /// # Errors
@@ -91,12 +88,6 @@ pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
 
     /// Delete a file or a folder at `rpath` (including all subfolders, if necessary).
     fn delete_file(&self, path: &RPath) -> impl Future<Output = Result<()>> + Send;
-
-    fn set_modified_time(
-        &self,
-        relative_name: &RPath,
-        modtime: OffsetDateTime,
-    ) -> impl Future<Output = Result<()>> + Send;
 
     /// Deletes a directory at path (and all subdirectories it contains) if it contains no files. See [`Self::delete_file`].
     fn delete_orphaned_directory(&self, path: &RPath) -> impl Future<Output = Result<bool>> + Send {
