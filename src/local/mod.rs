@@ -144,7 +144,7 @@ impl<H: FileHasher> LocalBackend<H> {
                             FileRepositoryError::Other(err)
                         })?
                     } else {
-                        RPath::ROOT.to_owned()
+                        RPathBuf::empty()
                     };
 
                     let err = map_io_error(
@@ -448,7 +448,7 @@ mod tests {
     fn setup_read_dir_test() -> (LocalBackend, Vec<&'static str>, Vec<&'static str>, impl Any) {
         let tmp = tempfile::tempdir().unwrap();
         let config = Config {
-            ignore_prefixes: vec!["ignored".parse().unwrap()],
+            ignore_prefixes: vec![["ignored"].into()],
             ..default_config(tmp.path().to_owned())
         };
 
@@ -512,7 +512,7 @@ mod tests {
         let mut retrieved_files = vec![];
         let mut retrieved_directories = vec![];
 
-        let mut next_directories = vec![RPath::ROOT.to_owned()];
+        let mut next_directories = vec![RPath::empty().to_owned()];
         while let Some(relative_name) = next_directories.pop() {
             let path: RPathBuf = relative_name.try_into().unwrap();
 
@@ -540,7 +540,7 @@ mod tests {
     async fn read_dir_max_depth() {
         let (b, files_should_be, dirs_should_be, _drop_later) = setup_read_dir_test();
 
-        let retrieved = b.read_dir(RPath::ROOT, u32::MAX).await.unwrap();
+        let retrieved = b.read_dir(RPath::empty(), u32::MAX).await.unwrap();
 
         let mut retrieved_files = vec![];
         let mut retrieved_dirs = vec![];
@@ -571,7 +571,7 @@ mod tests {
 
         let test_bytes = (0..1_000_000u64).map(|x| x as u8).collect::<Vec<_>>();
 
-        let the_path: RPathBuf = "dir/subdir/a/b/somefile".parse().unwrap();
+        let the_path: RPathBuf = RPathBuf::from_components(["dir", "subdir", "a", "b", "somefile"]);
         let fpath = tmp.path().join("dir/subdir/a/b/somefile");
         let fdir = tmp.path().join("dir/subdir/a/b");
 
@@ -604,7 +604,7 @@ mod tests {
             ignore_prefixes: vec![RPathBuf::from_components(["dir", "subdir"])],
             ..default_config(tmp.path().to_owned())
         });
-        let path: RPathBuf = "dir/subdir/a/b/somefile".parse().unwrap();
+        let path: RPathBuf = RPathBuf::from_sep("dir/subdir/a/b/somefile", '/');
         let res = b.read_file(&path).await;
 
         let error = res.unwrap_err();
@@ -623,7 +623,7 @@ mod tests {
         // Test if we can write to ignored locations
         let x = b
             .write_file(
-                &"dir/we/ignore/subdir/test".parse::<RPathBuf>().unwrap(),
+                &RPathBuf::from(["dir", "we", "ignore", "subdir", "test"]),
                 None,
                 futures::io::empty(),
                 0,
@@ -637,9 +637,7 @@ mod tests {
 
         let modtime_should_be = OffsetDateTime::now_utc();
         b.write_file(
-            &"dir/that-does-not-exist/somefile"
-                .parse::<RPathBuf>()
-                .unwrap(),
+            &RPathBuf::from(["dir", "that-does-not-exist", "somefile"]),
             None,
             Cursor::new(&test_bytes),
             test_bytes.len() as u64,
@@ -648,9 +646,7 @@ mod tests {
         .unwrap();
 
         b.set_modified_time(
-            &"dir/that-does-not-exist/somefile"
-                .parse::<RPathBuf>()
-                .unwrap(),
+            &RPathBuf::from(["dir", "that-does-not-exist", "somefile"]),
             modtime_should_be,
         )
         .await
@@ -679,7 +675,7 @@ mod tests {
 
         let res = b
             .write_file(
-                &"dir/subdir/test".parse::<RPathBuf>().unwrap(),
+                &RPathBuf::from(["dir", "subdir", "test"]),
                 None,
                 futures::io::empty(),
                 0,
@@ -712,7 +708,7 @@ mod tests {
         drop(f);
 
         let res = b
-            .get_metadata(&"dir/subdir/test".parse::<RPathBuf>().unwrap())
+            .get_metadata(&RPathBuf::from(["dir", "subdir", "test"]))
             .await;
 
         assert!(matches!(res, Err(FileRepositoryError::NotAllowed { .. })));
@@ -730,7 +726,7 @@ mod tests {
         std::fs::create_dir_all(&ignored_dir).unwrap();
 
         let res = b
-            .get_metadata(&"dir/subdir".parse::<RPathBuf>().unwrap())
+            .get_metadata(&RPathBuf::from(["dir", "subdir"]))
             .await;
         assert!(matches!(res, Err(FileRepositoryError::NotAllowed { .. })));
     }
@@ -745,7 +741,7 @@ mod tests {
         });
 
         let mut cursor = Cursor::new(vec![0xde, 0xad]);
-        let path: RPathBuf = "test".parse().unwrap();
+        let path: RPathBuf = ["test"].into();
         b.write_file(&path, None, &mut cursor, 2).await.unwrap();
 
         let info = b.get_metadata(&path).await.unwrap();
@@ -780,7 +776,7 @@ mod tests {
 
         let result = b
             .write_file(
-                &"testdir/nested".parse::<RPathBuf>().unwrap(),
+                &RPathBuf::from(["testdir", "nested"]),
                 None,
                 futures::io::empty(),
                 0,
@@ -790,7 +786,7 @@ mod tests {
         let FileRepositoryError::IsADirectory { rpath } = result else {
             panic!("Unexpectedly got {:?}", result);
         };
-        assert_eq!(rpath, "testdir/nested".parse::<RPathBuf>().unwrap());
+        assert_eq!(rpath, ["testdir", "nested"].into());
     }
 
     #[tokio::test]
@@ -802,13 +798,13 @@ mod tests {
         });
 
         let result = b
-            .read_file(&"testdir/nested".parse::<RPathBuf>().unwrap())
+            .read_file(&RPathBuf::from(["testdir", "nested"]))
             .await
             .unwrap_err();
         let FileRepositoryError::IsADirectory { rpath } = result else {
             panic!("Unexpectedly got {:?}", result);
         };
-        assert_eq!(rpath, "testdir/nested".parse::<RPathBuf>().unwrap());
+        assert_eq!(rpath, ["testdir", "nested"].into());
     }
 
     #[tokio::test]
@@ -822,7 +818,7 @@ mod tests {
             ..default_config(tmp.path().to_owned())
         });
 
-        b.delete_file(&"testdir".parse::<RPathBuf>().unwrap())
+        b.delete_file(&RPathBuf::from_components(["testdir"]))
             .await
             .unwrap();
 

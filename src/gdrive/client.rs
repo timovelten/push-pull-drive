@@ -26,9 +26,7 @@ fn to_pathinfo(file: drive_api::File, path: RPathBuf) -> (Option<PathInfo>, Stri
             modified: file.modified_time,
             hash: hex_must_decode(sha1_checksum),
         }),
-        _ if file.is_folder() => PathInfo::Dir(DirectoryInfo {
-            rpath: path,
-        }),
+        _ if file.is_folder() => PathInfo::Dir(DirectoryInfo { rpath: path }),
         _ => return (None, file.id),
     };
 
@@ -42,9 +40,7 @@ fn to_fileinfo(file: drive_api::File, path: RPathBuf) -> Result<FileInfo> {
     match to_pathinfo(file, path.clone()).0 {
         Some(PathInfo::File(info)) => Ok(info),
         Some(PathInfo::Dir(DirectoryInfo { rpath })) => Err(Error::IsADirectory { rpath }),
-        None => Err(Error::NotAllowed {
-            rpath: path,
-        }),
+        None => Err(Error::NotAllowed { rpath: path }),
     }
 }
 
@@ -124,17 +120,17 @@ impl GDriveClient {
             .await
             .map_err(|err| Error::Other(err.into()))?;
         debug_assert_eq!(root_file.parents, None);
-        self.cache_file(RPath::ROOT, root_file.clone());
+        self.cache_file(&RPath::empty(), root_file.clone());
 
         if path.is_empty() {
             return Ok(root_file);
         }
 
-        let mut current_path = RPathBuf::new();
+        let mut current_path = RPathBuf::empty();
         let mut current_file = root_file;
 
         for subrpath in path.subpaths().skip(1) {
-            let next_file_name = subrpath.filename();
+            let next_file_name = subrpath.filename().unwrap();
 
             // At this point, "{current_rpath}/next_file_name" is the file were looking for.
             if !current_file.is_folder() {
@@ -205,10 +201,10 @@ impl GDriveClient {
                 Err(Error::NotFound { rpath: subpath }) => {
                     // We rely on the correct error here. It should return the "smallest" possible subpath that was not found
                     // (i.e. after chopping off the last bit from that path, the remaining path should be valid)
-
                     log::debug!("mkdir_all encountered a NotFound for {}", subpath);
 
-                    let (parent, name) = subpath.split_right();
+                    // This can only fail when subpath is empty. And the empty path should always be valid
+                    let (parent, name) = subpath.split_right().expect("subpath is not empty");
                     let parent_id = &self.drive_file_by_rpath_cached(parent).await?.id;
 
                     // subpath was not found, so create it!
@@ -282,7 +278,10 @@ impl GDriveClient {
         len: u64,
     ) -> Result<Arc<drive_api::File>> {
         // We need to create the file. For that, we need to place it in the right path
-        let (parent, filename) = path.split_right();
+        let (parent, filename) = path.split_right().ok_or_else(|| Error::IsADirectory {
+            rpath: path.to_owned(),
+        })?;
+        
         let parent_file = self.mkdir_all(parent).await?;
         let file = self
             .api_client
@@ -531,5 +530,3 @@ impl GDriveClient {
         Ok(ret)
     }
 }
-
-

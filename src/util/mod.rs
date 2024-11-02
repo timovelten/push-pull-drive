@@ -1,9 +1,10 @@
+use std::fmt::Display;
+
 mod async_read;
 mod shell;
 
 pub use async_read::InspectAsyncReader;
 pub use shell::*;
-use std::fmt::Display;
 
 pub struct WithoutNewlines<'a>(pub &'a str);
 

@@ -181,10 +181,17 @@ impl SqliteDatabase {
             // This solution relies on the fact that, by default, SQLITE just uses lexiocraphic order on the bytes
             // (by way of memcmp), and stores string as UTF-8 (a superset of ascii). This should avoid a full table scan
             // (if there is an index on the path).
-            let next_char_after_sep = char::from_u32(RPath::SEP as u32 + 1).unwrap();
+            let lower = prefix.serialize();
+
+            // Below we rely on the fact that lower is terminated by the separator char, and that the character
+            // immediatly after the sep char is 0.
+            let (lower_without_sep, sep) = lower.split_at(lower.len() - 1);
+            debug_assert_eq!(sep, "/");
+
             let params = named_params! {
-                ":lower": format!("{prefix}{}", RPath::SEP),
-                ":upper": format!("{prefix}{}", next_char_after_sep)
+                ":lower": lower,
+                // 0 (0x30) is the character immediatly following / (0xF) in ASCII
+                ":upper": format!("{}0", lower_without_sep)
             };
 
             db.prepare_cached(CONSTRAINED_QUERY)?
@@ -337,9 +344,6 @@ impl KeyValueStore for SqliteDatabase {
 #[cfg(test)]
 mod tests {
     use time::{macros::datetime, OffsetDateTime};
-
-    use crate::paths::RPath;
-
     use super::*;
 
     fn empty_in_memory_repository() -> SqliteDatabase {
@@ -367,7 +371,7 @@ mod tests {
     fn file_tracking() {
         let repo = empty_in_memory_repository();
 
-        let rpath = RPath::new("somedir/that/contains/file");
+        let rpath = &RPathBuf::from_components(["somedir", "that", "contains", "file"]);
         let res = repo.get_tracked_file(rpath).unwrap();
         assert!(res.is_none());
 
@@ -396,7 +400,7 @@ mod tests {
     fn update_sided_impl(side: Side) {
         let db = empty_in_memory_repository();
         let example_info = FileInfo {
-            rpath: "somedir/that/contains/file".parse().unwrap(),
+            rpath: ["somedir", "that", "contains", "file"].into(),
             size: 42,
             modified: datetime!(2019-12-01 0:00 UTC),
             hash: "sadjhasdjhg".to_owned().into_bytes(),
@@ -405,7 +409,7 @@ mod tests {
         db.update(example_info.clone(), side).unwrap();
 
         let retrieved = db
-            .get_all(&"somedir/that/contains".parse::<RPathBuf>().unwrap(), side)
+            .get_all(&RPathBuf::from(["somedir", "that", "contains"]), side)
             .unwrap()
             .into_iter()
             .next()
@@ -438,7 +442,7 @@ mod tests {
         let db = empty_in_memory_repository();
 
         let tf = TrackedFile {
-            path: RPath::single("test").to_owned(),
+            path: RPathBuf::empty(),
             size: 42, 
             modified: OffsetDateTime::UNIX_EPOCH,
             local_hash: vec![],
@@ -446,19 +450,24 @@ mod tests {
         };
 
         let tf1 = TrackedFile {
-            path: RPathBuf::from_components(["test", "file1"]),
+            path: RPathBuf::from_components(["test_ends_with_/", "file1_with_/"]),
             ..tf.clone()
         };
         let tf2 = TrackedFile {
-            path: RPathBuf::from_components(["test", "file2"]),
+            path: RPathBuf::from_components(["test_ends_with_/", "file2_with_\\and_/"]),
+            ..tf.clone()
+        };
+        let tf3 = TrackedFile {
+            path: RPathBuf::from_components(["test_ends_with//", "a_file"]),
             ..tf.clone()
         };
 
-        db.update_tracked_file(tf, None).unwrap();
         db.update_tracked_file(tf1.clone(), None).unwrap();
         db.update_tracked_file(tf2.clone(), None).unwrap();
+        db.update_tracked_file(tf3.clone(), None).unwrap();
 
-        let mut tfs = db.get_all_tracked_files(RPath::single("test"), |x| x)
+        let prefix = RPathBuf::from_components(["test_ends_with_/"]);
+        let mut tfs = db.get_all_tracked_files(&prefix, |x| x)
             .unwrap();
         tfs.sort_by(|x, y| x.path.cmp(&y.path));
 

@@ -12,7 +12,7 @@ use context::{find_context, ExecutionEnvironment, Context, Ctx};
 
 mod fileinfo;
 pub use fileinfo::*;
-use paths::RPath;
+use paths::RPathBuf;
 
 pub mod local;
 use crate::local::LocalBackend;
@@ -119,7 +119,7 @@ fn get_local_backend_config(root_dir: impl AsRef<Path>) -> local::Config {
     return local::Config {
         root_path: root_dir.as_ref().to_owned(),
         ignore_prefixes: vec![
-            RPath::single(crate::context::CONFIG_DIR).to_owned(),
+            RPathBuf::from_components([crate::context::CONFIG_DIR])
         ],
         calculate_hashes: true,
     };

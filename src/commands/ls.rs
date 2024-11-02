@@ -5,7 +5,7 @@ use std::io::Write;
 
 #[derive(clap::Args)]
 pub struct LsArgs {
-    path: Option<RPathBuf>,
+    path: Option<String>,
 
     #[arg(long)]
     depth: Option<u32>,
@@ -27,7 +27,9 @@ pub fn remote_ls(
 
     env.shell.print_transient("Reading directory...")?;
 
-    let path = env.wd().join(path.as_deref().unwrap_or(RPath::ROOT));
+    let path = path.map(|path| RPathBuf::from_sep(&path, '/'))
+        .unwrap_or(RPathBuf::empty());
+    let path = env.wd().join(&path);
     let mut contents = env
         .handle
         .block_on(remote.read_dir(&path, depth.unwrap_or(1)))?;

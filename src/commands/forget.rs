@@ -15,7 +15,7 @@ pub fn forget(ctx: &impl Context, ForgetArgs { path }: ForgetArgs) -> anyhow::Re
     let rpath = if path == "." {
         env.wd.to_owned()
     } else {
-        let tmp: RPathBuf = path.parse().unwrap();
+        let tmp: RPathBuf = RPathBuf::from_sep(&path, '/');
         env.wd.join(&tmp)
     };
 

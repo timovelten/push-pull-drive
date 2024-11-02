@@ -106,15 +106,9 @@ pub(super) struct PushPullFlow<A, B> {
 /// Find a common directory that is a prefix of all rpath in the slice. Note that this panics
 /// if the slice is empty. Also note that this
 fn common_rpath_directory_prefix(changes: &[FileChange]) -> &RPath {
-    if changes.is_empty() {
-        return RPath::ROOT
-    }
+    let mut common_prefix = RPath::empty();
 
-    // Make sure to start with a valid directory. That way, this will always return an actual directory
-    // even if called with twice the same path, or only one path.
-    let (mut common_prefix, _filename) = changes[0].rpath().split_right();
-
-    for change in &changes[1..] {
+    for change in changes {
         common_prefix = common_prefix.intersect(change.rpath());
     }
     common_prefix
@@ -579,7 +573,7 @@ mod test {
 
     fn f(s: &str) -> FileInfo {
         FileInfo {
-            rpath: s.parse().unwrap(),
+            rpath: RPathBuf::from_sep(s, '/'),
             size: 42,
             modified: OffsetDateTime::now_utc(),
             hash: Default::default(),
@@ -593,16 +587,16 @@ mod test {
             FileChange::New(f("documents/2024/letter")),
             FileChange::Modified(f("documents/2024/cv")),
             FileChange::Deleted {
-                rpath: "documents/template".parse().unwrap(),
+                rpath: ["documents", "template"].into(),
             },
             FileChange::New(f("videos/test/vid.mp4")),
             FileChange::New(f("videos/test/vid2.mkv")),
             FileChange::Modified(f("videos/test/another.mkv")),
             FileChange::Deleted {
-                rpath: "tmp/file1".parse().unwrap(),
+                rpath: ["tmp", "file1"].into(),
             },
             FileChange::Deleted {
-                rpath: "tmp/file2".parse().unwrap(),
+                rpath: ["tmp", "file2"].into(),
             },
         ];
         sort_filechanges(&mut ret);
@@ -628,7 +622,7 @@ mod test {
         ) else {
             panic!();
         };
-        assert_eq!(dst.rpath(), &*"documents/2024/letter".parse::<RPathBuf>().unwrap());
+        assert_eq!(dst.rpath(), &*RPathBuf::from(["documents", "2024", "letter"]));
     }
 
     #[test]
@@ -669,6 +663,6 @@ mod test {
         ) else {
             panic!()
         };
-        assert_eq!(file.rpath(), &*"documents/2024/cv".parse::<RPathBuf>().unwrap());
+        assert_eq!(file.rpath(), &*RPathBuf::from(["documents", "2024", "cv"]));
     }
 }
