@@ -96,15 +96,15 @@ impl RPathBuf {
     }
 
     pub fn deserialize(s: &str) -> Self {
-        println!("Deserializing {}", s);
-
         let mut ret = Self::empty();
         let mut current_component = Vec::new();
 
         let mut is_escaped = false;
+
+        // I benchmarked this, and this seems to be faster than the version I wrote
+        // up that used the optimized memchr to search for / or \
         for b in s.as_bytes().iter().copied() {
             // At this point is_escaped indicates whether the character b is escaped or not
-
             match (b, is_escaped) {
                 (c @ b'\\', true) | (c @ b'/', true) => {
                     current_component.push(c);
@@ -126,9 +126,8 @@ impl RPathBuf {
             }
         }
 
-        if !current_component.is_empty() {
-            ret.push(String::from_utf8(current_component).unwrap());
-        }
+        debug_assert!(current_component.is_empty());
+        assert!(!is_escaped, "Expected escaped character");
 
         ret
     }
@@ -358,6 +357,8 @@ impl<const N: usize, T: Into<String>> From<[T; N]> for RPathBuf {
 
 #[cfg(test)]
 mod test {
+    use rand::{distributions::Uniform, prelude::*, Rng};
+
     use super::*;
 
     #[test]
@@ -410,14 +411,6 @@ mod test {
     }
 
     #[test]
-    pub fn serialize_with_escapes() {
-        let rpath = RPathBuf::from_components(["test_with_/", "path_with//", "with_both_/_and_//"]);
-        let serialized = rpath.serialize();
-        assert!(serialized.ends_with('/'));
-        assert_eq!(RPathBuf::deserialize(&serialized), rpath);
-    }
-
-    #[test]
     pub fn serialize_ord() {
         // Sorting these, and sorting their serialized representations should give the same result
         let rpath1 = RPathBuf::from_components(["with_a_/", "dir1", "dir2", "file_with_/"]);
@@ -447,5 +440,37 @@ mod test {
     #[should_panic]
     pub fn illegally_escaped_char() {
         RPathBuf::deserialize("escpaing_the_wrong_character_\\a");
+    }
+
+    #[test]
+    #[should_panic]
+    pub fn ends_unexpected() {
+        RPathBuf::deserialize("there_should_be_at_least_one_more_char_\\");
+    }
+
+    fn random_path(alphabet: &[char], rng: &mut impl Rng) -> RPathBuf {
+        let mut ret = RPathBuf::empty();
+        let uniform = Uniform::new(0, alphabet.len());
+    
+        for _ in 0..8 {
+            let word = uniform
+                .sample_iter(&mut *rng)
+                .take(10)
+                .map(|i| alphabet[i])
+                .collect::<String>();
+            ret.push(word);
+        }
+
+        ret
+    }
+
+    #[test]
+    pub fn deserialize_inverts_serialize() {
+        let alphabet = "abcdef/\\".chars().collect::<Vec<_>>();
+        let mut rng = SmallRng::seed_from_u64(123456);
+        for _ in 0..1000 {
+            let path =  random_path(&alphabet, &mut rng);
+            assert_eq!(path, RPathBuf::deserialize(&path.serialize()));
+        }
     }
 }

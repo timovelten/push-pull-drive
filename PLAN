@@ -1,0 +1,11 @@
+FOR NOW: Ignore the mismatch between path based file systems and google drives data model.
+That is, we pretend as if google drive files are uniquely identified by their paths
+and as if google drive paths cant contain arbitrary characters (in particular, slashes)
+
+We figure that out later.
+
+1. Move towards letting the backend determine changes by itself. That is, the backend gets access to
+the currently tracked files, and returns a list of changes by itself
+
+2. Hide Google Drive API behind a "service" abstraction that we can actually provide a
+fake implementation for (we want to avoid having to implement the google drive query language!)

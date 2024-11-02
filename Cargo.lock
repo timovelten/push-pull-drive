@@ -1499,6 +1499,7 @@ dependencies = [
  "libc",
  "log",
  "pin-project-lite",
+ "rand",
  "rusqlite",
  "serde",
  "serde_json",
