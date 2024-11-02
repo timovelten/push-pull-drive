@@ -16,8 +16,6 @@ pub enum Error {
     IsADirectory { rpath: RPathBuf },
     #[error("Expected a directory, got something else. {rpath:?}.")]
     NotADirectory { rpath: RPathBuf },
-    #[error("Something else modified files and invalidated our state.")]
-    ConcurrentModification,
     #[error(transparent)]
     Other(anyhow::Error),
 }
@@ -66,7 +64,7 @@ pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
     ) -> impl Future<Output = Result<(FileInfo, Self::Reader)>> + Send;
 
     /// Read the given `src` reader to completion and write its contents to the given path name. Do note the following behavior (which more or less mimicks the behavior
-    // of `mkdir -p rpath_dir` and then writing the file on Linux):
+    /// of `mkdir -p rpath_dir` and then writing the file on Linux):
     ///
     /// - If a file exists at path, then it is overwritten by the contents of src.
     /// - If rpath is of the form base/filename AND base is the rpath of a directory, a file named filename is created

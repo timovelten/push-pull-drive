@@ -8,4 +8,5 @@ We figure that out later.
 the currently tracked files, and returns a list of changes by itself
 
 2. Hide Google Drive API behind a "service" abstraction that we can actually provide a
-fake implementation for (we want to avoid having to implement the google drive query language!)
+fake implementation for (we want to avoid having to implement the google drive query language!). Do this by "mocking" the struct
+using different using statements for cfg(test)
