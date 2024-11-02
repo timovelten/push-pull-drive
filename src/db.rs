@@ -1,4 +1,7 @@
-use crate::{paths::{RPath, RPathBuf}, FileInfo};
+use crate::{
+    paths::{RPath, RPathBuf},
+    FileInfo,
+};
 use anyhow::{bail, Context};
 use const_format::concatcp;
 use rusqlite::{named_params, Connection, OpenFlags, OptionalExtension, Row};
@@ -30,7 +33,7 @@ pub trait KeyValueStore: Send + Sync {
     fn must_get(&self, key: &str) -> anyhow::Result<String> {
         match self.get(key)? {
             Some(res) => Ok(res),
-            None => Err(anyhow::anyhow!("No value for key {key}"))
+            None => Err(anyhow::anyhow!("No value for key {key}")),
         }
     }
 }
@@ -54,9 +57,25 @@ pub struct TrackedFile {
     pub remote_hash: Vec<u8>,
 }
 
+impl TrackedFile {
+    fn from_row(row: &Row<'_>) -> rusqlite::Result<TrackedFile> {
+        Ok(TrackedFile {
+            path: row.get("rpath")?,
+            size: row.get("size")?,
+            modified: row.get("modified")?,
+            local_hash: row
+                .get::<_, Option<Vec<u8>>>("local_hash")?
+                .unwrap_or_default(),
+            remote_hash: row
+                .get::<_, Option<Vec<u8>>>("remote_hash")?
+                .unwrap_or_default(),
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct SqliteDatabase {
-    db: Mutex<Connection>,
+    raw: Mutex<RawConn>,
 }
 
 // I have thought quite a bit about whether there should be an async version of this API
@@ -71,7 +90,9 @@ pub struct SqliteDatabase {
 // my system.
 impl SqliteDatabase {
     pub fn new(c: Connection) -> Self {
-        Self { db: Mutex::new(c) }
+        Self {
+            raw: Mutex::new(RawConn::new(c)),
+        }
     }
 
     pub fn new_from_path<P: AsRef<Path>>(
@@ -82,29 +103,63 @@ impl SqliteDatabase {
         if !create_if_not_exists {
             flags.remove(OpenFlags::SQLITE_OPEN_CREATE);
         }
-        let connection = Connection::open_with_flags(&path, flags)?;
-        let ret = Self::new(connection);
+        let raw_conn = RawConn::new(Connection::open_with_flags(&path, flags)?);
 
         // Does the database there have a schema we recognize?
-        let v = ret.get_value("schema_version");
+        let v = raw_conn.get_value("schema_version");
         let (valid_schema, could_be_empty) = match v {
             Ok(Some(x)) if x == "1" => (true, false),
             Ok(Some(_)) => (false, false),
             _ => (false, true),
         };
 
-        if valid_schema {
-            Ok(ret)
-        } else if !create_if_not_exists {
+        if !valid_schema && !create_if_not_exists {
             bail!("Database at {:?} is invalid", path.as_ref());
         } else if !could_be_empty {
             bail!("Could not create database at {:?}. A database already exists there and is not empty.", path.as_ref())
         } else {
             // At this point, both create_if_not_exists and could_be_empty are true.
             // We just write the schema and are done
-            ret.write_schema()?;
-            Ok(ret)
+            raw_conn.write_schema()?;
         }
+
+        Ok(Self::new(raw_conn.into_connection()))
+    }
+
+    delegate::delegate! {
+        to self.raw.lock().unwrap() {
+            pub fn get_value(&self, key: &str) -> rusqlite::Result<Option<String>>;
+
+            pub fn put_value(&self, key: &str, value: &str) -> rusqlite::Result<()>;
+
+            pub fn update_tracked_file(&self, t: TrackedFile, side: Option<Side>) -> rusqlite::Result<()>;
+
+            pub fn delete_tracked_file(&self, path: &RPath) -> rusqlite::Result<()>;
+
+            pub fn get_all_tracked_files<T, F: Fn(TrackedFile) -> T>(
+                &self,
+                prefix: &RPath,
+                op: F,
+            ) -> rusqlite::Result<Vec<T>>;
+
+            #[allow(dead_code)]
+            pub fn get_tracked_file(&self, path: &RPath) -> rusqlite::Result<Option<TrackedFile>>;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RawConn {
+    conn: Connection,
+}
+
+impl RawConn {
+    fn new(c: Connection) -> Self {
+        Self { conn: c }
+    }
+
+    fn into_connection(self) -> Connection {
+        self.conn
     }
 
     fn write_schema(&self) -> anyhow::Result<()> {
@@ -131,35 +186,103 @@ impl SqliteDatabase {
             COMMIT;
         ";
 
-        Ok(self.db.lock().unwrap().execute_batch(SCHEMA)?)
+        Ok(self.conn.execute_batch(SCHEMA)?)
     }
 
-    fn tracked_file_from_row(row: &Row<'_>) -> rusqlite::Result<TrackedFile> {
-        Ok(TrackedFile {
-            path: row.get("rpath")?,
-            size: row.get("size")?,
-            modified: row.get("modified")?,
-            local_hash: row
-                .get::<_, Option<Vec<u8>>>("local_hash")?
-                .unwrap_or_default(),
-            remote_hash: row
-                .get::<_, Option<Vec<u8>>>("remote_hash")?
-                .unwrap_or_default(),
-        })
+    #[allow(dead_code)]
+    fn get_tracked_file(&self, path: &RPath) -> rusqlite::Result<Option<TrackedFile>> {
+        let res = self.conn.prepare_cached("SELECT rpath, size, modified, local_hash, remote_hash FROM tracked_files WHERE rpath = :rpath")?
+            .query_row(named_params! { ":rpath": path }, TrackedFile::from_row)
+            .optional()?;
+
+        Ok(res)
     }
 
-    //
-    // Here lie the functions that actually do the SQL. If you change a column name, look here!
-    // There is not that many, so it shouldn't be too hard. Also the tests probably save you.
-    //
+    /// If side is none, both remote_hash and local_hash are updated. If side == Some(Side::Local),
+    /// If side == Some(Side::Remote), then only the remote hash is updated.
+    fn update_tracked_file(&self, t: TrackedFile, side: Option<Side>) -> rusqlite::Result<()> {
+        // This is kind of horrible
+        match side {
+            None => {
+                let mut s = self.conn.prepare_cached(
+                    "INSERT OR REPLACE INTO tracked_files (rpath, size, modified, local_hash, remote_hash) VALUES (:rpath, :size, :modified, :local_hash, :remote_hash)"
+                )?;
+                s.execute(named_params! {
+                    ":rpath": t.path,
+                    ":size": t.size,
+                    ":modified": t.modified,
+                    ":local_hash": t.local_hash,
+                    ":remote_hash": t.remote_hash
+                })?;
+            }
+            Some(Side::Local) => {
+                let mut s = self.conn.prepare_cached(
+                    "INSERT OR REPLACE INTO tracked_files (rpath, size, modified, local_hash) VALUES (:rpath, :size, :modified, :local_hash)"
+                )?;
+                s.execute(named_params! {
+                    ":rpath": t.path,
+                    ":size": t.size,
+                    ":modified": t.modified,
+                    ":local_hash": t.local_hash
+                })?;
+            }
+            Some(Side::Remote) => {
+                let mut s = self.conn.prepare_cached(
+                    "INSERT OR REPLACE INTO tracked_files (rpath, size, modified, remote_hash) VALUES (:rpath, :size, :modified, :remote_hash)
+                ")?;
+                s.execute(named_params! {
+                    ":rpath": t.path,
+                    ":size": t.size,
+                    ":modified": t.modified,
+                    ":remote_hash": t.remote_hash
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn get_value(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT value FROM config WHERE key = :key")?;
+
+        let ret: Option<String> = stmt
+            .query_row(named_params! { ":key": key }, |row| row.get("value"))
+            .optional()?;
+
+        Ok(ret)
+    }
+
+    fn put_value(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("INSERT OR REPLACE INTO config VALUES (:key, :value)")?;
+
+        stmt.execute(named_params! { ":key": key, ":value": value})?;
+
+        Ok(())
+    }
+
+    /// This will not return an error if the specified entry does not exist.
+    fn delete_tracked_file(&self, path: &RPath) -> rusqlite::Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("DELETE FROM tracked_files WHERE rpath = :rpath")?;
+
+        stmt.execute(named_params! { ":rpath": path })?;
+
+        Ok(())
+    }
 
     /// Returns all tracked files with rpaths that start with the given prefix and an additional
     /// separator (i.e. if prefix == "test" then return all files that have rpath "test/**". Of course,
-    /// the real separator is a null byte currently) 
-    pub fn get_all_tracked_files<F, T>(&self, prefix: &RPath, op: F) -> rusqlite::Result<Vec<T>>
-    where
-        F: Fn(TrackedFile) -> T,
-    {
+    /// the real separator is a null byte currently)
+    fn get_all_tracked_files<T, F: Fn(TrackedFile) -> T>(
+        &self,
+        prefix: &RPath,
+        op: F,
+    ) -> rusqlite::Result<Vec<T>> {
         const QUERY: &str =
             "SELECT rpath, size, modified, local_hash, remote_hash FROM tracked_files";
         const CONSTRAINED_QUERY: &str =
@@ -174,8 +297,6 @@ impl SqliteDatabase {
         // "inside" SQLITE, but either way, this results in a full table scan, and hurts my heart)
         // 2) Figure out how to compile sqlite with the flag SQLITE_CASE_SENSITIVE_LIKE. This wouldn't be a bad option.
         // 3) Go with the kind of hacky (but well-defined!) solution we have chosen here.
-        let db = self.db.lock().unwrap();
-
         if !prefix.is_empty() {
             // Thanks to this person https://stackoverflow.com/a/20423673
             // This solution relies on the fact that, by default, SQLITE just uses lexiocraphic order on the bytes
@@ -194,100 +315,16 @@ impl SqliteDatabase {
                 ":upper": format!("{}0", lower_without_sep)
             };
 
-            db.prepare_cached(CONSTRAINED_QUERY)?
-                .query_map(params, |row| Self::tracked_file_from_row(row).map(&op))?
+            self.conn
+                .prepare_cached(CONSTRAINED_QUERY)?
+                .query_map(params, |row| TrackedFile::from_row(row).map(&op))?
                 .collect()
         } else {
-            db.prepare_cached(QUERY)?
-                .query_map((), |row| Self::tracked_file_from_row(row).map(&op))?
+            self.conn
+                .prepare_cached(QUERY)?
+                .query_map((), |row| TrackedFile::from_row(row).map(&op))?
                 .collect()
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn get_tracked_file(&self, path: &RPath) -> rusqlite::Result<Option<TrackedFile>> {
-        let db = self.db.lock().unwrap();
-        let res = db.prepare_cached("SELECT rpath, size, modified, local_hash, remote_hash FROM tracked_files WHERE rpath = :rpath")?
-            .query_row(named_params! { ":rpath": path }, Self::tracked_file_from_row)
-            .optional()?;
-
-        Ok(res)
-    }
-
-    /// If side is none, both remote_hash and local_hash are updated. If side == Some(Side::Local),
-    /// If side == Some(Side::Remote), then only the remote hash is updated.
-    pub fn update_tracked_file(&self, t: TrackedFile, side: Option<Side>) -> rusqlite::Result<()> {
-        let db = self.db.lock().unwrap();
-
-        // This is kind of horrible
-        match side {
-            None => {
-                let mut s = db.prepare_cached(
-                    "INSERT OR REPLACE INTO tracked_files (rpath, size, modified, local_hash, remote_hash) VALUES (:rpath, :size, :modified, :local_hash, :remote_hash)"
-                )?;
-                s.execute(named_params! {
-                    ":rpath": t.path,
-                    ":size": t.size,
-                    ":modified": t.modified,
-                    ":local_hash": t.local_hash,
-                    ":remote_hash": t.remote_hash
-                })?;
-            }
-            Some(Side::Local) => {
-                let mut s = db.prepare_cached(
-                    "INSERT OR REPLACE INTO tracked_files (rpath, size, modified, local_hash) VALUES (:rpath, :size, :modified, :local_hash)"
-                )?;
-                s.execute(named_params! {
-                    ":rpath": t.path,
-                    ":size": t.size,
-                    ":modified": t.modified,
-                    ":local_hash": t.local_hash
-                })?;
-            }
-            Some(Side::Remote) => {
-                let mut s = db.prepare_cached(
-                    "INSERT OR REPLACE INTO tracked_files (rpath, size, modified, remote_hash) VALUES (:rpath, :size, :modified, :remote_hash)
-                ")?;
-                s.execute(named_params! {
-                    ":rpath": t.path,
-                    ":size": t.size,
-                    ":modified": t.modified,
-                    ":remote_hash": t.remote_hash
-                })?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// This will not return an error if the specified entry does not exist.
-    pub fn delete_tracked_file(&self, path: &RPath) -> rusqlite::Result<()> {
-        let db = self.db.lock().unwrap();
-        let mut stmt = db.prepare_cached("DELETE FROM tracked_files WHERE rpath = :rpath")?;
-
-        stmt.execute(named_params! { ":rpath": path })?;
-
-        Ok(())
-    }
-
-    pub fn get_value(&self, key: &str) -> rusqlite::Result<Option<String>> {
-        let db = self.db.lock().unwrap();
-        let mut stmt = db.prepare_cached("SELECT value FROM config WHERE key = :key")?;
-
-        let ret: Option<String> = stmt
-            .query_row(named_params! { ":key": key }, |row| row.get("value"))
-            .optional()?;
-
-        Ok(ret)
-    }
-
-    pub fn put_value(&self, key: &str, value: &str) -> rusqlite::Result<()> {
-        let db = self.db.lock().unwrap();
-        let mut stmt = db.prepare_cached("INSERT OR REPLACE INTO config VALUES (:key, :value)")?;
-
-        stmt.execute(named_params! { ":key": key, ":value": value})?;
-
-        Ok(())
     }
 }
 
@@ -343,12 +380,12 @@ impl KeyValueStore for SqliteDatabase {
 
 #[cfg(test)]
 mod tests {
-    use time::{macros::datetime, OffsetDateTime};
     use super::*;
+    use time::{macros::datetime, OffsetDateTime};
 
     fn empty_in_memory_repository() -> SqliteDatabase {
         let r = SqliteDatabase::new(Connection::open_in_memory().unwrap());
-        r.write_schema().unwrap();
+        r.raw.lock().unwrap().write_schema().unwrap();
 
         r
     }
@@ -443,10 +480,10 @@ mod tests {
 
         let tf = TrackedFile {
             path: RPathBuf::empty(),
-            size: 42, 
+            size: 42,
             modified: OffsetDateTime::UNIX_EPOCH,
             local_hash: vec![],
-            remote_hash: vec![]
+            remote_hash: vec![],
         };
 
         let tf1 = TrackedFile {
@@ -467,8 +504,7 @@ mod tests {
         db.update_tracked_file(tf3.clone(), None).unwrap();
 
         let prefix = RPathBuf::from_components(["test_ends_with_/"]);
-        let mut tfs = db.get_all_tracked_files(&prefix, |x| x)
-            .unwrap();
+        let mut tfs = db.get_all_tracked_files(&prefix, |x| x).unwrap();
         tfs.sort_by(|x, y| x.path.cmp(&y.path));
 
         assert_eq!(tfs, [tf1, tf2]);
