@@ -1,19 +1,11 @@
 use core::str;
+use anyhow::bail;
 use rusqlite::types::{FromSql, ToSqlOutput};
 use rusqlite::ToSql;
 use std::borrow::Borrow;
 use std::fmt::Display;
 use std::ops::Deref;
-use std::path::{Path, PathBuf};
-use thiserror::Error;
-
-#[derive(Error, Debug)]
-pub enum TryFromPathError {
-    #[error("path needs to be absolute here")]
-    PathNotAbsolute(PathBuf),
-    #[error("{path:?} is not a subpath of {base:?}")]
-    PathIsNotSubpathOf { base: PathBuf, path: PathBuf },
-}
+use std::path::Path;
 
 #[derive(Clone, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
 pub struct RPathBuf {
@@ -57,12 +49,12 @@ impl RPathBuf {
     pub fn try_from_path<P: AsRef<Path>, Q: AsRef<Path>>(
         base_path: P,
         path: Q,
-    ) -> Result<Self, TryFromPathError> {
+    ) -> anyhow::Result<Self> {
         let base_path = base_path.as_ref();
         let path = path.as_ref();
 
         if !base_path.is_absolute() || !path.is_absolute() {
-            return Err(TryFromPathError::PathNotAbsolute(path.to_owned()));
+            bail!("{path:?} is not absolute");
         }
 
         let base_components = base_path
@@ -75,10 +67,7 @@ impl RPathBuf {
         for (a, b) in base_components.zip(components) {
             match a {
                 Some(a) if a != b => {
-                    return Err(TryFromPathError::PathIsNotSubpathOf {
-                        base: base_path.to_owned(),
-                        path: path.to_owned(),
-                    })
+                    bail!("The path {base_path:?} is not a subpath of {path:?}");
                 }
                 Some(_) => {}
                 None => {
