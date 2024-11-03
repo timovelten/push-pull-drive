@@ -1,3 +1,8 @@
+use anyhow::anyhow;
+use clap::{Parser, Subcommand};
+use env_logger::Target;
+use std::{fs::File, path::Path, sync::Arc};
+
 pub mod commands;
 use commands::{
     forget::{self, ForgetArgs},
@@ -25,11 +30,7 @@ pub use util::*;
 pub mod db;
 pub mod file_repository;
 pub mod gdrive;
-
-use anyhow::anyhow;
-use clap::{Parser, Subcommand};
-use env_logger::Target;
-use std::{fs::File, path::Path, sync::Arc};
+pub mod filetree;
 
 // Note that the level argument is implemented through the LevelFilter::from_str implementation.
 // Therefore, clap cannot possibly know all values (and therefore also cannot list them in the help).

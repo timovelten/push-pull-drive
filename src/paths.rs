@@ -29,7 +29,7 @@ impl RPathBuf {
     }
 
     /// This will panic if the iterator emits an empty string
-    pub fn from_components<'a, T: Into<String>, I: IntoIterator<Item = T>>(components: I) -> Self {
+    pub fn from_components<T: Into<String>, I: IntoIterator<Item = T>>(components: I) -> Self {
         let mut ret = Self::empty();
         for component in components {
             ret.push(component.into());
@@ -205,12 +205,17 @@ impl RPath {
     pub fn subpaths(&self) -> impl DoubleEndedIterator<Item = &RPath> {
         (0..=self.inner.len()).map(|i| {
             let new_components = &self.inner[0..i];
-            Self::new(&new_components)
+            Self::new(new_components)
         })
     }
 
     pub fn components(&self) -> impl DoubleEndedIterator<Item = &str> {
         self.inner.iter().map(|s| s.as_str())
+    }
+
+    /// Length is the number of components
+    pub fn len(&self) -> usize {
+        self.inner.len()
     }
 
     pub fn with_separator(&self, sep: char) -> Result<String, String> {

@@ -120,7 +120,7 @@ impl GDriveClient {
             .await
             .map_err(|err| Error::Other(err.into()))?;
         debug_assert_eq!(root_file.parents, None);
-        self.cache_file(&RPath::empty(), root_file.clone());
+        self.cache_file(RPath::empty(), root_file.clone());
 
         if path.is_empty() {
             return Ok(root_file);
