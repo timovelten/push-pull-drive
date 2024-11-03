@@ -6,7 +6,6 @@ use crate::FileInfo;
 use crate::{
     commands::status::status_of_dir,
     context::ExecutionEnvironment,
-    db::{Side, TrackedFilesRepository},
     file_repository::FileRepository,
     FileChange,
 };

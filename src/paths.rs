@@ -3,13 +3,19 @@ use anyhow::bail;
 use rusqlite::types::{FromSql, ToSqlOutput};
 use rusqlite::ToSql;
 use std::borrow::Borrow;
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 use std::ops::Deref;
 use std::path::Path;
 
-#[derive(Clone, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RPathBuf {
     inner: Vec<String>,
+}
+
+impl Debug for RPathBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Debug::fmt(self.as_rpath(), f)
+    }
 }
 
 impl RPathBuf {
@@ -148,10 +154,16 @@ impl ToOwned for RPath {
 }
 
 #[repr(transparent)]
-#[derive(Hash, PartialEq, Eq, Ord, PartialOrd, Debug)]
+#[derive(Hash, PartialEq, Eq, Ord, PartialOrd)]
 pub struct RPath {
     /// We consider it a logic error for any one String to be empty
     inner: [String],
+}
+
+impl Debug for RPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.serialize())
+    }
 }
 
 impl RPath {

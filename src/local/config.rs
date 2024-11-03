@@ -1,7 +1,4 @@
-use anyhow::anyhow;
-
 use crate::context::ExecutionEnvironment;
-
 use super::LocalBackend;
 
 const LOCAL_BACKEND: &str = "local";
@@ -15,8 +12,8 @@ pub struct LocalInitArgs {
 }
 
 pub fn init(ctx: &ExecutionEnvironment, args: LocalInitArgs) -> anyhow::Result<()> {
-    ctx.key_value_store.put(KEY_BACKEND, LOCAL_BACKEND)?;
-    ctx.key_value_store.put(KEY_LOCAL_PATH, &args.path)?;
+    ctx.db.put_value(KEY_BACKEND, LOCAL_BACKEND)?;
+    ctx.db.put_value(KEY_LOCAL_PATH, &args.path)?;
 
     Ok(())
 }
@@ -26,7 +23,7 @@ pub fn init(ctx: &ExecutionEnvironment, args: LocalInitArgs) -> anyhow::Result<(
 // only one hasher associated with it) as SHA1.
 
 pub fn load(ctx: &ExecutionEnvironment) -> anyhow::Result<Option<LocalBackend>> {
-    if ctx.key_value_store.get(KEY_BACKEND)?.as_deref() == Some(LOCAL_BACKEND) {
+    if ctx.db.get_value(KEY_BACKEND)?.as_deref() == Some(LOCAL_BACKEND) {
         Ok(Some(load_internal(ctx)?))
     } else {
         Ok(None)
@@ -37,13 +34,11 @@ fn load_internal(ctx: &ExecutionEnvironment) -> anyhow::Result<LocalBackend> {
     log::debug!("Loading local backend");
 
     let local_path = ctx
-        .key_value_store
-        .get(KEY_LOCAL_PATH)?
-        .ok_or_else(|| anyhow!("Expected to find {KEY_LOCAL_PATH}"))?;
+        .db
+        .must_get_value(KEY_LOCAL_PATH)?;
     let config = super::Config {
         root_path: local_path.into(),
-        ignore_prefixes: vec![],
-        calculate_hashes: true,
+        ignore_prefixes: vec![]
     };
     Ok(LocalBackend::from_config(config))
 }

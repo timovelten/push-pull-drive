@@ -7,6 +7,13 @@ pub enum Type {
     File,
 }
 
+/// We implement this trait for a bunch of types
+pub trait Node: core::fmt::Debug {
+    fn path(&self) -> &RPath;
+
+    fn typ(&self) -> Type;
+}
+
 /// Generally speaking, all of these operations should happen in the order defined by order
 /// and they may not be reordered arbitrarily.
 ///
@@ -14,98 +21,145 @@ pub enum Type {
 /// be swapped with other [`Self::UpdateFile`] and [`Self::CreateFile`] operations (i.e.
 /// it does not matter in what order the files are created or updated)
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone)]
-pub enum Patch {
-    DeleteFile(RPathBuf),
-    DeleteDir(RPathBuf),
-    UpdateDir(RPathBuf),
-    UpdateFile(RPathBuf),
-    CreateDir(RPathBuf),
-    CreateFile(RPathBuf),
+pub enum Patch<'a> {
+    DeleteFile(&'a RPath),
+    DeleteDir(&'a RPath),
+    UpdateDir(&'a RPath),
+    UpdateFile(&'a RPath),
+    CreateDir(&'a RPath),
+    CreateFile(&'a RPath),
 }
 
-impl Patch {
-    fn delete_from(node: &Node) -> Self {
-        match node.typ {
-            Type::Dir => Self::DeleteDir(node.path.clone()),
-            Type::File => Self::DeleteFile(node.path.clone()),
+impl<'a> Patch<'a> {
+    fn delete_from(node: &'a impl Node) -> Self {
+        match node.typ() {
+            Type::Dir => Self::DeleteDir(node.path()),
+            Type::File => Self::DeleteFile(node.path()),
         }
     }
 
-    fn create_from(node: &Node) -> Self {
-        match node.typ {
-            Type::Dir => Self::CreateDir(node.path.clone()),
-            Type::File => Self::CreateFile(node.path.clone()),
+    fn create_from(node: &'a impl Node) -> Self {
+        match node.typ() {
+            Type::Dir => Self::CreateDir(node.path()),
+            Type::File => Self::CreateFile(node.path()),
         }
     }
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
-struct Node {
-    path: RPathBuf,
-    typ: Type,
+pub struct FileTreeBuilder<T> {
+    nodes: Vec<T>,
+}
+
+impl<T: Node> FileTreeBuilder<T> {
+    pub fn new() -> Self {
+        Self {
+            nodes: Default::default(),
+        }
+    }
+
+    pub fn push(&mut self, node: T) {
+        self.nodes.push(node);
+    }
+
+    pub fn extend<I: IntoIterator<Item = T>>(&mut self, nodes: I) {
+        self.nodes.extend(nodes)
+    }
+
+    pub fn extended_with<I: IntoIterator<Item = T>>(mut self, nodes: I) -> Self {
+        self.nodes.extend(nodes);
+        self
+    }
+
+    pub fn build(self) -> anyhow::Result<FileTree<T>> {
+        let mut nodes = self.nodes;
+        nodes.sort_by(|a, b| a.path().cmp(&b.path()));
+
+        if nodes.is_empty() {
+            bail!("FileTree must not be empty")
+        }
+
+        // Count the number of distinct paths. Also make sure that all files are leafs (and have no children)
+        let root = &nodes[0];
+        for i in 0..(nodes.len() - 1) {
+            if nodes[i].path() == nodes[i + 1].path() {
+                bail!(
+                    "paths must be unique but the path {:?} appears twice",
+                    nodes[i].path()
+                )
+            }
+
+            let is_file_with_children =
+                nodes[i].typ() == Type::File && nodes[i + 1].path().starts_with(&nodes[i].path());
+            if is_file_with_children {
+                bail!(
+                    "the file {:?} has children, but fails may never have children",
+                    nodes[i].path()
+                )
+            }
+
+            ensure!(
+                nodes[i].path().starts_with(&root.path()),
+                "{:?} is not a child of root path {:?}",
+                nodes[i].path(),
+                root.path()
+            );
+        }
+
+        // Ensure that the first node
+
+        // Note that we do not guarantee that the root of the tree (i.e. nodes[0]) is a directory
+
+        Ok(FileTree { nodes })
+    }
 }
 
 #[derive(Clone)]
-pub struct FileTree {
+pub struct FileTree<T> {
     /// This list must not be modified, and the only way to construct it, is to use try from below.
     ///
     /// This ensures that the list is sorted properly, and that paths cannot appear twice.
-    nodes: Vec<Node>,
+    nodes: Vec<T>,
 }
 
-impl FileTree {
-    pub fn try_from(items: impl IntoIterator<Item = (RPathBuf, Type)>) -> anyhow::Result<Self> {
-        let mut nodes = Vec::new();
-        for (path, typ) in items {
-            let node = Node { path, typ };
-            nodes.push(node);
-        }
-
-        nodes.sort();
-
-        // Count the number of distinct paths
-        for i in 1..nodes.len() {
-            if nodes[i - 1].path == nodes[i].path {
-                bail!(
-                    "paths must be unique but the path {:?} appears twice",
-                    nodes[i].path
-                )
-            }
-        }
-
-        Ok(Self { nodes })
-    }
-
+impl<T: Node> FileTree<T> {
     fn get_index(&self, path: &RPath) -> Result<usize, usize> {
-        self.nodes.binary_search_by_key(&path, |node| &node.path)
+        self.nodes.binary_search_by_key(&path, |node| &node.path())
     }
 
-    fn all_children<'a>(&'a self, path: &'a RPath) -> impl Iterator<Item = &'a Node> + 'a {
+    fn all_children<'a>(&'a self, path: &'a RPath) -> impl Iterator<Item = &'a T> + 'a {
         // If path is not in the list, return no elements. This somewhat awkward construction does
         // just that.
         self.get_index(path)
             .map(|idx| {
                 self.nodes[idx + 1..]
                     .iter()
-                    .take_while(move |node| node.path.starts_with(path))
+                    .take_while(move |node| node.path().starts_with(path))
             })
             .into_iter()
             .flatten()
     }
 
-    fn children<'a>(&'a self, path: &'a RPath) -> impl Iterator<Item = &'a Node> + 'a {
+    fn children<'a>(&'a self, path: &'a RPath) -> impl Iterator<Item = &'a T> + 'a {
         self.all_children(path)
-            .filter(|node| node.path.len() == path.len() + 1)
+            .filter(|node| node.path().len() == path.len() + 1)
+    }
+
+    fn root(&self) -> &T {
+        &self.nodes[0]
+    }
+
+    fn len(&self) -> usize {
+        self.nodes.len()
     }
 
     fn count_reachable_nodes(&self) -> usize {
-        fn f(tree: &FileTree, path: &RPath) -> usize {
+        fn f<D: Node>(tree: &FileTree<D>, path: &RPath) -> usize {
             // Count the node at path itself
             let mut ret = 1;
 
             for child in tree.children(path) {
-                ret += match child.typ {
-                    Type::Dir => f(tree, &child.path),
+                ret += match child.typ() {
+                    Type::Dir => f(tree, &child.path()),
                     Type::File => 1,
                 };
             }
@@ -113,15 +167,7 @@ impl FileTree {
             ret
         }
 
-        f(self, self.root())
-    }
-
-    fn root(&self) -> &RPath {
-        &self.nodes[0].path
-    }
-
-    fn len(&self) -> usize {
-        self.nodes.len()
+        f(self, self.root().path())
     }
 }
 
@@ -132,12 +178,15 @@ impl FileTree {
 /// done to the right tree in order for it to match the left tree.
 ///
 /// We guarantee that the list of patches is sorted.
-pub fn diff(new: &FileTree, old: &FileTree) -> anyhow::Result<Vec<Patch>> {
+pub fn diff<'a, A: Node, B: Node>(
+    new: &'a FileTree<A>,
+    old: &'a FileTree<B>,
+) -> anyhow::Result<Vec<Patch<'a>>> {
     ensure!(
-        new.root() == new.root(),
+        new.root().path() == new.root().path(),
         "roots of filetrees do not match {} vs {}",
-        new.root(),
-        old.root()
+        new.root().path(),
+        old.root().path()
     );
     ensure!(
         new.count_reachable_nodes() == new.len(),
@@ -148,7 +197,12 @@ pub fn diff(new: &FileTree, old: &FileTree) -> anyhow::Result<Vec<Patch>> {
         "right tree is not connected"
     );
 
-    fn f(path: &RPath, new_tree: &FileTree, old_tree: &FileTree, patches: &mut Vec<Patch>) {
+    fn f<'a, A: Node, B: Node>(
+        path: &'a RPath,
+        new_tree: &'a FileTree<A>,
+        old_tree: &'a FileTree<B>,
+        patches: &mut Vec<Patch<'a>>,
+    ) {
         // Invariant: path exists in new_tree and may or may not exist in old_tree.
 
         // Both of these are sorted. If path does not exist in the old tree, ys will be empty
@@ -156,26 +210,26 @@ pub fn diff(new: &FileTree, old: &FileTree) -> anyhow::Result<Vec<Patch>> {
         let mut ys = old_tree.children(path).peekable();
 
         for x in xs {
-            while let Some(y) = ys.next_if(|y| *y < x) {
+            while let Some(y) = ys.next_if(|y| y.path() < x.path()) {
                 patches.push(Patch::delete_from(y));
             }
 
             // At this point the "top" (xs.peek()) of x is smaller than all elements in ys
-            if let Some(y) = ys.next_if(|y| y.path == x.path) {
-                match (x.typ, y.typ) {
+            if let Some(y) = ys.next_if(|y| y.path() == x.path()) {
+                match (x.typ(), y.typ()) {
                     (Type::Dir, Type::Dir) => {
-                        patches.push(Patch::UpdateDir(x.path.clone()));
+                        patches.push(Patch::UpdateDir(x.path()));
                     }
                     (Type::File, Type::File) => {
-                        patches.push(Patch::UpdateFile(x.path.clone()));
+                        patches.push(Patch::UpdateFile(x.path()));
                     }
                     (Type::Dir, Type::File) => {
-                        patches.push(Patch::DeleteFile(x.path.clone()));
-                        patches.push(Patch::CreateDir(x.path.clone()));
+                        patches.push(Patch::DeleteFile(x.path()));
+                        patches.push(Patch::CreateDir(x.path()));
                     }
                     (Type::File, Type::Dir) => {
-                        patches.push(Patch::DeleteDir(x.path.clone()));
-                        patches.push(Patch::CreateFile(x.path.clone()));
+                        patches.push(Patch::DeleteDir(x.path()));
+                        patches.push(Patch::CreateFile(x.path()));
                     }
                 }
             } else {
@@ -185,8 +239,8 @@ pub fn diff(new: &FileTree, old: &FileTree) -> anyhow::Result<Vec<Patch>> {
             }
 
             // If this is a directory, keep going
-            if x.typ == Type::Dir {
-                f(&x.path, new_tree, old_tree, patches)
+            if x.typ() == Type::Dir {
+                f(&x.path(), new_tree, old_tree, patches)
             }
         }
 
@@ -198,7 +252,7 @@ pub fn diff(new: &FileTree, old: &FileTree) -> anyhow::Result<Vec<Patch>> {
 
     let mut patches = Vec::new();
 
-    f(old.root(), new, old, &mut patches);
+    f(old.root().path(), new, old, &mut patches);
 
     patches.sort();
     Ok(patches)
@@ -207,127 +261,165 @@ pub fn diff(new: &FileTree, old: &FileTree) -> anyhow::Result<Vec<Patch>> {
 #[cfg(test)]
 mod test {
     use crate::{
-        filetree::{diff, FileTree, Patch},
+        assert_equal_when_sorted,
+        filetree::{diff, FileTree, FileTreeBuilder, Patch},
         paths::RPathBuf,
     };
 
-    use super::Type;
+    use super::{Node, Type};
 
-    fn file<const N: usize>(p: [&'static str; N]) -> (RPathBuf, Type) {
-        (p.into(), Type::File)
+    #[derive(Debug)]
+    enum Nd {
+        File(RPathBuf),
+        Dir(RPathBuf),
     }
 
-    fn dir<const N: usize>(p: [&'static str; N]) -> (RPathBuf, Type) {
-        (p.into(), Type::Dir)
+    impl Nd {
+        fn file(p: impl Into<RPathBuf>) -> Self {
+            Self::File(p.into())
+        }
+
+        fn dir(p: impl Into<RPathBuf>) -> Self {
+            Self::Dir(p.into())
+        }
+
+        fn root() -> Self {
+            Self::Dir(RPathBuf::empty())
+        }
+    }
+
+    impl Node for Nd {
+        fn path(&self) -> &crate::paths::RPath {
+            match self {
+                Self::Dir(path) => path,
+                Self::File(path) => path,
+            }
+        }
+
+        fn typ(&self) -> Type {
+            match self {
+                Self::Dir(path) => Type::Dir,
+                Self::File(path) => Type::File,
+            }
+        }
+    }
+
+    // That this works at all is kind of a mircale (that the reference lives long enough).
+    // If it didn't we maybe would have had to leak the array or something...
+    macro_rules! patch {
+        ($ty:ident; $($elem:expr),*) => {
+               Patch::$ty(&RPathBuf::from([$($elem),*]))
+        };
     }
 
     #[test]
     fn reachability_works() {
-        let left = FileTree::try_from([
-            file(["dir", "file"]),
-            file(["dir", "file2"]),
-            dir(["dir"]),
-            file(["dir", "dir2", "file"]),
-            dir(["dir", "dir2", "file2"]),
-        ])
-        .unwrap();
+        let left = FileTreeBuilder::new()
+            .extended_with([
+                Nd::root(),
+                Nd::dir(["dir"]),
+                Nd::file(["dir", "file"]),
+                Nd::file(["dir", "file2"]),
+                Nd::file(["dir2", "file1"]),
+                Nd::file(["dir2", "file2"]),
+            ])
+            .build()
+            .unwrap();
 
-        println!("{:?}", left.nodes);
-
-        for child in left.children(left.root()) {
-            println!("{:?}", child);
-        }
-
-        assert_eq!(left.count_reachable_nodes(), 3);
-    }
-
-    fn assert_equals_unordered<T: Ord + Clone + core::fmt::Debug>(a: &[T], b: &[T]) {
-        let mut a = Vec::from(a);
-        let mut b = Vec::from(b);
-        a.sort();
-        b.sort();
-
-        assert_eq!(a, b)
+        assert_eq!(left.count_reachable_nodes(), 4);
     }
 
     #[test]
     fn basic_test() {
-        let a = FileTree::try_from([dir([]), file(["a_movie"]), file(["some document"])]).unwrap();
+        let a = FileTreeBuilder::new()
+            .extended_with([
+                Nd::root(),
+                Nd::file(["a_movie"]),
+                Nd::file(["some document"]),
+            ])
+            .build()
+            .unwrap();
 
-        let b = FileTree::try_from([
-            dir([]),
-            file(["some other document"]),
-            file(["a_movie"]),
-            file(["old picture"]),
-        ])
-        .unwrap();
+        let b = FileTreeBuilder::new()
+            .extended_with([
+                Nd::root(),
+                Nd::file(["some other document"]),
+                Nd::file(["a_movie"]),
+                Nd::file(["old picture"]),
+            ])
+            .build()
+            .unwrap();
 
         let patches = diff(&a, &b).unwrap();
-        assert_equals_unordered(
+        assert_equal_when_sorted(
             &patches,
             &[
-                Patch::UpdateFile(["a_movie"].into()),
-                Patch::DeleteFile(["old picture"].into()),
-                Patch::DeleteFile(["some other document"].into()),
-                Patch::CreateFile(["some document"].into()),
+                patch!(UpdateFile; "a_movie"),
+                patch!(DeleteFile; "old picture"),
+                patch!(DeleteFile; "some other document"),
+                patch!(CreateFile; "some document"),
             ],
         );
 
         let patches = diff(&b, &a).unwrap();
-        assert_equals_unordered(
+        assert_equal_when_sorted(
             &patches,
             &[
-                Patch::UpdateFile(["a_movie"].into()),
-                Patch::DeleteFile(["some document"].into()),
-                Patch::CreateFile(["some other document"].into()),
-                Patch::CreateFile(["old picture"].into()),
+                patch!(UpdateFile; "a_movie"),
+                patch!(DeleteFile; "some document"),
+                patch!(CreateFile; "some other document"),
+                patch!(CreateFile; "old picture"),
             ],
         );
     }
 
     #[test]
     fn folder_turns_into_file() {
-        let a = FileTree::try_from([
-            dir([]),
-            dir(["2013"]),
-            dir(["2012"]),
-            dir(["2012", "invoices"]),
-            file(["2013", "readme"]),
-            file(["2012", "invoices", "invoice 1"]),
-            file(["2012", "invoices", "invoice 2"]),
-        ])
-        .unwrap();
+        let a = FileTreeBuilder::new()
+            .extended_with([
+                Nd::root(),
+                Nd::dir(["2013"]),
+                Nd::dir(["2012"]),
+                Nd::dir(["2012", "invoices"]),
+                Nd::file(["2013", "readme"]),
+                Nd::file(["2012", "invoices", "invoice 1"]),
+                Nd::file(["2012", "invoices", "invoice 2"]),
+            ])
+            .build()
+            .unwrap();
 
-        let b = FileTree::try_from([
-            dir([]),
-            dir(["2013"]),
-            file(["2013", "readme"]),
-            file(["2012"]),
-        ])
-        .unwrap();
+        let b = FileTreeBuilder::new()
+            .extended_with([
+                Nd::root(),
+                Nd::dir(["2013"]),
+                Nd::file(["2013", "readme"]),
+                Nd::file(["2012"]),
+            ])
+            .build()
+            .unwrap();
 
         let patches = diff(&b, &a).unwrap();
-        assert_equals_unordered(
+        assert_equal_when_sorted(
             &patches,
             &[
-                Patch::UpdateDir(["2013"].into()),
-                Patch::UpdateFile(["2013", "readme"].into()),
-                Patch::DeleteDir(["2012"].into()),
-                Patch::CreateFile(["2012"].into()),
+                patch!(UpdateDir; "2013"),
+                patch!(UpdateFile; "2013", "readme"),
+                patch!(DeleteDir; "2012"),
+                patch!(CreateFile; "2012"),
             ],
         );
 
         let patches = diff(&a, &b).unwrap();
-        assert_equals_unordered(
+        assert_equal_when_sorted(
             &patches,
             &[
-                Patch::UpdateDir(["2013"].into()),
-                Patch::UpdateFile(["2013", "readme"].into()),
-                Patch::DeleteFile(["2012"].into()),
-                Patch::CreateDir(["2012"].into()),
-                Patch::CreateDir(["2012", "invoices"].into()),
-                Patch::CreateFile(["2012", "invoices", "invoice 1"].into()),
-                Patch::CreateFile(["2012", "invoices", "invoice 2"].into()),
+                patch!(UpdateDir; "2013"),
+                patch!(UpdateFile; "2013", "readme"),
+                patch!(DeleteFile; "2012"),
+                patch!(CreateDir; "2012"),
+                patch!(CreateDir; "2012", "invoices"),
+                patch!(CreateFile; "2012", "invoices", "invoice 1"),
+                patch!(CreateFile; "2012", "invoices", "invoice 2"),
             ],
         );
     }

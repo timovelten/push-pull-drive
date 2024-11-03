@@ -1,75 +1,37 @@
 use crate::{
+    filetree::{self},
     paths::{RPath, RPathBuf},
-    FileInfo,
 };
-use anyhow::{bail, Context};
-use const_format::concatcp;
-use rusqlite::{named_params, Connection, OpenFlags, OptionalExtension, Row};
-use static_assertions::assert_obj_safe;
+use anyhow::bail;
+use rusqlite::{named_params, types::Null, Connection, OpenFlags, OptionalExtension, Row};
 use std::{path::Path, sync::Mutex};
 
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub enum Side {
-    Local,
-    Remote,
+// TODO: Track extra metadata per backend. In particular, hashes
+#[derive(Debug, PartialEq, Eq, Clone, Hash, PartialOrd, Ord)]
+pub enum Tracked {
+    Dir {
+        path: RPathBuf,
+    },
+    File {
+        path: RPathBuf,
+        size: u64,
+        modified: time::OffsetDateTime,
+    },
 }
 
-impl std::ops::Not for Side {
-    type Output = Side;
-
-    fn not(self) -> Self::Output {
+impl filetree::Node for Tracked {
+    fn path(&self) -> &RPath {
         match self {
-            Side::Local => Side::Remote,
-            Side::Remote => Side::Local,
+            Self::Dir { path } => &path,
+            Self::File { path, .. } => &path,
         }
     }
-}
 
-pub trait KeyValueStore: Send + Sync {
-    fn get(&self, key: &str) -> anyhow::Result<Option<String>>;
-
-    fn put(&self, key: &str, value: &str) -> anyhow::Result<()>;
-
-    fn must_get(&self, key: &str) -> anyhow::Result<String> {
-        match self.get(key)? {
-            Some(res) => Ok(res),
-            None => Err(anyhow::anyhow!("No value for key {key}")),
+    fn typ(&self) -> filetree::Type {
+        match self {
+            Self::Dir { .. } => filetree::Type::Dir,
+            Self::File { .. } => filetree::Type::File,
         }
-    }
-}
-assert_obj_safe!(KeyValueStore);
-
-pub trait TrackedFilesRepository: Send + Sync {
-    fn update(&self, info: FileInfo, side: Side) -> anyhow::Result<()>;
-
-    fn get_all(&self, dir_path: &RPath, side: Side) -> anyhow::Result<Vec<FileInfo>>;
-
-    fn delete(&self, path: &RPath) -> anyhow::Result<()>;
-}
-assert_obj_safe!(TrackedFilesRepository);
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct TrackedFile {
-    pub path: RPathBuf,
-    pub size: u64,
-    pub modified: time::OffsetDateTime,
-    pub local_hash: Vec<u8>,
-    pub remote_hash: Vec<u8>,
-}
-
-impl TrackedFile {
-    fn from_row(row: &Row<'_>) -> rusqlite::Result<TrackedFile> {
-        Ok(TrackedFile {
-            path: row.get("rpath")?,
-            size: row.get("size")?,
-            modified: row.get("modified")?,
-            local_hash: row
-                .get::<_, Option<Vec<u8>>>("local_hash")?
-                .unwrap_or_default(),
-            remote_hash: row
-                .get::<_, Option<Vec<u8>>>("remote_hash")?
-                .unwrap_or_default(),
-        })
     }
 }
 
@@ -132,18 +94,25 @@ impl SqliteDatabase {
 
             pub fn put_value(&self, key: &str, value: &str) -> rusqlite::Result<()>;
 
-            pub fn update_tracked_file(&self, t: TrackedFile, side: Option<Side>) -> rusqlite::Result<()>;
+            pub fn update_tracked(&self, tracked: &Tracked) -> rusqlite::Result<()>;
 
-            pub fn delete_tracked_file(&self, path: &RPath) -> rusqlite::Result<()>;
+            pub fn delete_tracked(&self, path: &RPath) -> rusqlite::Result<()>;
 
-            pub fn get_all_tracked_files<T, F: Fn(TrackedFile) -> T>(
+            pub fn get_all_tracked(
                 &self,
-                prefix: &RPath,
-                op: F,
-            ) -> rusqlite::Result<Vec<T>>;
+                prefix: &RPath
+            ) -> rusqlite::Result<Vec<Tracked>>;
 
             #[allow(dead_code)]
-            pub fn get_tracked_file(&self, path: &RPath) -> rusqlite::Result<Option<TrackedFile>>;
+            pub fn get_tracked_file(&self, path: &RPath) -> rusqlite::Result<Option<Tracked>>;
+        }
+    }
+
+    /// Convenience method
+    pub fn must_get_value(&self, key: &str) -> anyhow::Result<String> {
+        match self.get_value(key)? {
+            Some(res) => Ok(res),
+            None => Err(anyhow::anyhow!("No value for key {key}")),
         }
     }
 }
@@ -166,13 +135,12 @@ impl RawConn {
         const SCHEMA: &str = r"
             BEGIN;
             DROP TABLE IF EXISTS tracked_files;
-            CREATE TABLE tracked_files (
-                rpath 	        BLOB,
+            CREATE TABLE tracked (
+                path 	        BLOB,
+                type            INTEGER,
                 size    		INTEGER,
                 modified		DATETIME,
-                local_hash      BLOB,
-                remote_hash     BLOB,
-                PRIMARY KEY (rpath)
+                PRIMARY KEY (path)
             );
             
             DROP TABLE IF EXISTS config;
@@ -187,59 +155,6 @@ impl RawConn {
         ";
 
         Ok(self.conn.execute_batch(SCHEMA)?)
-    }
-
-    #[allow(dead_code)]
-    fn get_tracked_file(&self, path: &RPath) -> rusqlite::Result<Option<TrackedFile>> {
-        let res = self.conn.prepare_cached("SELECT rpath, size, modified, local_hash, remote_hash FROM tracked_files WHERE rpath = :rpath")?
-            .query_row(named_params! { ":rpath": path }, TrackedFile::from_row)
-            .optional()?;
-
-        Ok(res)
-    }
-
-    /// If side is none, both remote_hash and local_hash are updated. If side == Some(Side::Local),
-    /// If side == Some(Side::Remote), then only the remote hash is updated.
-    fn update_tracked_file(&self, t: TrackedFile, side: Option<Side>) -> rusqlite::Result<()> {
-        // This is kind of horrible
-        match side {
-            None => {
-                let mut s = self.conn.prepare_cached(
-                    "INSERT OR REPLACE INTO tracked_files (rpath, size, modified, local_hash, remote_hash) VALUES (:rpath, :size, :modified, :local_hash, :remote_hash)"
-                )?;
-                s.execute(named_params! {
-                    ":rpath": t.path,
-                    ":size": t.size,
-                    ":modified": t.modified,
-                    ":local_hash": t.local_hash,
-                    ":remote_hash": t.remote_hash
-                })?;
-            }
-            Some(Side::Local) => {
-                let mut s = self.conn.prepare_cached(
-                    "INSERT OR REPLACE INTO tracked_files (rpath, size, modified, local_hash) VALUES (:rpath, :size, :modified, :local_hash)"
-                )?;
-                s.execute(named_params! {
-                    ":rpath": t.path,
-                    ":size": t.size,
-                    ":modified": t.modified,
-                    ":local_hash": t.local_hash
-                })?;
-            }
-            Some(Side::Remote) => {
-                let mut s = self.conn.prepare_cached(
-                    "INSERT OR REPLACE INTO tracked_files (rpath, size, modified, remote_hash) VALUES (:rpath, :size, :modified, :remote_hash)
-                ")?;
-                s.execute(named_params! {
-                    ":rpath": t.path,
-                    ":size": t.size,
-                    ":modified": t.modified,
-                    ":remote_hash": t.remote_hash
-                })?;
-            }
-        }
-
-        Ok(())
     }
 
     fn get_value(&self, key: &str) -> rusqlite::Result<Option<String>> {
@@ -264,13 +179,77 @@ impl RawConn {
         Ok(())
     }
 
-    /// This will not return an error if the specified entry does not exist.
-    fn delete_tracked_file(&self, path: &RPath) -> rusqlite::Result<()> {
+    #[allow(dead_code)]
+    fn get_tracked_file(&self, path: &RPath) -> rusqlite::Result<Option<Tracked>> {
         let mut stmt = self
             .conn
-            .prepare_cached("DELETE FROM tracked_files WHERE rpath = :rpath")?;
+            .prepare_cached("SELECT * FROM tracked WHERE path = ?1")?;
 
-        stmt.execute(named_params! { ":rpath": path })?;
+        let mut row = stmt.query((path,))?;
+        match row.next()? {
+            Some(row) => {
+                let tf = Self::tracked_file_from_row(row)?;
+                Ok(Some(tf))
+            }
+            None => Ok(None),
+        }
+        // Note: rows should not (and cannot, at least in theory, contain more rows. We do not
+        // explicitly check for this)
+    }
+
+    /// This will not return an error if the specified entry does not exist.
+    fn delete_tracked(&self, path: &RPath) -> rusqlite::Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("DELETE FROM tracked WHERE path = ?1")?;
+
+        stmt.execute((path,))?;
+
+        Ok(())
+    }
+
+    fn tracked_file_from_row(row: &Row<'_>) -> rusqlite::Result<Tracked> {
+        // Keep in sync with update_tracked
+        let ty: u64 = row.get("type")?;
+        let ret = match ty {
+            0 => Tracked::Dir {
+                path: row.get("path")?,
+            },
+            1 => Tracked::File {
+                path: row.get("path")?,
+                size: row.get("size")?,
+                modified: row.get("modified")?,
+            },
+            t => panic!("Illegal type value {t} should be 0 or 1"),
+        };
+
+        Ok(ret)
+    }
+
+    fn update_tracked(&self, t: &Tracked) -> rusqlite::Result<()> {
+        // Keep in sync with tracked_file_from_row
+        let mut stmt = self.conn.prepare_cached(
+            "INSERT OR REPLACE INTO tracked (path, type, size, modified) VALUES (:path, :type, :size, :modified)"
+        )?;
+
+        let _rows = match &t {
+            Tracked::Dir { path } => stmt.execute(named_params! {
+                ":path": path,
+                ":type": 0,
+                ":size": Null,
+                ":modified": Null
+            }),
+            Tracked::File {
+                path,
+                size,
+                modified,
+            } => stmt.execute(named_params! {
+                ":path": path,
+                ":type": 1,
+                ":size": size,
+                ":modified": modified
+            }),
+        }?;
 
         Ok(())
     }
@@ -278,15 +257,7 @@ impl RawConn {
     /// Returns all tracked files with rpaths that start with the given prefix and an additional
     /// separator (i.e. if prefix == "test" then return all files that have rpath "test/**". Of course,
     /// the real separator is a null byte currently)
-    fn get_all_tracked_files<T, F: Fn(TrackedFile) -> T>(
-        &self,
-        prefix: &RPath,
-        op: F,
-    ) -> rusqlite::Result<Vec<T>> {
-        const QUERY: &str =
-            "SELECT rpath, size, modified, local_hash, remote_hash FROM tracked_files";
-        const CONSTRAINED_QUERY: &str =
-            concatcp!(QUERY, " WHERE rpath >= :lower AND rpath < :upper");
+    fn get_all_tracked(&self, prefix: &RPath) -> rusqlite::Result<Vec<Tracked>> {
         // Some pain and suffering went into this function. We need sqlite to find all strings that
         // match a certain prefix. One might think that using GLOB is a good idea. It is not however,
         // as we cannot guarantee that the special wildcard symbol '*' does not appear in paths.
@@ -297,89 +268,27 @@ impl RawConn {
         // "inside" SQLITE, but either way, this results in a full table scan, and hurts my heart)
         // 2) Figure out how to compile sqlite with the flag SQLITE_CASE_SENSITIVE_LIKE. This wouldn't be a bad option.
         // 3) Go with the kind of hacky (but well-defined!) solution we have chosen here.
-        if !prefix.is_empty() {
-            // Thanks to this person https://stackoverflow.com/a/20423673
-            // This solution relies on the fact that, by default, SQLITE just uses lexiocraphic order on the bytes
-            // (by way of memcmp), and stores string as UTF-8 (a superset of ascii). This should avoid a full table scan
-            // (if there is an index on the path).
-            let lower = prefix.serialize();
 
-            // Below we rely on the fact that lower is terminated by the separator char, and that the character
-            // immediatly after the sep char is 0.
-            let (lower_without_sep, sep) = lower.split_at(lower.len() - 1);
-            debug_assert_eq!(sep, "/");
-
-            let params = named_params! {
-                ":lower": lower,
-                // 0 (0x30) is the character immediatly following / (0xF) in ASCII
-                ":upper": format!("{}0", lower_without_sep)
-            };
-
-            self.conn
-                .prepare_cached(CONSTRAINED_QUERY)?
-                .query_map(params, |row| TrackedFile::from_row(row).map(&op))?
-                .collect()
-        } else {
-            self.conn
-                .prepare_cached(QUERY)?
-                .query_map((), |row| TrackedFile::from_row(row).map(&op))?
-                .collect()
-        }
-    }
-}
-
-impl TrackedFilesRepository for SqliteDatabase {
-    fn update(&self, info: FileInfo, side: Side) -> anyhow::Result<()> {
-        let (local_hash, remote_hash) = match side {
-            Side::Local => (info.hash, Vec::new()),
-            Side::Remote => (Vec::new(), info.hash),
+        let lower = prefix.serialize();
+        let lower_without_trailing_sep = match lower.rsplit_once('/') {
+            Some((x, _)) => x,
+            None => "",
         };
+        let upper = format!("{lower_without_trailing_sep}0");
 
-        let updated = TrackedFile {
-            path: info.rpath,
-            size: info.size,
-            modified: info.modified,
-            local_hash,
-            remote_hash,
-        };
-
-        self.update_tracked_file(updated, Some(side))?;
-
-        Ok(())
-    }
-
-    fn get_all(&self, dir_rpath: &RPath, side: Side) -> anyhow::Result<Vec<FileInfo>> {
-        let ret = self.get_all_tracked_files(dir_rpath, |tf| FileInfo {
-            rpath: tf.path,
-            size: tf.size,
-            modified: tf.modified,
-            hash: match side {
-                Side::Local => tf.local_hash,
-                Side::Remote => tf.remote_hash,
-            },
-        })?;
-        Ok(ret)
-    }
-
-    fn delete(&self, path: &RPath) -> anyhow::Result<()> {
-        self.delete_tracked_file(path)?;
-        Ok(())
-    }
-}
-
-impl KeyValueStore for SqliteDatabase {
-    fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
-        self.get_value(key)
-            .with_context(|| format!("Tried to retrieve value for key `{key}`)"))
-    }
-
-    fn put(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        self.put_value(key, value).map_err(Into::into)
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM tracked WHERE path >= ?1 AND path < ?2")?;
+        let rows = stmt.query((lower, upper))?;
+        rows.mapped(|row| Self::tracked_file_from_row(row))
+            .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::assert_equal_when_sorted;
+
     use super::*;
     use time::{macros::datetime, OffsetDateTime};
 
@@ -412,56 +321,42 @@ mod tests {
         let res = repo.get_tracked_file(rpath).unwrap();
         assert!(res.is_none());
 
-        let tf = TrackedFile {
+        let tf = Tracked::File {
             path: rpath.to_owned(),
             size: 42069,
             modified: datetime!(2019-12-01 0:00 UTC),
-            local_hash: "a0acb1671c1f8829404636476b221cd417fe89bf"
-                .to_owned()
-                .into_bytes(),
-            remote_hash: "asdasdkljhasdkjh".to_owned().into_bytes(),
         };
 
-        repo.update_tracked_file(tf.clone(), None).unwrap();
+        repo.update_tracked(&tf).unwrap();
 
         let tf_retrieved = repo.get_tracked_file(rpath).unwrap();
 
         assert_eq!(tf_retrieved, Some(tf));
 
-        repo.delete_tracked_file(rpath).unwrap();
+        repo.delete_tracked(rpath).unwrap();
 
         let tf3 = repo.get_tracked_file(rpath).unwrap();
         assert!(tf3.is_none());
     }
 
-    fn update_sided_impl(side: Side) {
+    #[test]
+    fn update_() {
         let db = empty_in_memory_repository();
-        let example_info = FileInfo {
-            rpath: ["somedir", "that", "contains", "file"].into(),
+        let example_info = Tracked::File {
+            path: ["somedir", "that", "contains", "file"].into(),
             size: 42,
             modified: datetime!(2019-12-01 0:00 UTC),
-            hash: "sadjhasdjhg".to_owned().into_bytes(),
         };
 
-        db.update(example_info.clone(), side).unwrap();
+        db.update_tracked(&example_info).unwrap();
 
         let retrieved = db
-            .get_all(&RPathBuf::from(["somedir", "that", "contains"]), side)
+            .get_all_tracked(&RPathBuf::from(["somedir", "that", "contains"]))
             .unwrap()
             .into_iter()
             .next()
             .unwrap();
         assert_eq!(retrieved, example_info);
-    }
-
-    #[test]
-    fn update_remote() {
-        update_sided_impl(Side::Remote)
-    }
-
-    #[test]
-    fn update_local() {
-        update_sided_impl(Side::Local)
     }
 
     #[test]
@@ -478,35 +373,28 @@ mod tests {
     fn get_all_tracked_files_works() {
         let db = empty_in_memory_repository();
 
-        let tf = TrackedFile {
-            path: RPathBuf::empty(),
-            size: 42,
-            modified: OffsetDateTime::UNIX_EPOCH,
-            local_hash: vec![],
-            remote_hash: vec![],
-        };
-
-        let tf1 = TrackedFile {
+        let tf1 = Tracked::File {
             path: RPathBuf::from_components(["test_ends_with_/", "file1_with_/"]),
-            ..tf.clone()
+            size: 43,
+            modified: OffsetDateTime::now_utc(),
         };
-        let tf2 = TrackedFile {
+        let tf2 = Tracked::File {
             path: RPathBuf::from_components(["test_ends_with_/", "file2_with_\\and_/"]),
-            ..tf.clone()
+            size: 44,
+            modified: OffsetDateTime::now_utc(),
         };
-        let tf3 = TrackedFile {
+        let tf3 = Tracked::File {
             path: RPathBuf::from_components(["test_ends_with//", "a_file"]),
-            ..tf.clone()
+            size: 45,
+            modified: OffsetDateTime::now_utc(),
         };
 
-        db.update_tracked_file(tf1.clone(), None).unwrap();
-        db.update_tracked_file(tf2.clone(), None).unwrap();
-        db.update_tracked_file(tf3.clone(), None).unwrap();
+        db.update_tracked(&tf1).unwrap();
+        db.update_tracked(&tf2).unwrap();
+        db.update_tracked(&tf3).unwrap();
 
         let prefix = RPathBuf::from_components(["test_ends_with_/"]);
-        let mut tfs = db.get_all_tracked_files(&prefix, |x| x).unwrap();
-        tfs.sort_by(|x, y| x.path.cmp(&y.path));
 
-        assert_eq!(tfs, [tf1, tf2]);
+        assert_equal_when_sorted(&db.get_all_tracked(&prefix).unwrap(), &[tf1, tf2]);
     }
 }

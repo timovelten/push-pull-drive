@@ -21,12 +21,11 @@ fn to_pathinfo(file: drive_api::File, path: RPathBuf) -> (Option<PathInfo>, Stri
             size,
             ..
         }) => PathInfo::File(FileInfo {
-            rpath: path,
+            path,
             size,
-            modified: file.modified_time,
-            hash: hex_must_decode(sha1_checksum),
+            modified: file.modified_time
         }),
-        _ if file.is_folder() => PathInfo::Dir(DirectoryInfo { rpath: path }),
+        _ if file.is_folder() => PathInfo::Dir(DirectoryInfo { path }),
         _ => return (None, file.id),
     };
 
@@ -39,7 +38,7 @@ fn to_pathinfo(file: drive_api::File, path: RPathBuf) -> (Option<PathInfo>, Stri
 fn to_fileinfo(file: drive_api::File, path: RPathBuf) -> Result<FileInfo> {
     match to_pathinfo(file, path.clone()).0 {
         Some(PathInfo::File(info)) => Ok(info),
-        Some(PathInfo::Dir(DirectoryInfo { rpath })) => Err(Error::IsADirectory { rpath }),
+        Some(PathInfo::Dir(DirectoryInfo { path: rpath })) => Err(Error::IsADirectory { rpath }),
         None => Err(Error::NotAllowed { rpath: path }),
     }
 }
@@ -318,12 +317,11 @@ impl GDriveClient {
                     ..
                 }) => PathInfo::File(FileInfo {
                     size,
-                    rpath: cpath.to_owned(),
-                    modified: file.modified_time,
-                    hash: hex_must_decode(sha1_checksum),
+                    path: cpath.to_owned(),
+                    modified: file.modified_time
                 }),
                 None if file.is_folder() => PathInfo::Dir(DirectoryInfo {
-                    rpath: cpath.to_owned(),
+                    path: cpath.to_owned(),
                 }),
                 _ => {
                     return Err(Error::NotAllowed {
@@ -350,10 +348,9 @@ impl GDriveClient {
                 size,
             }) => {
                 let info = FileInfo {
-                    rpath: cpath,
+                    path: cpath,
                     size,
-                    modified: file.modified_time,
-                    hash: hex_must_decode(sha1_checksum),
+                    modified: file.modified_time
                 };
 
                 let body = self
@@ -435,17 +432,18 @@ impl GDriveClient {
         Ok(())
     }
 
-    pub async fn read_dir(&self, path: &RPath, up_to_depth: u32) -> Result<Vec<PathInfo>> {
+    pub async fn list_files(&self, path: &RPath, up_to_depth: u32) -> Result<Vec<PathInfo>> {
         const BATCH_SIZE: usize = 12;
 
         // Another day, another (sort-of) BFS!
         let mut ret = Vec::new();
 
+        // TODO: This needs to support the case where path is the path to a file
         let id = self.drive_file_by_rpath_cached(path).await?.id.to_owned();
         let mut queue = vec![(
             id,
             DirectoryInfo {
-                rpath: path.to_owned(),
+                path: path.to_owned(),
             },
         )];
 
@@ -479,7 +477,7 @@ impl GDriveClient {
                         let parent_cpath = chunk
                             .iter()
                             .find(|(id, _)| id == parent_id)
-                            .map(|(_, info)| &info.rpath)
+                            .map(|(_, info)| &info.path)
                             .with_context(|| format!("List of targets is {chunk:?} and we recevied a file with parent id {parent_id:?}"))
                             .expect("Every file we receive should have a parent we know of");
 
@@ -491,13 +489,12 @@ impl GDriveClient {
                                 size,
                                 ..
                             }) => PathInfo::File(FileInfo {
-                                rpath: cpath.to_owned(),
+                                path: cpath.to_owned(),
                                 size,
-                                modified: file.modified_time,
-                                hash: hex_must_decode(sha1_checksum),
+                                modified: file.modified_time
                             }),
                             None if file.is_folder() => PathInfo::Dir(DirectoryInfo {
-                                rpath: cpath.to_owned(),
+                                path: cpath.to_owned(),
                             }),
                             _ => {
                                 // Ignore Google docs etc for now..

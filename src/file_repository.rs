@@ -1,3 +1,5 @@
+use crate::db::Tracked;
+use crate::filetree::Patch;
 use crate::paths::{RPath, RPathBuf};
 use crate::{FileInfo, PathInfo};
 use futures::AsyncRead;
@@ -40,13 +42,15 @@ pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
     /// on a "best effort" basis.
     const CONCURRENCY_LIMIT: usize;
 
-    /// Return all files and folders contained in the directory at `rpath` up to the specified `depth`. Note that if called
-    /// with `depth` 0, this should return an empty list. With `depth` 1, this returns all the immediate children (but not the directory itself!).
-    /// Use `u32::MAX` as `depth` to return all files and subfolders.
+    /// Return all files and folder such that the given path is a subpath of their paths. That is,
+    /// 
+    /// - If path is a directory this returns the directory itself and all of its children up to the given depth (depth 0 is just the directory itself,
+    ///   depth 1 includes the immediate children and so on)
+    /// - If path is a file, then this returns just that file and the given depth is irrelevant
     ///
     /// # Errors
-    /// - If `rpath` is a file this returns the error [`Error::NotADirectory`].
-    fn read_dir(
+    /// - If path does not exist, this returns [`Error::NotFound`]
+    fn list_files(
         &self,
         path: &RPath,
         depth: u32,
@@ -87,11 +91,13 @@ pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
     /// Delete a file or a folder at `rpath` (including all subfolders, if necessary).
     fn delete_file(&self, path: &RPath) -> impl Future<Output = Result<()>> + Send;
 
+    fn determine_changes(&self, path: &RPath, all_files: Vec<Tracked>) -> impl Future<Output = Result<Vec<Patch>>> + Send;
+
     /// Deletes a directory at path (and all subdirectories it contains) if it contains no files. See [`Self::delete_file`].
     fn delete_orphaned_directory(&self, path: &RPath) -> impl Future<Output = Result<bool>> + Send {
         async {
             let files_in_folder = self
-                .read_dir(path, u32::MAX)
+                .list_files(path, u32::MAX)
                 .await?
                 .into_iter()
                 .filter(|d| matches!(d, PathInfo::File(_)))

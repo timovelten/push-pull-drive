@@ -37,8 +37,7 @@ pub fn init(
     let ctx: ExecutionEnvironment = ExecutionEnvironment {
         shell,
         wd: RPath::empty().to_owned(),
-        key_value_store: db.clone(),
-        tracked_files: db,
+        db,
         root_dir: root_dir.to_owned(),
         handle,
     };

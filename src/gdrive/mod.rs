@@ -40,7 +40,7 @@ impl FileRepository for GDriveRepo {
 
     delegate! {
         to self.inner {
-            async fn read_dir(&self, path: &RPath, up_to_depth: u32) -> Result<Vec<PathInfo>>;
+            async fn list_files(&self, path: &RPath, up_to_depth: u32) -> Result<Vec<PathInfo>>;
 
             async fn delete_file(&self, path: &RPath) -> Result<()>;
 
@@ -57,5 +57,9 @@ impl FileRepository for GDriveRepo {
     async fn read_file(&self, path: &RPath) -> Result<(FileInfo, Self::Reader)> {
         let (info, reader) = self.inner.read_file(path).await?;
         Ok((info, Box::into_pin(reader)))
+    }
+    
+    async fn determine_changes(&self, path: &RPath, all_files: Vec<crate::db::Tracked>) -> Result<Vec<crate::filetree::Patch>> {
+        todo!()
     }
 }

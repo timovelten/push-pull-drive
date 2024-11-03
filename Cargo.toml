@@ -44,7 +44,6 @@ tokio-util = { version = "0.7.4", features = ["compat"] }
 pin-project-lite = "0.2.13"
 env_logger = "0.10.0"
 ahash = "0.8.7"
-const_format = "0.2.32"
 libc = "0.2.153"
 either = "1.10.0"
 crossterm = "0.27.0"

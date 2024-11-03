@@ -1,5 +1,5 @@
 use crate::{
-    context::{Context, Ctx}, file_repository::FileRepository, paths::{RPath, RPathBuf}, DirectoryInfo, FileInfo, PathInfo
+    context::{Context, Ctx}, file_repository::FileRepository, human_readable_bytes, paths::{RPath, RPathBuf}, DirectoryInfo, FileInfo, PathInfo
 };
 use std::io::Write;
 
@@ -29,18 +29,18 @@ pub fn remote_ls(
 
     let path = path.map(|path| RPathBuf::from_sep(&path, '/'))
         .unwrap_or(RPathBuf::empty());
-    let path = env.wd().join(&path);
+    let path = env.wd.join(&path);
     let mut contents = env
         .handle
-        .block_on(remote.read_dir(&path, depth.unwrap_or(1)))?;
+        .block_on(remote.list_files(&path, depth.unwrap_or(1)))?;
 
     // Sort directories first
     fn key(f: &PathInfo) -> (u8, &RPath) {
         match f {
             PathInfo::Dir(DirectoryInfo {
-                rpath: relative_name,
+                path: relative_name,
             }) => (0, relative_name),
-            PathInfo::File(FileInfo { rpath, .. }) => (1, rpath),
+            PathInfo::File(FileInfo { path: rpath, .. }) => (1, rpath),
         }
     }
     contents.sort_by(|f, g| key(f).cmp(&key(g)));
@@ -48,16 +48,16 @@ pub fn remote_ls(
     for file in contents {
         match file {
             PathInfo::Dir(DirectoryInfo {
-                rpath: relative_name,
+                path: relative_name,
             }) => {
                 writeln!(env.shell.out(), "{}/", relative_name)?;
             }
             PathInfo::File(FileInfo {
-                rpath, size, hash, ..
+                path: rpath, size, ..
             }) => {
                 if details {
-                    let short_hash = hex::encode(&hash[..hash.len().min(4)]);
-                    writeln!(env.shell.out(), "{rpath} [{size} b, Hash: {short_hash}]")?;
+                    let (num, unit) = human_readable_bytes(size);
+                    writeln!(env.shell.out(), "{rpath} [{num} {unit}]")?;
                 } else {
                     writeln!(env.shell.out(), "{rpath}")?;
                 }

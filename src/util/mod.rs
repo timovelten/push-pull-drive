@@ -33,6 +33,19 @@ pub fn hex_must_decode(s: impl AsRef<[u8]>) -> Vec<u8> {
     hex::decode(s).expect("hex is valid")
 }
 
+pub fn assert_equal_when_sorted<T: Ord + core::fmt::Debug + Clone>(
+    left: &[T],
+    right: &[T]
+) {
+    let mut a = Vec::from(left);
+    a.sort();
+
+    let mut b = Vec::from(right);
+    b.sort();
+
+    assert_eq!(a, b)
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

@@ -5,11 +5,8 @@ use std::{fs::File, path::Path, sync::Arc};
 
 pub mod commands;
 use commands::{
-    forget::{self, ForgetArgs},
     init::{self, InitBackendCmd},
-    ls::{self, LsArgs},
-    push_pull::{self, PushPullArgs},
-    status::{self, StatusArgs},
+    ls::{self, LsArgs}
 };
 
 pub mod context;
@@ -59,16 +56,7 @@ enum Commands {
         #[command(subcommand)]
         backend: InitBackendCmd,
     },
-    /// Show status of local files
-    Status(StatusArgs),
-    /// Show status of remote files
-    RemoteStatus(StatusArgs),
-    /// Pull modified / new remote files and deletions into the local state
-    Pull(PushPullArgs),
-    /// Push local modified / new files and deletions to the remote
-    Push(PushPullArgs),
     RemoteLs(LsArgs),
-    Forget(ForgetArgs),
 }
 
 trait CommandHandler {
@@ -121,8 +109,7 @@ fn get_local_backend_config(root_dir: impl AsRef<Path>) -> local::Config {
         root_path: root_dir.as_ref().to_owned(),
         ignore_prefixes: vec![
             RPathBuf::from_components([crate::context::CONFIG_DIR])
-        ],
-        calculate_hashes: true,
+        ]
     };
 }
 
@@ -149,12 +136,7 @@ impl<C: Context> CommandHandler for C {
     fn handle(&mut self, cmd: Commands) -> anyhow::Result<()> {
         match cmd {
             Commands::Init { .. } => unimplemented!("Init command is handled separately elsewhere"),
-            Commands::Pull(args) => push_pull::pull(self, args),
-            Commands::Push(args) => push_pull::push(self, args),
             Commands::RemoteLs(args) => ls::remote_ls(self, args),
-            Commands::Status(args) => status::local_status(self, args),
-            Commands::RemoteStatus(args) => status::remote_status(self, args),
-            Commands::Forget(args) => forget::forget(self, args),
         }
     }
 }

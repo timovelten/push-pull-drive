@@ -1,4 +1,4 @@
-use crate::paths::{RPath, RPathBuf};
+use crate::{filetree::{self, Node}, paths::{RPath, RPathBuf}};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum FileChange {
@@ -10,7 +10,7 @@ pub enum FileChange {
 impl FileChange {
     pub fn rpath(&self) -> &RPath {
         match self {
-            FileChange::New(info) | FileChange::Modified(info) => &info.rpath,
+            FileChange::New(info) | FileChange::Modified(info) => &info.path,
             FileChange::Deleted { rpath } => rpath,
         }
     }
@@ -36,6 +36,22 @@ pub enum PathInfo {
     File(FileInfo),
 }
 
+impl filetree::Node for PathInfo {
+    fn path(&self) -> &RPath {
+        match self {
+            PathInfo::Dir(DirectoryInfo { path: rpath }) => rpath.as_rpath(),
+            PathInfo::File(FileInfo { path: rpath, .. }) => rpath.as_rpath(),
+        }
+    }
+
+    fn typ(&self) -> crate::filetree::Type {
+        match self {
+            PathInfo::Dir(_) => filetree::Type::Dir,
+            PathInfo::File(_) => filetree::Type::File,
+        }
+    }
+}
+
 impl PathInfo {
     pub fn is_file(&self) -> bool {
         match self {
@@ -43,29 +59,16 @@ impl PathInfo {
             PathInfo::File(_) => true,
         }
     }
-
-    pub fn rpath(&self) -> &RPath {
-        match self {
-            PathInfo::Dir(DirectoryInfo { rpath }) => rpath.as_rpath(),
-            PathInfo::File(FileInfo { rpath, .. }) => rpath.as_rpath(),
-        }
-    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FileInfo {
-    pub rpath: RPathBuf,
+    pub path: RPathBuf,
     pub size: u64,
-    pub modified: time::OffsetDateTime,
-    /// This value should typically only be compared to other FileInfo's created by the same
-    /// repository. We do not specify what hash algorithm is used (or how much of the file is hashed,
-    /// or how long this value is, or if it exists at all etc).
-    /// For instance, Google Drive supplies us with a SHA1 hash, where as Dropbox has a very custom
-    /// checksum implementation
-    pub hash: Vec<u8>,
+    pub modified: time::OffsetDateTime
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DirectoryInfo {
-    pub rpath: RPathBuf,
+    pub path: RPathBuf,
 }
