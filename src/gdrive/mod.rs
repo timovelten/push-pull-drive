@@ -59,10 +59,6 @@ impl FileRepository for GDriveRepo {
         let (info, reader) = self.inner.read_file(path).await?;
         Ok((info, Box::into_pin(reader)))
     }
-    
-    async fn determine_changes(&self, path: &RPath, all_files: Vec<crate::db::Tracked>) -> Result<Vec<Change>> {
-        todo!()
-    }
 
     async fn mkdir(&self, path: &RPath) -> Result<crate::DirectoryInfo> {
         todo!()

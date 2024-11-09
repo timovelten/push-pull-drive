@@ -1,5 +1,5 @@
 use crate::paths::RPath;
-use anyhow::{bail, ensure, Context as _};
+use anyhow::bail;
 use merge::{Merge, Side};
 
 mod merge;
@@ -10,21 +10,11 @@ pub enum Type {
     File,
 }
 
-impl Type {
-    fn is_dir(&self) -> bool {
-        matches!(self, Self::Dir)
-    }
-}
-
 /// We implement this trait for a bunch of types
 pub trait Node: core::fmt::Debug {
     fn path(&self) -> &RPath;
 
     fn typ(&self) -> Type;
-
-    fn as_tuple(&self) -> (&RPath, Type) {
-        (self.path(), self.typ())
-    }
 }
 
 impl<T: Node> Node for &T {
@@ -37,29 +27,18 @@ impl<T: Node> Node for &T {
     }
 }
 
-/// Generally speaking, all of these operations should happen in the order defined by [Ord]
-/// and they may not be reordered arbitrarily.
-///
-/// Specifically, it is vital that all deletions happen before all creations, and that the creation
-/// of directories happens before the creation of files.
-///
-/// It is okay to reorder [`Self::Update`] with other patches of type [`Self::Update`].
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy)]
-pub enum Patch<'a> {
-    Delete(Type, &'a RPath),
-    Update(Type, &'a RPath),
-    Create(Type, &'a RPath),
+pub enum PatchKind {
+    Update(Type),
+    Delete(Type),
+    Create(Type),
+    Replace { old: Type, new: Type },
 }
 
-// Constructing these in tests is annoying because of the lifetime
-#[cfg(test)]
-macro_rules! patch {
-    ($variant:ident; $ty:ident; $($elem:expr),*) => {
-        {
-            let rp: &'static RPathBuf = Box::leak(RPathBuf::from([$($elem),*]).into());
-            Patch::$variant(Type::$ty, rp)
-        }
-    };
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy)]
+pub struct Patch<'a> {
+    pub path: &'a RPath,
+    pub kind: PatchKind,
 }
 
 pub struct FileTreeBuilder<T> {
@@ -105,7 +84,7 @@ impl<T: Node> FileTreeBuilder<T> {
             }
 
             let is_file_with_children =
-                nodes[i].typ() == Type::File && nodes[i + 1].path().starts_with(&nodes[i].path());
+                nodes[i].typ() == Type::File && nodes[i + 1].path().starts_with(nodes[i].path());
             if is_file_with_children {
                 bail!(
                     "the file {:?} has children, but files may never have children",
@@ -118,9 +97,13 @@ impl<T: Node> FileTreeBuilder<T> {
 
         // Constructing a non-connected FileTree is allowed, but only by us.
         let ret = FileTree { nodes };
-        
-        if ret.count_reachable_nodes() != ret.len() {
-            bail!("Tree is not connected");
+
+        let reachable_nodes = ret.count_reachable_nodes();
+        if reachable_nodes != ret.len() {
+            bail!(
+                "Tree is not connected (only {reachable_nodes} are reachable from the root {:?})",
+                ret.root().unwrap()
+            );
         }
 
         Ok(ret)
@@ -146,20 +129,26 @@ impl<T: Node> FileTree<T> {
             .and_then(|idx| self.nodes.get(idx))
     }
 
-    pub fn all_children<'a>(&'a self, path: &'a RPath) -> impl Iterator<Item = &'a T> + 'a {
+    /// If `max_depth == 0`, this iterator will be empty (the node itself is never returned).
+    /// If `max_depth == 1`, the immediate children of the node are returned
+    fn all_children<'a>(
+        &'a self,
+        path: &'a RPath,
+        max_depth: usize,
+    ) -> impl Iterator<Item = &'a T> + 'a {
         self.get_index(path)
-            .map(|idx| {
+            .map(move |idx| {
                 self.nodes[idx + 1..]
                     .iter()
                     .take_while(move |node| node.path().starts_with(path))
+                    .filter(move |node| node.path().len() - path.len() <= max_depth)
             })
             .into_iter()
             .flatten()
     }
 
     pub fn children<'a>(&'a self, path: &'a RPath) -> impl Iterator<Item = &'a T> + 'a {
-        self.all_children(path)
-            .filter(|node| node.path().len() == path.len() + 1)
+        self.all_children(path, 1)
     }
 
     pub fn root(&self) -> Option<&RPath> {
@@ -178,6 +167,7 @@ impl<T: Node> FileTree<T> {
         fn f<D: Node>(tree: &FileTree<D>, path: &RPath) -> usize {
             // Count the node at path itself
             let mut ret = 1;
+            println!("{:?}", path);
 
             for child in tree.children(path) {
                 ret += match child.typ() {
@@ -198,100 +188,96 @@ impl<T: Node> FileTree<T> {
 }
 
 /// What operations do we have to do to the old tree so that it equals the new tree?
-/// 
+///
 /// Nodes that appear in both trees are output as [`Patch::Update`], regardless of whether
 /// they were actually updated or not (there is no way for this function to determine that).
 pub fn diff<'a, A: Node, B: Node>(
     new: &'a FileTree<A>,
     old: &'a FileTree<B>,
 ) -> anyhow::Result<Vec<Patch<'a>>> {
-    ensure!(
-        new.count_reachable_nodes() == new.len(),
-        "left tree is not connected"
-    );
-    ensure!(
-        old.count_reachable_nodes() == old.len(),
-        "right tree is not connected"
-    );
-    ensure!(!new.is_empty(), "new tree must not be empty");
+    let mut patches = Vec::new();
 
-    fn f<'a, A: Node, B: Node>(
-        path: &'a RPath,
-        new_tree: &'a FileTree<A>,
-        old_tree: &'a FileTree<B>,
-        patches: &mut Vec<Patch<'a>>,
-    ) {
-        let xs = new_tree.children(path);
-        let ys = old_tree.children(path);
-        let merged = Merge::new(xs, ys, |x, y| x.path().cmp(y.path()));
+    let merged = Merge::new(new.nodes.iter(), old.nodes.iter(), |x, y| {
+        x.path().cmp(y.path())
+    });
 
-        for state in merged {
-            let descend = match state {
-                Side::Left(x) => {
-                    // x is only present in the new tree, so we must create it in the old one
-                    patches.push(Patch::Create(x.typ(), x.path()));
-
-                    x.typ().is_dir().then(|| x.path())
-                }
-                Side::Right(y) => {
-                    // y is only present in the old tree, so it must have been deleted
-                    patches.push(Patch::Delete(y.typ(), y.path()));
-
-                    // Do NOT descend into paths that are deleted in the old tree. We already have
-                    // deleted the parent, we do not need to know about every single deleted child.
-                    // Those changes are implied.
-                    None
-                }
-                Side::Both { left: x, right: y } => {
-                    let the_path = x.path();
-
-                    match (x.typ(), y.typ()) {
-                        (Type::Dir, Type::Dir) => {
-                            patches.push(Patch::Update(Type::Dir, the_path));
-                            Some(the_path)
-                        }
-                        (Type::File, Type::File) => {
-                            patches.push(Patch::Update(Type::File, the_path));
-
-                            // Do not need to traverse files (they wont have any children anyway)
-                            None
-                        }
-                        (Type::Dir, Type::File) => {
-                            patches.push(Patch::Delete(Type::File, the_path));
-                            patches.push(Patch::Create(Type::Dir, the_path));
-
-                            Some(the_path)
-                        }
-                        (Type::File, Type::Dir) => {
-                            patches.push(Patch::Delete(Type::Dir, the_path));
-                            patches.push(Patch::Create(Type::File, the_path));
-
-                            // Do NOT descend into a deleted directory in the old tree
-                            None
-                        }
-                    }
-                }
-            };
-
-            // Descend into possible child directories
-            if let Some(path) = descend {
-                f(path, new_tree, old_tree, patches)
+    let mut skip_over: Option<&RPath> = None;
+    for side in merged {
+        let path = match side {
+            Side::Left(x) => x.path(),
+            Side::Right(y) => y.path(),
+            Side::Both { left, .. } => {
+                // Note that both left and right compare equal according to the above
+                // cmp function. Terefore, left and right have the same path
+                // (unless Node has a very pathological path() impl that does not return the same
+                // value when called again)
+                left.path()
             }
+        };
+
+        // Maybe skip over some paths
+        match skip_over {
+            Some(skip_over) if path.starts_with(skip_over) => continue,
+            Some(_) => {
+                skip_over = None;
+            }
+            None => {}
+        }
+
+        match side {
+            Side::Left(x) => {
+                // x is only present in the new tree, so we must create it in the old one
+                patches.push(Patch {
+                    path,
+                    kind: PatchKind::Create(x.typ()),
+                })
+            }
+            Side::Right(y) => {
+                // y is only present in the old tree, so it must have been deleted
+                patches.push(Patch {
+                    path,
+                    kind: PatchKind::Delete(y.typ()),
+                });
+
+                // Skip over all children of this node (we do not care about the children that
+                // may have also been deleted)
+                skip_over = Some(path);
+            }
+            Side::Both {
+                left: new,
+                right: old,
+            } => match (new.typ(), old.typ()) {
+                (typ @ Type::Dir, Type::Dir) | (typ @ Type::File, Type::File) => {
+                    patches.push(Patch {
+                        path,
+                        kind: PatchKind::Update(typ),
+                    });
+                }
+                (Type::Dir, Type::File) => {
+                    patches.push(Patch {
+                        path,
+                        kind: PatchKind::Replace {
+                            new: Type::Dir,
+                            old: Type::File,
+                        },
+                    });
+                }
+                (Type::File, Type::Dir) => {
+                    patches.push(Patch {
+                        path,
+                        kind: PatchKind::Replace {
+                            new: Type::File,
+                            old: Type::Dir,
+                        },
+                    });
+
+                    // Skip over the children of the deleted directory
+                    skip_over = Some(path)
+                }
+            },
         }
     }
 
-    // The two trees might not have the same root, or may even be empty (?)
-    let start = match (new.root(), old.root()) {
-        (None, None) => return Ok(Default::default()),
-        (Some(root), None) | (None, Some(root)) => root,
-        (Some(new_root), Some(old_root)) if new_root == old_root => new_root,
-        (Some(_), Some(_)) => {
-            todo!("Should we allow this case and determine a common starting point?");
-        }
-    };
-
-    let mut patches = Vec::new();
-    f(start, new, old, &mut patches);
     patches.sort();
 
     Ok(patches)
@@ -302,29 +288,15 @@ mod test {
     use crate::{
         assert_equal_when_sorted,
         filetree::{diff, FileTreeBuilder, Patch},
-        paths::RPathBuf,
+        paths::{RPath, RPathBuf},
     };
 
-    use super::{Node, Type};
+    use super::{FileTree, Node, PatchKind, Type};
 
     #[derive(Debug)]
     enum Nd {
         File(RPathBuf),
         Dir(RPathBuf),
-    }
-
-    impl Nd {
-        fn file(p: impl Into<RPathBuf>) -> Self {
-            Self::File(p.into())
-        }
-
-        fn dir(p: impl Into<RPathBuf>) -> Self {
-            Self::Dir(p.into())
-        }
-
-        fn root() -> Self {
-            Self::Dir(RPathBuf::empty())
-        }
     }
 
     impl Node for Nd {
@@ -343,100 +315,100 @@ mod test {
         }
     }
 
-    #[test]
-    fn test_sort_order() {
-        let update_file = patch!(Update; File; "test");
-        let delete_dir = patch!(Delete; Dir; "test");
-        let create_dir = patch!(Create; Dir; "dir");
-        let create_file = patch!(Create; File; "dir", "file");
+    fn patch(s: &'static str, kind: PatchKind) -> Patch<'static> {
+        use ahash::HashMap;
+        use std::sync::{LazyLock, Mutex};
 
-        let patches = &[update_file, delete_dir, create_dir, create_file];
-        assert_equal_when_sorted(patches, &[delete_dir, update_file, create_dir, create_file]);
+        static CACHE: LazyLock<Mutex<HashMap<&'static str, &'static RPath>>> =
+            LazyLock::new(|| Default::default());
+        let mut map = CACHE.lock().unwrap();
+        let path: &'static RPath = map
+            .entry(s)
+            .or_insert_with(|| Box::leak(Box::new(RPathBuf::from_sep(s, '/'))));
+        drop(map);
+
+        Patch { path, kind }
+    }
+
+    fn filetree(nodes: &[&'static str]) -> anyhow::Result<FileTree<Nd>> {
+        let mut builder = FileTreeBuilder::new();
+        for node in nodes {
+            let nd = if let Some(folder) = node.strip_suffix('/') {
+                Nd::Dir(RPathBuf::from(folder))
+            } else {
+                Nd::File(RPathBuf::from(*node))
+            };
+
+            builder.push(nd);
+        }
+
+        builder.build()
     }
 
     #[test]
     fn trees_must_be_connected() {
-        let _ = FileTreeBuilder::new()
-            .extended_with([
-                Nd::root(),
-                Nd::dir(["dir"]),
-                Nd::file(["dir", "file"]),
-                Nd::file(["dir", "file2"]),
-                Nd::file(["dir2", "file1"]),
-                Nd::file(["dir2", "file2"]),
-            ])
-            .build()
-            .unwrap_err();
+        let err = filetree(&[
+            "/",
+            "/dir/",
+            "/dir/file",
+            "/dir/file2",
+            "/dir2/file1",
+            "/dir2/file2"
+        ])
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(err.to_string().contains("connected"), "Wrong error: {msg}");
     }
 
     #[test]
     fn basic_test() {
-        let a = FileTreeBuilder::new()
-            .extended_with([
-                Nd::root(),
-                Nd::file(["a_movie"]),
-                Nd::file(["some document"]),
-            ])
-            .build()
-            .unwrap();
+        let a = filetree(&[
+            "/",
+            "/a_movie",
+            "/some document"
+        ]).unwrap();
 
-        let b = FileTreeBuilder::new()
-            .extended_with([
-                Nd::root(),
-                Nd::file(["some other document"]),
-                Nd::file(["a_movie"]),
-                Nd::file(["old picture"]),
-            ])
-            .build()
-            .unwrap();
+        let b = filetree(&[
+            "/",
+            "/some other document",
+            "/a_movie",
+            "/old picture"
+        ]).unwrap();
 
-        let patches = diff(&a, &b).unwrap();
-        assert_equal_when_sorted(
-            &patches,
-            &[
-                patch!(Update; File; "a_movie"),
-                patch!(Delete; File; "old picture"),
-                patch!(Delete; File; "some other document"),
-                patch!(Create; File; "some document"),
-            ],
-        );
+        let mut patches = diff(&a, &b).unwrap();
+        let mut expected = [
+            patch("", PatchKind::Update(Type::Dir)),
+            patch("a_movie", PatchKind::Update(Type::File)),
+            patch("old picture", PatchKind::Delete(Type::File)),
+            patch("some other document", PatchKind::Delete(Type::File)),
+            patch("some document", PatchKind::Create(Type::File))
+        ];
+        
+        expected.sort();
+        patches.sort();
 
-        let patches = diff(&b, &a).unwrap();
-        assert_equal_when_sorted(
-            &patches,
-            &[
-                patch!(Update; File; "a_movie"),
-                patch!(Delete; File; "some document"),
-                patch!(Create; File; "some other document"),
-                patch!(Create; File; "old picture"),
-            ],
-        );
+        assert_equal_when_sorted(&patches, &expected);
     }
 
     #[test]
     fn folder_turns_into_file() {
-        let a = FileTreeBuilder::new()
-            .extended_with([
-                Nd::root(),
-                Nd::dir(["2013"]),
-                Nd::dir(["2012"]),
-                Nd::dir(["2012", "invoices"]),
-                Nd::file(["2013", "readme"]),
-                Nd::file(["2012", "invoices", "invoice 1"]),
-                Nd::file(["2012", "invoices", "invoice 2"]),
-            ])
-            .build()
-            .unwrap();
+        let a = filetree(&[
+            "/",
+            "/2013/",
+            "/2012/",
+            "/2012/invoices/",
+            "/2013/readme",
+            "/2012/invoices/invoice 1",
+            "/2012/invoices/invoice 2"
+        ]).unwrap();
 
-        let b = FileTreeBuilder::new()
-            .extended_with([
-                Nd::root(),
-                Nd::dir(["2013"]),
-                Nd::file(["2013", "readme"]),
-                Nd::file(["2012"]),
-            ])
-            .build()
-            .unwrap();
+        let b = filetree(&[
+            "/",
+            "/2013/",
+            "/2013/readme",
+            "/2012"
+        ]).unwrap();
 
         // Note that we expect only one deleted item (the directory. We do not want the
         // the deleted children to be listed)
@@ -444,10 +416,10 @@ mod test {
         assert_equal_when_sorted(
             &patches,
             &[
-                patch!(Update; Dir; "2013"),
-                patch!(Update; File; "2013", "readme"),
-                patch!(Delete; Dir; "2012"),
-                patch!(Create; File; "2012"),
+                patch("", PatchKind::Update(Type::Dir)),
+                patch("2013", PatchKind::Update(Type::Dir)),
+                patch("2013/readme", PatchKind::Update(Type::File)),
+                patch("2012", PatchKind::Replace { old: Type::Dir, new: Type::File })
             ],
         );
 
@@ -455,38 +427,34 @@ mod test {
         assert_equal_when_sorted(
             &patches,
             &[
-                patch!(Update; Dir; "2013"),
-                patch!(Update; File; "2013", "readme"),
-                patch!(Delete; File; "2012"),
-                patch!(Create; Dir; "2012"),
-                patch!(Create; Dir; "2012", "invoices"),
-                patch!(Create; File; "2012", "invoices", "invoice 1"),
-                patch!(Create; File; "2012", "invoices", "invoice 2"),
+                patch("", PatchKind::Update(Type::Dir)),
+                patch("2013", PatchKind::Update(Type::Dir)),
+                patch("2013/readme", PatchKind::Update(Type::File)),
+                patch("2012", PatchKind::Replace { old: Type::File, new: Type::Dir }),
+                patch("2012/invoices", PatchKind::Create(Type::Dir)),
+                patch("2012/invoices/invoice 1", PatchKind::Create(Type::File)),
+                patch("2012/invoices/invoice 2", PatchKind::Create(Type::File)),
             ],
         );
     }
 
     #[test]
-    fn deletions_are_short_1() {
+    fn deletions_are_short() {
         // Keep deletion patches short. That is, if a parent path is already deleted,
-        // we do not need to list every single child that is deleted.
+        // we do not need to list every single child that is deleted
+        let old = filetree(&[
+            "/",
+            "/2013/",
+            "2013/invoice 1",
+            "2013/invoice 2"
+        ]).unwrap();
 
-        let old = FileTreeBuilder::new()
-            .extended_with([
-                Nd::root(),
-                Nd::dir(["2013"]),
-                Nd::file(["2013", "invoice 1"]),
-                Nd::file(["2013", "invoice 2"]),
-            ])
-            .build()
-            .unwrap();
-
-        let new = FileTreeBuilder::new()
-            .extended_with([Nd::root()])
-            .build()
-            .unwrap();
+        let new = filetree(&["/"]).unwrap();
 
         let patches = diff(&new, &old).unwrap();
-        assert_equal_when_sorted(&patches, &[patch!(Delete; Dir; "2013")]);
+        assert_equal_when_sorted(
+            &patches,
+            &[patch("", PatchKind::Update(Type::Dir)), patch("2013", PatchKind::Delete(Type::Dir))],
+        );
     }
 }

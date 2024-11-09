@@ -59,44 +59,7 @@ where
     }
 
     async fn execute_async(self) -> anyhow::Result<()> {
-        let path = &self.ctx.wd;
-        let all_files = self.ctx.db.get_all_tracked(path)?;
-
-        let src_changes = self.from.determine_changes(path, all_files).await?;
-        let dest_changes = self.to.determine_changes(path, all_files).await?;
-
-        // Actually perform these changes. Note: They are ordered, and we also require them to be ordered.
-        // TODO: Paralellize updates.
-        for change in res {
-            writeln!(self.stderr(), "{change:?}")?;
-
-            match change {
-                Change::FileDeleted(path) | Change::DirDeleted(path) => {
-                    self.to.delete(&path).await?;
-                    self.db().delete_tracked(&path)?;
-                }
-                Change::DirCreated(path) => {
-                    self.to.mkdir(&path).await?;
-                    self.db().update_tracked(&Tracked::Dir { path })?;
-                }
-                Change::FileUpdated(path) | Change::FileCreated(path) => {
-                    let (info, reader) = self.from.read_file(&path).await?;
-                    let info = self
-                        .to
-                        .write_file(&path, Some(info.modified), reader, info.size)
-                        .await?;
-
-                    let tracked = Tracked::File {
-                        path,
-                        size: info.size,
-                        modified: info.modified,
-                    };
-                    self.db().update_tracked(&tracked)?;
-                }
-            }
-        }
-
-        Ok(())
+        todo!()
     }
 }
 

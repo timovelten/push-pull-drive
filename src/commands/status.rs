@@ -36,6 +36,6 @@ pub(super) async fn status_of_dir<'a>(
 ) -> anyhow::Result<Vec<Change>> {
     // Get a list of files...
     let all_files = db.get_all_tracked(dir)?;
-    let res = repo.determine_changes(dir, all_files).await?;
+    let res = todo!();
     Ok(res)
 }

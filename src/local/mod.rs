@@ -318,67 +318,6 @@ impl FileRepository for LocalBackend {
 
         Ok(ret)
     }
-
-    async fn determine_changes(
-        &self,
-        path: &RPath,
-        all_files: Vec<crate::db::Tracked>,
-    ) -> Result<Vec<Change>> {
-        let old = FileTreeBuilder::new()
-            .extended_with(all_files)
-            .build()
-            .unwrap();
-
-        let all_current_files = self.list_files(path, u32::MAX).await?;
-        let new = FileTreeBuilder::new()
-            .extended_with(all_current_files)
-            .build()
-            .unwrap();
-
-        let patches = filetree::diff(&new, &old).unwrap();
-
-        let mut changes = Vec::new();
-        for patch in patches {
-            let change = match patch {
-                ft::Patch::Delete(ft::Type::Dir, path) => Change {
-                    kind: ChangeKind::DirCreated,
-                    path: path.to_owned(),
-                },
-                ft::Patch::Delete(ft::Type::File, path) => Change {
-                    kind: ChangeKind::FileCreated,
-                    path: path.to_owned(),
-                },
-                ft::Patch::Update(ft::Type::Dir, _) => {
-                    continue;
-                }
-                ft::Patch::Update(ft::Type::File, path) => {
-                    let old_file = old.get(path).unwrap();
-                    let new_file = new.get(path).unwrap();
-
-                    if is_changed(path, old_file, new_file) {
-                        Change {
-                            kind: ChangeKind::FileUpdated,
-                            path: path.to_owned(),
-                        }
-                    } else {
-                        continue;
-                    }
-                }
-                ft::Patch::Create(ft::Type::Dir, path) => Change {
-                    kind: ChangeKind::DirCreated,
-                    path: path.to_owned(),
-                },
-                ft::Patch::Create(ft::Type::File, path) => Change {
-                    kind: ChangeKind::FileCreated,
-                    path: path.to_owned(),
-                },
-            };
-
-            changes.push(change);
-        }
-
-        Ok(changes)
-    }
 }
 
 fn is_changed(path: &RPath, old: &Tracked, new: &PathInfo) -> bool {

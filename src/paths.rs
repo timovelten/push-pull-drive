@@ -1,5 +1,5 @@
-use core::str;
 use anyhow::bail;
+use core::str;
 use rusqlite::types::{FromSql, ToSqlOutput};
 use rusqlite::ToSql;
 use std::borrow::Borrow;
@@ -34,11 +34,14 @@ impl RPathBuf {
         self.inner.extend(other.inner.iter().cloned())
     }
 
-    /// This will panic if the iterator emits an empty string
+    /// Note: All empty components will be ignored (silently)
     pub fn from_components<T: Into<String>, I: IntoIterator<Item = T>>(components: I) -> Self {
         let mut ret = Self::empty();
         for component in components {
-            ret.push(component.into());
+            let comp = component.into();
+            if !comp.is_empty() {
+                ret.push(comp);
+            }
         }
         ret
     }
@@ -303,6 +306,29 @@ impl RPath {
     }
 }
 
+#[cfg(test)]
+impl From<&'static str> for &'static RPath {
+    /// This is useful in testing to materialze &'static RPaths "out of thin air"
+    fn from(value: &'static str) -> Self {
+        use ahash::HashMap;
+        use std::sync::{LazyLock, Mutex};
+
+        static CACHE: LazyLock<Mutex<HashMap<&'static str, &'static RPath>>> =
+            LazyLock::new(|| Default::default());
+        let mut map = CACHE.lock().unwrap();
+
+        map.entry(value)
+            .or_insert_with(|| Box::leak(Box::new(RPathBuf::from(value))))
+    }
+}
+
+#[cfg(test)]
+impl From<&str> for RPathBuf {
+    fn from(value: &str) -> Self {
+        RPathBuf::from_sep(value, '/')
+    }
+}
+
 impl Display for RPathBuf {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut first = true;
@@ -457,7 +483,7 @@ mod test {
     fn random_path(alphabet: &[char], rng: &mut impl Rng) -> RPathBuf {
         let mut ret = RPathBuf::empty();
         let uniform = Uniform::new(0, alphabet.len());
-    
+
         for _ in 0..8 {
             let word = uniform
                 .sample_iter(&mut *rng)
@@ -475,8 +501,16 @@ mod test {
         let alphabet = "abcdef/\\".chars().collect::<Vec<_>>();
         let mut rng = SmallRng::seed_from_u64(123456);
         for _ in 0..1000 {
-            let path =  random_path(&alphabet, &mut rng);
+            let path = random_path(&alphabet, &mut rng);
             assert_eq!(path, RPathBuf::deserialize(&path.serialize()));
         }
+    }
+
+    #[test]
+    pub fn trailing_separator_is_ignored() {
+        assert_eq!(
+            RPathBuf::from_sep("abc/def/fgh/", '/'),
+            RPathBuf::from_sep("abc/def/fgh", '/')
+        )
     }
 }

@@ -1,5 +1,3 @@
-use crate::db::Tracked;
-use crate::filetree::{self, FileTree};
 use crate::paths::{RPath, RPathBuf};
 use crate::{DirectoryInfo, FileInfo, PathInfo};
 use futures::AsyncRead;
@@ -85,13 +83,6 @@ pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
 
     /// Delete a file or a folder at `path` (including all subfolders, if necessary).
     fn delete(&self, path: &RPath) -> impl Future<Output = Result<()>> + Send;
-
-    /// What changes need to be made to the `from` tree in order for it
-    /// to match the filetree represented by this repository?
-    fn determine_changes<T: filetree::Node>(
-        &self,
-        from: FileTree<T>
-    ) -> impl Future<Output = Result<Vec<Change>>> + Send;
 }
 
 #[derive(Debug, Clone, PartialEq, Hash, Eq, PartialOrd, Ord)]

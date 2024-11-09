@@ -44,6 +44,10 @@ pub fn assert_equal_when_sorted<T: Ord + core::fmt::Debug + Clone>(
     let mut b = Vec::from(right);
     b.sort();
 
+    println!("{a:#?}");
+
+    println!("{b:#?}");
+
     assert_eq!(a, b)
 }
 
