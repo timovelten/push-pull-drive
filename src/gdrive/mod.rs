@@ -22,6 +22,7 @@ mod client;
 pub use config::{load, init};
 
 use crate::file_repository::AsyncReader;
+use crate::file_repository::Change;
 use crate::file_repository::{FileRepository, Error, Result};
 use crate::paths::RPath;
 use crate::FileInfo;
@@ -42,7 +43,7 @@ impl FileRepository for GDriveRepo {
         to self.inner {
             async fn list_files(&self, path: &RPath, up_to_depth: u32) -> Result<Vec<PathInfo>>;
 
-            async fn delete_file(&self, path: &RPath) -> Result<()>;
+            async fn delete(&self, path: &RPath) -> Result<()>;
 
             async fn write_file<R: AsyncReader>(
                 &self,
@@ -59,7 +60,11 @@ impl FileRepository for GDriveRepo {
         Ok((info, Box::into_pin(reader)))
     }
     
-    async fn determine_changes(&self, path: &RPath, all_files: Vec<crate::db::Tracked>) -> Result<Vec<crate::filetree::Patch>> {
+    async fn determine_changes(&self, path: &RPath, all_files: Vec<crate::db::Tracked>) -> Result<Vec<Change>> {
+        todo!()
+    }
+
+    async fn mkdir(&self, path: &RPath) -> Result<crate::DirectoryInfo> {
         todo!()
     }
 }

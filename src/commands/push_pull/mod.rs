@@ -3,13 +3,11 @@ use crate::context::{Context, Ctx};
 use clap::ValueEnum;
 
 mod flow;
-mod progress;
+mod conflicts;
+// mod progress;
 
 #[derive(clap::Args, Clone)]
 pub struct PushPullArgs {
-    #[arg(long)]
-    pub ignore_index: bool,
-
     #[arg(long, value_enum, default_value_t=ConflictResolution::Interactive)]
     conflict_resolution: ConflictResolution,
 }

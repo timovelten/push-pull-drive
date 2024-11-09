@@ -1,5 +1,5 @@
 use crate::{
-    filetree::{self},
+    filetree::{self, Node},
     paths::{RPath, RPathBuf},
 };
 use anyhow::bail;
@@ -69,21 +69,23 @@ impl SqliteDatabase {
 
         // Does the database there have a schema we recognize?
         let v = raw_conn.get_value("schema_version");
-        let (valid_schema, could_be_empty) = match v {
-            Ok(Some(x)) if x == "1" => (true, false),
-            Ok(Some(_)) => (false, false),
-            _ => (false, true),
+        match v {
+            Ok(Some(x)) if x == "1" => {
+                // The database is (probably) initialized with the correct schema
+            }
+            Ok(Some(_)) => {
+                // The database is not empty, but not initialized with the correct schema
+                bail!("Could not create database at {:?}. A database already exists there and is not empty.", path.as_ref())
+            }
+            _ => {
+                // The database might not be intiailized at all
+                if create_if_not_exists {
+                    raw_conn.write_schema()?;
+                } else {
+                    bail!("Database at {:?} is invalid", path.as_ref());
+                }
+            }
         };
-
-        if !valid_schema && !create_if_not_exists {
-            bail!("Database at {:?} is invalid", path.as_ref());
-        } else if !could_be_empty {
-            bail!("Could not create database at {:?}. A database already exists there and is not empty.", path.as_ref())
-        } else {
-            // At this point, both create_if_not_exists and could_be_empty are true.
-            // We just write the schema and are done
-            raw_conn.write_schema()?;
-        }
 
         Ok(Self::new(raw_conn.into_connection()))
     }
@@ -102,9 +104,6 @@ impl SqliteDatabase {
                 &self,
                 prefix: &RPath
             ) -> rusqlite::Result<Vec<Tracked>>;
-
-            #[allow(dead_code)]
-            pub fn get_tracked_file(&self, path: &RPath) -> rusqlite::Result<Option<Tracked>>;
         }
     }
 
@@ -179,24 +178,6 @@ impl RawConn {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    fn get_tracked_file(&self, path: &RPath) -> rusqlite::Result<Option<Tracked>> {
-        let mut stmt = self
-            .conn
-            .prepare_cached("SELECT * FROM tracked WHERE path = ?1")?;
-
-        let mut row = stmt.query((path,))?;
-        match row.next()? {
-            Some(row) => {
-                let tf = Self::tracked_file_from_row(row)?;
-                Ok(Some(tf))
-            }
-            None => Ok(None),
-        }
-        // Note: rows should not (and cannot, at least in theory, contain more rows. We do not
-        // explicitly check for this)
-    }
-
     /// This will not return an error if the specified entry does not exist.
     fn delete_tracked(&self, path: &RPath) -> rusqlite::Result<()> {
         let mut stmt = self
@@ -227,6 +208,11 @@ impl RawConn {
     }
 
     fn update_tracked(&self, t: &Tracked) -> rusqlite::Result<()> {
+        if t.path().is_empty() {
+            assert!(matches!(t, Tracked::Dir {.. }), "The root must be a directory");
+            return Ok(());
+        }
+
         // Keep in sync with tracked_file_from_row
         let mut stmt = self.conn.prepare_cached(
             "INSERT OR REPLACE INTO tracked (path, type, size, modified) VALUES (:path, :type, :size, :modified)"
@@ -269,19 +255,35 @@ impl RawConn {
         // 2) Figure out how to compile sqlite with the flag SQLITE_CASE_SENSITIVE_LIKE. This wouldn't be a bad option.
         // 3) Go with the kind of hacky (but well-defined!) solution we have chosen here.
 
-        let lower = prefix.serialize();
-        let lower_without_trailing_sep = match lower.rsplit_once('/') {
-            Some((x, _)) => x,
-            None => "",
-        };
-        let upper = format!("{lower_without_trailing_sep}0");
+        if !prefix.is_empty() {
+            let lower = prefix.serialize();
+            let lower_without_trailing_sep = match lower.rsplit_once('/') {
+                Some((x, _)) => x,
+                None => "",
+            };
+            let upper = format!("{lower_without_trailing_sep}0");
 
-        let mut stmt = self
-            .conn
-            .prepare("SELECT * FROM tracked WHERE path >= ?1 AND path < ?2")?;
-        let rows = stmt.query((lower, upper))?;
-        rows.mapped(|row| Self::tracked_file_from_row(row))
-            .collect()
+            let mut stmt = self
+                .conn
+                .prepare("SELECT * FROM tracked WHERE path >= ?1 AND path < ?2")?;
+
+            let rows = stmt.query((lower, upper))?;
+            rows.mapped(|row| Self::tracked_file_from_row(row))
+                .collect()
+        } else {
+            let mut stmt = self.conn.prepare("SELECT * FROM tracked")?;
+            let rows = stmt.query([])?;
+            let mut all = rows
+                .mapped(|row| Self::tracked_file_from_row(row))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            // Pretend as if the empty directory is also tracked...
+            all.push(Tracked::Dir {
+                path: RPathBuf::empty(),
+            });
+
+            Ok(all)
+        }
     }
 }
 
@@ -318,8 +320,8 @@ mod tests {
         let repo = empty_in_memory_repository();
 
         let rpath = &RPathBuf::from_components(["somedir", "that", "contains", "file"]);
-        let res = repo.get_tracked_file(rpath).unwrap();
-        assert!(res.is_none());
+        let res = repo.get_all_tracked(rpath).unwrap();
+        assert!(res.is_empty());
 
         let tf = Tracked::File {
             path: rpath.to_owned(),
@@ -329,14 +331,14 @@ mod tests {
 
         repo.update_tracked(&tf).unwrap();
 
-        let tf_retrieved = repo.get_tracked_file(rpath).unwrap();
+        let tf_retrieved = repo.get_all_tracked(rpath).unwrap();
 
-        assert_eq!(tf_retrieved, Some(tf));
+        assert_eq!(tf_retrieved, [tf]);
 
         repo.delete_tracked(rpath).unwrap();
 
-        let tf3 = repo.get_tracked_file(rpath).unwrap();
-        assert!(tf3.is_none());
+        let tf3 = repo.get_all_tracked(rpath).unwrap();
+        assert!(tf3.is_empty());
     }
 
     #[test]

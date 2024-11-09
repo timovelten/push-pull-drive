@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use anyhow::Context;
+use anyhow::{anyhow, bail, Context};
 use cached::TimedCache;
 use drive_api::{DriveApi, File, FilesReq, GoogleCredential, MoreFileFields};
 use futures::{stream::FuturesUnordered, AsyncRead, StreamExt as _};
@@ -36,11 +36,13 @@ fn to_pathinfo(file: drive_api::File, path: RPathBuf) -> (Option<PathInfo>, Stri
 /// if the file is a directory, and `Error::NotAllowed`, if it is neither a binary file nor a directory (i.e. google docs document or something
 /// like that)
 fn to_fileinfo(file: drive_api::File, path: RPathBuf) -> Result<FileInfo> {
-    match to_pathinfo(file, path.clone()).0 {
-        Some(PathInfo::File(info)) => Ok(info),
-        Some(PathInfo::Dir(DirectoryInfo { path: rpath })) => Err(Error::IsADirectory { rpath }),
-        None => Err(Error::NotAllowed { rpath: path }),
-    }
+    let err = match to_pathinfo(file, path.clone()).0 {
+        Some(PathInfo::File(info)) => return Ok(info),
+        Some(PathInfo::Dir(DirectoryInfo { path: rpath })) => anyhow!(Error::IsADirectory),
+        None => anyhow!(Error::NotAllowed),
+    };
+
+    return Err(err.context(path));
 }
 
 #[derive(Debug)]
@@ -116,8 +118,7 @@ impl GDriveClient {
         let root_file = self
             .api_client
             .files_get("root")
-            .await
-            .map_err(|err| Error::Other(err.into()))?;
+            .await?;
         debug_assert_eq!(root_file.parents, None);
         self.cache_file(RPath::empty(), root_file.clone());
 
@@ -133,9 +134,7 @@ impl GDriveClient {
 
             // At this point, "{current_rpath}/next_file_name" is the file were looking for.
             if !current_file.is_folder() {
-                return Err(Error::NotADirectory {
-                    rpath: current_path,
-                });
+                return Err(anyhow!(Error::NotADirectory).context(current_path));
             }
 
             let files = self.read_dirs([current_file.id]).await?;
@@ -166,7 +165,7 @@ impl GDriveClient {
                 current_path = next_rpath;
                 current_file = next_file;
             } else {
-                return Err(Error::NotFound { rpath: next_rpath });
+                return Err(anyhow!(Error::NotFound).context(next_rpath));
             }
         }
 
@@ -180,54 +179,7 @@ impl GDriveClient {
     /// It is important that mkdir_all is NOT called concurrently with itself. For this reason,
     /// the caller should aquire all permits (`self.api_exclusive()`) to call this function.
     pub async fn mkdir_all(&self, rpath: &RPath) -> Result<Arc<drive_api::File>> {
-        log::debug!("creating folder(s) {}", rpath);
-        let _guard = self.mkdir_lock.lock().await;
-
-        /// It is important that we take an exclusive lock here! We particularly want to avoid
-        /// any other mkdir_all running at the same time as us (anything else would more or less probably work...)
-        loop {
-            /// Try and build up the thing!
-            match self.drive_file_by_rpath_cached(rpath).await {
-                Ok(file) => {
-                    if file.is_folder() {
-                        return Ok(file);
-                    } else {
-                        return Err(Error::NotADirectory {
-                            rpath: rpath.to_owned(),
-                        });
-                    }
-                }
-                Err(Error::NotFound { rpath: subpath }) => {
-                    // We rely on the correct error here. It should return the "smallest" possible subpath that was not found
-                    // (i.e. after chopping off the last bit from that path, the remaining path should be valid)
-                    log::debug!("mkdir_all encountered a NotFound for {}", subpath);
-
-                    // This can only fail when subpath is empty. And the empty path should always be valid
-                    let (parent, name) = subpath.split_right().expect("subpath is not empty");
-                    let parent_id = &self.drive_file_by_rpath_cached(parent).await?.id;
-
-                    // subpath was not found, so create it!
-                    let req =
-                        FilesReq::new_create_folder(name.to_owned(), parent_id.as_str().to_owned());
-                    let created_file = self
-                        .api_client
-                        .files_create(req)
-                        .await
-                        .map_err(|err| Error::Other(err.into()))?;
-                    log::debug!("Created folder {} with id {}", subpath, created_file.id);
-
-                    self.cache_file(&subpath, created_file.clone());
-
-                    // We could loop once more here and let the other match arm end the loop too, but that would only cost us
-                    // one more api call...
-                    if &*subpath == rpath {
-                        return Ok(Arc::new(created_file));
-                    }
-                }
-                // Other errors (i.e. if a subpath is a file or something like that) we cannot deal with
-                Err(err) => return Err(err),
-            }
-        }
+        todo!()
     }
 
     /// This is a helper method. It takes a list of targets, which are google drive ids of folders (or not,
@@ -262,8 +214,7 @@ impl GDriveClient {
         let files = self
             .api_client
             .file_list_all(&query)
-            .await
-            .map_err(|err| Error::Other(err.into()))?;
+            .await?;
 
         return Ok(files);
 
@@ -277,9 +228,7 @@ impl GDriveClient {
         len: u64,
     ) -> Result<Arc<drive_api::File>> {
         // We need to create the file. For that, we need to place it in the right path
-        let (parent, filename) = path.split_right().ok_or_else(|| Error::IsADirectory {
-            rpath: path.to_owned(),
-        })?;
+        let (parent, filename) = path.split_right().ok_or(Error::IsADirectory)?;
         
         let parent_file = self.mkdir_all(parent).await?;
         let file = self
@@ -293,18 +242,18 @@ impl GDriveClient {
                 src,
                 len,
             )
-            .await
-            .map_err(|err| Error::Other(err.into()))?;
+            .await?;
 
         let ret = self.cache_file(path, file);
         Ok(ret)
     }
 
     async fn update_file<R: AsyncRead + Send>(&self, file: File, src: R, len: u64) -> Result<File> {
-        self.api_client
+        let file = self.api_client
             .files_update_upload(&file.id, src, len)
-            .await
-            .map_err(|err| Error::Other(err.into()))
+            .await?;
+
+        Ok(file)
     }
 
     pub async fn get_metadata(&self, cpath: &RPath) -> Result<PathInfo> {
@@ -324,12 +273,10 @@ impl GDriveClient {
                     path: cpath.to_owned(),
                 }),
                 _ => {
-                    return Err(Error::NotAllowed {
-                        rpath: cpath.to_owned(),
-                    })
+                    bail!(Error::NotAllowed);
                 }
             },
-            Err(err) => return Err(Error::Other(err.into())),
+            Err(err) => bail!(err),
         };
 
         Ok(info)
@@ -356,13 +303,12 @@ impl GDriveClient {
                 let body = self
                     .api_client
                     .files_get_alt_media(&file.id, Some(&head_revision_id))
-                    .await
-                    .map_err(|err| Error::Other(err.into()))?;
+                    .await?;
 
                 Ok((info, body))
             }
-            None if file.is_folder() => Err(Error::IsADirectory { rpath: cpath }),
-            _ => Err(Error::NotAllowed { rpath: cpath }),
+            None if file.is_folder() => Err(anyhow!(Error::IsADirectory)),
+            _ => Err(anyhow!(Error::NotAllowed)),
         }
     }
 
@@ -374,31 +320,11 @@ impl GDriveClient {
         len: u64,
     ) -> Result<FileInfo> {
         let cpath = path.to_owned();
-        let info = match self.drive_file_by_rpath(&cpath).await {
-            Ok(file) => {
-                // The file already exists, update it.
-                let file = self.update_file(file, src, len).await?;
-                to_fileinfo(file, cpath)?
-            }
-            Err(Error::NotFound { .. }) => {
-                // No such file exists, create it!
-                log::debug!(
-                    "Tried to write to drive path {cpath} but it does not exist. Creating it."
-                );
 
-                let file = self.create_file(&cpath, src, len).await?.as_ref().clone();
-
-                to_fileinfo(file, cpath)?
-            }
-            Err(err) => return Err(err),
-        };
-
-        Ok(info)
+        todo!("Check if the file exists and then update it. Otherwise, create it");
     }
 
-    pub async fn delete_file(&self, path: &RPath) -> Result<()> {
-        // To be sure, we require deletions to have exclusive access (I'm not sure if weird things might
-        // otherwise happen if we delete a directory and the files in it at the same time or something like that)
+    pub async fn delete(&self, path: &RPath) -> Result<()> {
         let id = &self.drive_file_by_rpath_cached(path).await?.id;
 
         // Delete from cache early (what if the deletion happens, but still returns an error for whatever reason. Deleting from
@@ -406,8 +332,7 @@ impl GDriveClient {
         self.delete_from_cache(path);
         self.api_client
             .files_delete(id)
-            .await
-            .map_err(|err| Error::Other(err.into()))?;
+            .await?;
 
         Ok(())
     }
@@ -505,7 +430,7 @@ impl GDriveClient {
                         ret.push((file.id, info));
                     }
 
-                    Ok(ret)
+                    Ok::<_, anyhow::Error>(ret)
                 });
             }
 

@@ -1,37 +1,30 @@
 use crate::db::Tracked;
-use crate::filetree::Patch;
+use crate::filetree::{self, FileTree};
 use crate::paths::{RPath, RPathBuf};
-use crate::{FileInfo, PathInfo};
+use crate::{DirectoryInfo, FileInfo, PathInfo};
 use futures::AsyncRead;
 use std::fmt::Debug;
 use std::future::Future;
-use thiserror::Error;
 
-#[derive(Debug, Error)]
-#[allow(dead_code)]
+#[derive(Debug, strum::Display)]
 pub enum Error {
-    #[error("{rpath:?} was not found")]
-    NotFound { rpath: RPathBuf },
-    #[error("{rpath:?} not allowed")]
-    NotAllowed { rpath: RPathBuf },
-    #[error("Expected a non-directory, got a directory. {rpath:?}.")]
-    IsADirectory { rpath: RPathBuf },
-    #[error("Expected a directory, got something else. {rpath:?}.")]
-    NotADirectory { rpath: RPathBuf },
-    #[error(transparent)]
-    Other(anyhow::Error),
+    NotFound,
+    NotAllowed,
+    IsADirectory,
+    NotADirectory,
 }
+impl std::error::Error for Error {}
 
 pub trait AsyncReader: AsyncRead + Send {}
 impl<T> AsyncReader for T where T: AsyncRead + Send {}
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = anyhow::Result<T>;
 
 /// Implementations should ensure that the number of concurrent requests does not exceed
 /// the capabilities of an underlying server. This can be implemented with a semaphore.
 ///
 /// Implementations should be cheaply cloneable, potentially by being wrapped inside of an Arc.
-/// 
+///
 /// Note that this trait is not object safe.
 pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
     type Reader: AsyncReader;
@@ -43,7 +36,7 @@ pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
     const CONCURRENCY_LIMIT: usize;
 
     /// Return all files and folder such that the given path is a subpath of their paths. That is,
-    /// 
+    ///
     /// - If path is a directory this returns the directory itself and all of its children up to the given depth (depth 0 is just the directory itself,
     ///   depth 1 includes the immediate children and so on)
     /// - If path is a file, then this returns just that file and the given depth is irrelevant
@@ -64,7 +57,7 @@ pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
     /// - If a subpath of `path` is a file, this returns either [`Error::NotADirectory`] or [`Error::NotFound`] (up to the implementation).
     fn read_file(
         &self,
-        relative_name: &RPath,
+        path: &RPath,
     ) -> impl Future<Output = Result<(FileInfo, Self::Reader)>> + Send;
 
     /// Read the given `src` reader to completion and write its contents to the given path name. Do note the following behavior (which more or less mimicks the behavior
@@ -88,29 +81,30 @@ pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
         len: u64,
     ) -> impl Future<Output = Result<FileInfo>> + Send;
 
-    /// Delete a file or a folder at `rpath` (including all subfolders, if necessary).
-    fn delete_file(&self, path: &RPath) -> impl Future<Output = Result<()>> + Send;
+    fn mkdir(&self, path: &RPath) -> impl Future<Output = Result<DirectoryInfo>> + Send;
 
-    fn determine_changes(&self, path: &RPath, all_files: Vec<Tracked>) -> impl Future<Output = Result<Vec<Patch>>> + Send;
+    /// Delete a file or a folder at `path` (including all subfolders, if necessary).
+    fn delete(&self, path: &RPath) -> impl Future<Output = Result<()>> + Send;
 
-    /// Deletes a directory at path (and all subdirectories it contains) if it contains no files. See [`Self::delete_file`].
-    fn delete_orphaned_directory(&self, path: &RPath) -> impl Future<Output = Result<bool>> + Send {
-        async {
-            let files_in_folder = self
-                .list_files(path, u32::MAX)
-                .await?
-                .into_iter()
-                .filter(|d| matches!(d, PathInfo::File(_)))
-                .count();
+    /// What changes need to be made to the `from` tree in order for it
+    /// to match the filetree represented by this repository?
+    fn determine_changes<T: filetree::Node>(
+        &self,
+        from: FileTree<T>
+    ) -> impl Future<Output = Result<Vec<Change>>> + Send;
+}
 
-            log::debug!("delete_oprhanded_directory found {} files", files_in_folder);
+#[derive(Debug, Clone, PartialEq, Hash, Eq, PartialOrd, Ord)]
+pub enum ChangeKind {
+    FileDeleted,
+    DirDeleted,
+    FileUpdated,
+    DirCreated,
+    FileCreated
+}
 
-            if files_in_folder == 0 {
-                self.delete_file(path).await?;
-                Ok(true)
-            } else {
-                Ok(false)
-            }
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Hash, Eq, PartialOrd, Ord)]
+pub struct Change {
+    pub kind: ChangeKind,
+    pub path: RPathBuf
 }

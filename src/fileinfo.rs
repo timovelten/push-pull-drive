@@ -1,4 +1,4 @@
-use crate::{filetree::{self, Node}, paths::{RPath, RPathBuf}};
+use crate::{filetree::{self}, paths::{RPath, RPathBuf}};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum FileChange {

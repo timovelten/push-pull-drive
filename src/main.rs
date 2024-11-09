@@ -5,8 +5,7 @@ use std::{fs::File, path::Path, sync::Arc};
 
 pub mod commands;
 use commands::{
-    init::{self, InitBackendCmd},
-    ls::{self, LsArgs}
+    init::{self, InitBackendCmd}, ls::{self, LsArgs}, push_pull::{self, PushPullArgs}, status::{self, StatusArgs}
 };
 
 pub mod context;
@@ -57,6 +56,9 @@ enum Commands {
         backend: InitBackendCmd,
     },
     RemoteLs(LsArgs),
+    Status(StatusArgs),
+    RemoteStatus(StatusArgs),
+    Pull(PushPullArgs),
 }
 
 trait CommandHandler {
@@ -137,6 +139,9 @@ impl<C: Context> CommandHandler for C {
         match cmd {
             Commands::Init { .. } => unimplemented!("Init command is handled separately elsewhere"),
             Commands::RemoteLs(args) => ls::remote_ls(self, args),
+            Commands::Status(args) => status::local_status(self.get(), args),
+            Commands::RemoteStatus(args) => status::remote_status(self.get(), args),
+            Commands::Pull(args) => push_pull::pull(self.get(), args)
         }
     }
 }

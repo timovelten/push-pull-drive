@@ -1,4 +1,4 @@
-use super::flow::ChangeRequest;
+
 use crate::util::human_readable_bytes;
 use crate::util::Shell;
 use std::io::Write;
@@ -18,6 +18,38 @@ enum ProgressUpdate {
     Start { id: usize },
     Done { id: usize },
     Failed { id: usize }
+}
+
+// One could imagine that we might add a variant here to also make some changes on the src side (?)
+// For now, we do not have that though and all these represent changes we intend to make on the dst side.
+#[derive(PartialEq, Clone, Debug)]
+pub(super) enum ChangeRequest {
+    DeleteFile { rpath: RPathBuf },
+    DeleteDir { rpath: RPathBuf },
+    CreateFile { info: FileInfo },
+    UpdateFile { info: FileInfo },
+}
+
+impl std::fmt::Display for ChangeRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Note: It is somewhat important that whatever we return contains no line-breaks (so as to not break the asthetic...)
+        match self {
+            ChangeRequest::DeleteFile { rpath } => {
+                write!(f, "Delete {}", WithoutNewlines(&rpath.to_string()))?;
+            }
+            ChangeRequest::DeleteDir { rpath } => {
+                write!(f, "Delete {}", WithoutNewlines(&rpath.to_string()))?;
+            }
+            ChangeRequest::CreateFile { info } => {
+                write!(f, "Create {}", WithoutNewlines(&info.rpath.to_string()))?;
+            }
+            ChangeRequest::UpdateFile { info } => {
+                write!(f, "Update {}", WithoutNewlines(&info.rpath.to_string()))?;
+            }
+        };
+
+        Ok(())
+    }
 }
 
 #[derive(Clone)]

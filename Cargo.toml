@@ -15,6 +15,9 @@ rand = { version = "0.8.5", features = ["small_rng"] }
 log = { version = "0.4.21", features = ["std"] }
 oauth2 = { version = "4.3.0" }
 
+# Has better error messages than assert!(matches!(...))
+assert_matches = "1.5.0"
+
 [package]
 name = "push-pull-drive"
 version = "0.1.0"
@@ -52,10 +55,12 @@ walkdir = "2.5.0"
 tempfile = "3.10.1"
 delegate = "0.12.0"
 static_assertions = "1.1.0"
+strum = { version = "0.26.3", features = ["derive"] }
 
 [dev-dependencies]
 test-log = "0.2.15"
 rand.workspace = true
+assert_matches.workspace = true
 
 # Always compile dependencies with some level of optimization. Especially the hashing
 # is painfully slow otherwise.

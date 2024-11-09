@@ -1,25 +1,27 @@
-pub mod config;
-pub mod file_hasher;
 use anyhow::anyhow;
-pub use config::*;
+use anyhow::bail;
+use futures::TryFutureExt;
 use walkdir::WalkDir;
 
-use self::file_hasher::{FileHasher, Sha1Hasher};
 use crate::db::Tracked;
+use crate::file_repository::Change;
+use crate::file_repository::ChangeKind;
 use crate::file_repository::Error;
 use crate::file_repository::Result;
+use crate::filetree as ft;
 use crate::filetree;
-use crate::filetree::FileTree;
 use crate::filetree::FileTreeBuilder;
 use crate::paths::RPath;
 use crate::paths::RPathBuf;
 use crate::{file_repository::FileRepository, DirectoryInfo, FileInfo, PathInfo};
 use futures::AsyncRead;
+use std::path::Path as StdPath;
+use std::time::Duration;
 use std::u32;
 use std::{
     fs::File,
     io::{ErrorKind, Seek},
-    path::{Path, PathBuf},
+    path::PathBuf,
     pin::pin,
     sync::Arc,
 };
@@ -27,10 +29,13 @@ use tokio::fs::File as TokioFile;
 use tokio::task::spawn_blocking;
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
+pub mod config;
+pub mod file_hasher;
+pub use config::*;
+
 #[derive(Debug, Clone)]
-pub struct LocalBackend<H = Sha1Hasher> {
+pub struct LocalBackend {
     config: Arc<Config>,
-    hasher: H,
 }
 
 #[derive(Debug, Clone)]
@@ -44,20 +49,15 @@ pub struct Config {
     pub ignore_prefixes: Vec<RPathBuf>,
 }
 
-impl<H: FileHasher + Default> LocalBackend<H> {
+impl LocalBackend {
     pub fn from_config(config: Config) -> Self {
-        Self::new(config, Default::default())
+        Self {
+            config: Arc::new(config),
+        }
     }
 }
 
-impl<H: FileHasher> LocalBackend<H> {
-    pub fn new(config: Config, hasher: H) -> Self {
-        Self {
-            config: Arc::new(config),
-            hasher,
-        }
-    }
-
+impl LocalBackend {
     /// path is still needed because it is returned as part of the metadata. Otherwise, it is ignored.
     ///
     /// Note that this function might calculate the hash of the file and is therefore somewhat CPU bound. You should
@@ -67,7 +67,7 @@ impl<H: FileHasher> LocalBackend<H> {
         path: RPathBuf,
         mut file: File,
     ) -> Result<(PathInfo, File)> {
-        let metadata = file.metadata().map_err(|err| map_io_error(err, &path))?;
+        let metadata = file.metadata().map_err(map_io_error)?;
         let res = if metadata.is_file() {
             let info = FileInfo {
                 path,
@@ -78,7 +78,7 @@ impl<H: FileHasher> LocalBackend<H> {
                     .into(),
             };
 
-            file.rewind().map_err(as_other_error)?;
+            file.rewind()?;
             (PathInfo::File(info), file)
         } else if metadata.is_dir() {
             (
@@ -88,10 +88,7 @@ impl<H: FileHasher> LocalBackend<H> {
                 file,
             )
         } else {
-            // For now, we ignore symlinks by returning NotAllowed...
-            return Err(Error::NotAllowed {
-                rpath: path.to_owned(),
-            });
+            bail!("symlinks cannot be opened (at {path:?})")
         };
 
         Ok(res)
@@ -99,103 +96,37 @@ impl<H: FileHasher> LocalBackend<H> {
 
     fn read_file_impl(&self, path: RPathBuf) -> Result<(PathInfo, File)> {
         if self.config.is_ignored(&path) {
-            return Err(Error::NotAllowed {
-                rpath: path.to_owned(),
-            });
+            bail!(Error::NotAllowed);
         }
-        let local_path = self.config.get_local_path_from_rpath(&path);
+        let local_path = self.config.get_local_path(&path);
 
         // Open it, to avoid the time-of-check-time-of-use race condition. Note that
         // one can actually open directories.
-        let file = File::open(local_path).map_err(|err| map_io_error(err, &path))?;
+        let file = File::open(local_path).map_err(map_io_error)?;
         self.read_file_impl_for_open_file(path, file)
-    }
-
-    fn read_dir_impl(
-        config: &Arc<Config>,
-        path: impl AsRef<Path>,
-        max_depth: usize,
-    ) -> Result<Vec<RPathBuf>> {
-        let mut ret = Vec::new();
-
-        let walker = WalkDir::new(path).max_depth(max_depth);
-        for entry in walker {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(err) => {
-                    let error_depth = err.depth();
-                    let error_rpath = if let Some(err_path) = err.path() {
-                        RPathBuf::try_from_path(&config.root_path, err_path).map_err(|err| {
-                            let err = anyhow!(err).context(format!(
-                                "Error occurred at depth {} for error path {err_path:?}",
-                                error_depth
-                            ));
-                            Error::Other(err)
-                        })?
-                    } else {
-                        RPathBuf::empty()
-                    };
-
-                    let err = map_io_error(
-                        err.into_io_error().expect("should be io error"),
-                        &error_rpath,
-                    );
-                    return Err(err);
-                }
-            };
-
-            if entry.depth() == 0 {
-                continue;
-            }
-
-            let child_rpath =
-                RPathBuf::try_from_path(&config.root_path, entry.path()).map_err(as_other_error)?;
-
-            ret.push(child_rpath);
-        }
-
-        Ok(ret)
     }
 }
 
-fn map_io_error(err: std::io::Error, path: &RPath) -> Error {
-    if path.is_empty() {
-        return as_other_error(err);
-    }
-
+fn map_io_error(err: std::io::Error) -> anyhow::Error {
     match err.kind() {
-        ErrorKind::NotFound => Error::NotFound {
-            rpath: path.to_owned(),
-        },
-        ErrorKind::PermissionDenied => Error::NotAllowed {
-            rpath: path.to_owned(),
-        },
+        ErrorKind::NotFound => Error::NotFound.into(),
+        ErrorKind::PermissionDenied => Error::NotAllowed.into(),
         _ => {
             // It is actually extremely unfortunate that more error kinds are still not
             // stabilized. In the meantime, we really want the IsADirectory and IsNotADirectory
             // so we do them ourselves here...
+            // TODO: Change this when Rust 1.83 lands
             match err.raw_os_error() {
-                Some(libc::ENOTDIR) => Error::NotADirectory {
-                    rpath: path.to_owned(),
-                },
-                Some(libc::EISDIR) => Error::IsADirectory {
-                    rpath: path.to_owned(),
-                },
-                _ => {
-                    let e = anyhow!(err).context(path.to_owned());
-                    Error::Other(e)
-                }
+                Some(libc::ENOTDIR) => Error::NotADirectory.into(),
+                Some(libc::EISDIR) => Error::IsADirectory.into(),
+                _ => anyhow!(err),
             }
         }
     }
 }
 
-fn as_other_error(err: impl Into<anyhow::Error>) -> Error {
-    Error::Other(err.into())
-}
-
 impl Config {
-    fn get_local_path_from_rpath(&self, path: &RPath) -> PathBuf {
+    fn get_local_path(&self, path: &RPath) -> PathBuf {
         let slash_separated_path = path
             .with_separator('/')
             .expect("directory and filenames should not contain slashes");
@@ -211,9 +142,13 @@ impl Config {
 
         false
     }
+
+    fn get_path(&self, local_path: impl AsRef<StdPath>) -> anyhow::Result<RPathBuf> {
+        RPathBuf::try_from_path(&self.root_path, local_path.as_ref())
+    }
 }
 
-impl<H: FileHasher> FileRepository for LocalBackend<H> {
+impl FileRepository for LocalBackend {
     type Reader = Compat<TokioFile>;
     const CONCURRENCY_LIMIT: usize = 16;
 
@@ -224,12 +159,21 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
             .await
             .unwrap()?
         else {
-            return Err(Error::IsADirectory {
-                rpath: path.to_owned(),
-            });
+            bail!(Error::IsADirectory)
         };
 
         Ok((info, TokioFile::from_std(file).compat()))
+    }
+
+    async fn mkdir(&self, path: &RPath) -> Result<DirectoryInfo> {
+        let local_path = self.config.get_local_path(path);
+        tokio::fs::create_dir(local_path)
+            .await
+            .map_err(map_io_error)?;
+
+        Ok(DirectoryInfo {
+            path: path.to_owned(),
+        })
     }
 
     async fn write_file<R: AsyncRead + Send>(
@@ -241,9 +185,7 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
     ) -> Result<FileInfo> {
         let mut src = pin!(src.compat());
         if self.config.is_ignored(path) {
-            return Err(Error::NotAllowed {
-                rpath: path.to_owned(),
-            });
+            bail!(Error::NotAllowed);
         }
 
         // We are optimistic: Start writing the file to a temporary location
@@ -261,9 +203,7 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
 
         log::info!("Writing to temp path {:?}", tmp_file_path);
 
-        tokio::io::copy(&mut src, &mut tmp_file)
-            .await
-            .map_err(as_other_error)?;
+        tokio::io::copy(&mut src, &mut tmp_file).await?;
 
         // Drop the source as early as possible. It is conceivable that our call tracks how long
         // the source reader is around (via the drop trait) and maybe terminate a connection or something.
@@ -279,8 +219,7 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
         let cp = path.to_owned();
         let (PathInfo::File(info), _) = spawn_blocking(move || {
             if let Some(modified_time) = modified_time {
-                file.set_modified(modified_time.into())
-                    .map_err(as_other_error)?;
+                file.set_modified(modified_time.into())?;
             }
             me.read_file_impl_for_open_file(cp, file)
         })
@@ -291,10 +230,7 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
         };
 
         // Make sure the directories exist..
-        let local_path = self.config.get_local_path_from_rpath(path);
-        tokio::fs::create_dir_all(local_path.parent().unwrap())
-            .await
-            .map_err(as_other_error)?;
+        let local_path = self.config.get_local_path(path);
 
         // Make sure the file exists..
         let _ = tokio::fs::OpenOptions::new()
@@ -303,56 +239,67 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
             .create(true)
             .truncate(false)
             .open(&local_path)
-            .await
-            .map_err(|err| map_io_error(err, path))?;
+            .map_err(map_io_error)
+            .await?;
 
         // Actually rename. This should succeed now that we have created the file.
         spawn_blocking(|| tmp_file_path.persist(local_path))
             .await
-            .unwrap()
-            .map_err(as_other_error)?;
+            .unwrap()?;
 
         Ok(info)
     }
 
-    async fn delete_file(&self, path: &RPath) -> Result<()> {
-        let local_path = self.config.get_local_path_from_rpath(path);
+    async fn delete(&self, path: &RPath) -> Result<()> {
+        let local_path = self.config.get_local_path(path);
+        let f = tokio::fs::File::open(&local_path).await?;
+        let meta = f.metadata().await?;
 
-        // Pretend it is a file first. If that fails, try to delete a directory there...
-        let res = tokio::fs::remove_file(&local_path)
-            .await
-            .map_err(move |err| map_io_error(err, path));
-
-        match res {
-            Ok(()) => {}
-            Err(Error::IsADirectory { rpath: cp }) if &*cp == path => {
-                // Maybe it is a directory?
-                tokio::fs::remove_dir(&local_path)
-                    .await
-                    .map_err(move |err| map_io_error(err, path))?;
-            }
-            Err(err) => return Err(err),
-        };
+        if meta.is_dir() {
+            drop(f);
+            tokio::fs::remove_dir_all(local_path).await?;
+        } else if meta.is_file() {
+            tokio::fs::remove_file(local_path).await?;
+        } else {
+            bail!(Error::NotAllowed)
+        }
 
         Ok(())
     }
 
     async fn list_files(&self, path: &RPath, up_to_depth: u32) -> Result<Vec<PathInfo>> {
         let mut ret = Vec::new();
-        let local_path = self.config.get_local_path_from_rpath(&path);
+        let local_path = self.config.get_local_path(&path);
         let walker = WalkDir::new(local_path).max_depth(up_to_depth as usize);
 
+        // Try to access the root element here in order to catch "common" errors
         for entry in walker {
-            let entry = entry.map_err(as_other_error)?;
-            let entry_path = RPathBuf::try_from_path(&self.config.root_path, entry.path())
-                .map_err(as_other_error)?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    let err = if err.io_error().is_some() {
+                        let mapped_io_error = map_io_error(err.into_io_error().unwrap());
+                        anyhow!(mapped_io_error)
+                    } else {
+                        anyhow!(err)
+                    };
+
+                    return Err(err.context(path.to_owned()));
+                }
+            };
+
+            let entry_path = self.config.get_path(entry.path())?;
+
+            // Note: This means that we just return an empty list when this is called with a directory
+            // that we are not allowed to access (is that okay?)
+            if self.config.is_ignored(&entry_path) {
+                continue;
+            }
+
             if entry.file_type().is_dir() {
                 ret.push(PathInfo::Dir(DirectoryInfo { path: entry_path }))
             } else if entry.file_type().is_file() {
-                let meta = entry
-                    .metadata()
-                    .map_err(|err| err.into_io_error().unwrap())
-                    .map_err(|err| map_io_error(err, &entry_path))?;
+                let meta = entry.metadata()?;
 
                 let info = FileInfo {
                     path: entry_path,
@@ -376,7 +323,7 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
         &self,
         path: &RPath,
         all_files: Vec<crate::db::Tracked>,
-    ) -> Result<Vec<crate::filetree::Patch>> {
+    ) -> Result<Vec<Change>> {
         let old = FileTreeBuilder::new()
             .extended_with(all_files)
             .build()
@@ -388,13 +335,101 @@ impl<H: FileHasher> FileRepository for LocalBackend<H> {
             .build()
             .unwrap();
 
-        todo!()
+        let patches = filetree::diff(&new, &old).unwrap();
+
+        let mut changes = Vec::new();
+        for patch in patches {
+            let change = match patch {
+                ft::Patch::Delete(ft::Type::Dir, path) => Change {
+                    kind: ChangeKind::DirCreated,
+                    path: path.to_owned(),
+                },
+                ft::Patch::Delete(ft::Type::File, path) => Change {
+                    kind: ChangeKind::FileCreated,
+                    path: path.to_owned(),
+                },
+                ft::Patch::Update(ft::Type::Dir, _) => {
+                    continue;
+                }
+                ft::Patch::Update(ft::Type::File, path) => {
+                    let old_file = old.get(path).unwrap();
+                    let new_file = new.get(path).unwrap();
+
+                    if is_changed(path, old_file, new_file) {
+                        Change {
+                            kind: ChangeKind::FileUpdated,
+                            path: path.to_owned(),
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                ft::Patch::Create(ft::Type::Dir, path) => Change {
+                    kind: ChangeKind::DirCreated,
+                    path: path.to_owned(),
+                },
+                ft::Patch::Create(ft::Type::File, path) => Change {
+                    kind: ChangeKind::FileCreated,
+                    path: path.to_owned(),
+                },
+            };
+
+            changes.push(change);
+        }
+
+        Ok(changes)
     }
+}
+
+fn is_changed(path: &RPath, old: &Tracked, new: &PathInfo) -> bool {
+    const EPSILON: Duration = Duration::from_millis(10);
+
+    let Tracked::File {
+        size: old_size,
+        modified: old_modified,
+        ..
+    } = old
+    else {
+        panic!("expected a file")
+    };
+
+    let PathInfo::File(FileInfo {
+        size: new_size,
+        modified: new_modified,
+        ..
+    }) = new
+    else {
+        panic!("expected a file")
+    };
+
+    if old_size != new_size {
+        log::trace!(
+            "Considering {} as changed because of size change {} --> {}",
+            path,
+            old_size,
+            new_size
+        );
+        return true;
+    }
+
+    if *new_modified - *old_modified >= EPSILON {
+        log::trace!(
+            "Considering {} as changed because of modtime change {:?} --> {:?}",
+            path,
+            old_modified,
+            new_modified
+        );
+        return true;
+    }
+
+    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert_matches::assert_matches;
+    use filetree::Node;
     use futures::io::Cursor;
     use std::{any::Any, fs::OpenOptions, io::Write, path::Path};
     use time::OffsetDateTime;
@@ -413,7 +448,7 @@ mod tests {
             ..default_config(tmp.path().to_owned())
         };
 
-        let b = LocalBackend::<Sha1Hasher>::from_config(config);
+        let b = LocalBackend::from_config(config);
 
         let mut files = vec![
             "file-1.txt",
@@ -425,6 +460,7 @@ mod tests {
             "anothersubdir/d1/d2/d3/ignored"
         ];
         let mut directories = vec![
+            "",
             "subdir",
             "anothersubdir",
             "anothersubdir/d1",
@@ -471,13 +507,17 @@ mod tests {
         // Now read it with read_dir (this should really be done recursively,
         // but the recursive function definition is kind of verbose)
         let mut retrieved_files = vec![];
-        let mut retrieved_directories = vec![];
+        let mut retrieved_directories = vec![String::new()];
 
         let mut next_directories = vec![RPath::empty().to_owned()];
         while let Some(relative_name) = next_directories.pop() {
             let path: RPathBuf = relative_name.try_into().unwrap();
 
             for info in b.list_files(&path, 1).await.unwrap() {
+                if info.path() == path.as_rpath() {
+                    continue;
+                }
+
                 match info {
                     PathInfo::Dir(d) => {
                         retrieved_directories.push(d.path.with_separator('/').unwrap());
@@ -528,7 +568,7 @@ mod tests {
         let config = Config {
             ..default_config(tmp.path().to_owned())
         };
-        let b = LocalBackend::<Sha1Hasher>::from_config(config);
+        let b = LocalBackend::from_config(config);
 
         let test_bytes = (0..1_000_000u64).map(|x| x as u8).collect::<Vec<_>>();
 
@@ -561,7 +601,7 @@ mod tests {
     #[tokio::test]
     async fn file_ignores_ignored() {
         let tmp = tempfile::tempdir().unwrap();
-        let b = LocalBackend::<Sha1Hasher>::from_config(Config {
+        let b = LocalBackend::from_config(Config {
             ignore_prefixes: vec![RPathBuf::from_components(["dir", "subdir"])],
             ..default_config(tmp.path().to_owned())
         });
@@ -569,13 +609,13 @@ mod tests {
         let res = b.read_file(&path).await;
 
         let error = res.unwrap_err();
-        assert!(matches!(error, Error::NotAllowed { .. }));
+        assert_matches!(error.downcast().unwrap(), Error::NotAllowed);
     }
 
     #[tokio::test]
     async fn write_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let b: LocalBackend<Sha1Hasher> = LocalBackend::from_config(Config {
+        let b: LocalBackend = LocalBackend::from_config(Config {
             ignore_prefixes: vec![RPathBuf::from_components(["dir", "we", "ignore"])],
             ..default_config(tmp.path().to_owned())
         });
@@ -591,14 +631,15 @@ mod tests {
             )
             .await;
         let error = x.unwrap_err();
-        assert!(matches!(error, Error::NotAllowed { .. }));
+        assert_matches!(error.downcast().unwrap(), Error::NotAllowed);
 
         // Now write an actual file
-        let fpath = tmp.path().join("dir/that-does-not-exist/somefile");
+        let fpath = tmp.path().join("a-directory/somefile");
 
         let modtime_should_be = OffsetDateTime::now_utc();
+        b.mkdir(&RPathBuf::from(["a-directory"])).await.unwrap();
         b.write_file(
-            &RPathBuf::from(["dir", "that-does-not-exist", "somefile"]),
+            &RPathBuf::from(["a-directory", "somefile"]),
             Some(modtime_should_be),
             Cursor::new(&test_bytes),
             test_bytes.len() as u64,
@@ -621,7 +662,7 @@ mod tests {
     #[tokio::test]
     async fn write_file_ignores_ignored() {
         let tmp = tempfile::tempdir().unwrap();
-        let b: LocalBackend<Sha1Hasher> = LocalBackend::from_config(Config {
+        let b: LocalBackend = LocalBackend::from_config(Config {
             root_path: tmp.path().to_owned(),
             ignore_prefixes: vec![RPathBuf::from_components(["dir", "subdir"])],
             ..default_config(tmp.path().to_owned())
@@ -636,13 +677,13 @@ mod tests {
             )
             .await;
         let error = res.unwrap_err();
-        assert!(matches!(error, Error::NotAllowed { .. }));
+        assert_matches!(error.downcast().unwrap(), Error::NotAllowed);
     }
 
     #[tokio::test]
     async fn info_ignores_ignored() {
         let tmp = tempfile::tempdir().unwrap();
-        let b = LocalBackend::<Sha1Hasher>::from_config(Config {
+        let b = LocalBackend::from_config(Config {
             root_path: tmp.path().to_owned(),
             ignore_prefixes: vec![RPathBuf::from_components(["dir", "subdir"])],
             ..default_config(tmp.path().to_owned())
@@ -665,13 +706,16 @@ mod tests {
             .read_file(&RPathBuf::from(["dir", "subdir", "test"]))
             .await;
 
-        assert!(matches!(res, Err(Error::NotAllowed { .. })));
+        assert_matches!(
+            res.unwrap_err().downcast().unwrap(),
+            Error::NotAllowed { .. }
+        );
     }
 
     #[tokio::test]
     async fn info_ignores_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let b = LocalBackend::<Sha1Hasher>::from_config(Config {
+        let b = LocalBackend::from_config(Config {
             root_path: tmp.path().to_owned(),
             ignore_prefixes: vec![RPathBuf::from_components(["dir", "subdir"])],
             ..default_config(tmp.path().to_owned())
@@ -680,20 +724,21 @@ mod tests {
         std::fs::create_dir_all(&ignored_dir).unwrap();
 
         let res = b.read_file(&RPathBuf::from(["dir", "subdir"])).await;
-        assert!(matches!(res, Err(Error::NotAllowed { .. })));
+        assert!(matches!(
+            res.unwrap_err().downcast().unwrap(),
+            Error::NotAllowed
+        ));
     }
 
     #[tokio::test]
     async fn read_dir_errors_on_not_exist() {
         let tmp = tempfile::tempdir().unwrap();
         let path = RPathBuf::from_sep("should-not-exist", '/');
-        let b = LocalBackend::<Sha1Hasher>::from_config(default_config(tmp.path().to_owned()));
-        let res = b.list_files(&path, 0).await;
+        let b = LocalBackend::from_config(default_config(tmp.path().to_owned()));
+        let res = b.list_files(&path, 0).await.unwrap_err();
 
-        let Err(Error::NotFound { rpath }) = res else {
-            panic!("Got {res:#?}");
-        };
-        assert_eq!(rpath, path);
+        println!("{res:?}");
+        assert_matches!(res.downcast().unwrap(), Error::NotFound);
     }
 
     #[tokio::test]
@@ -702,7 +747,7 @@ mod tests {
         // returns Error::IsADirectory.
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("testdir").join("nested")).unwrap();
-        let b = LocalBackend::<Sha1Hasher>::from_config(Config {
+        let b = LocalBackend::from_config(Config {
             ..default_config(tmp.path().to_owned())
         });
 
@@ -715,17 +760,15 @@ mod tests {
             )
             .await
             .unwrap_err();
-        let Error::IsADirectory { rpath } = result else {
-            panic!("Unexpectedly got {:?}", result);
-        };
-        assert_eq!(rpath, ["testdir", "nested"].into());
+
+        assert_matches!(result.downcast().unwrap(), Error::IsADirectory);
     }
 
     #[tokio::test]
     async fn read_file_on_directory() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("testdir").join("nested")).unwrap();
-        let b = LocalBackend::<Sha1Hasher>::from_config(Config {
+        let b = LocalBackend::from_config(Config {
             ..default_config(tmp.path().to_owned())
         });
 
@@ -733,10 +776,8 @@ mod tests {
             .read_file(&RPathBuf::from(["testdir", "nested"]))
             .await
             .unwrap_err();
-        let Error::IsADirectory { rpath } = result else {
-            panic!("Unexpectedly got {:?}", result);
-        };
-        assert_eq!(rpath, ["testdir", "nested"].into());
+
+        assert_matches!(result.downcast().unwrap(), Error::IsADirectory);
     }
 
     #[tokio::test]
@@ -746,11 +787,11 @@ mod tests {
         std::fs::create_dir(&test_path).unwrap();
         assert!(test_path.exists());
 
-        let b = LocalBackend::<Sha1Hasher>::from_config(Config {
+        let b = LocalBackend::from_config(Config {
             ..default_config(tmp.path().to_owned())
         });
 
-        b.delete_file(&RPathBuf::from_components(["testdir"]))
+        b.delete(&RPathBuf::from_components(["testdir"]))
             .await
             .unwrap();
 
