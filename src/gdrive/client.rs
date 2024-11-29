@@ -6,10 +6,7 @@ use drive_api::{DriveApi, File, FilesReq, GoogleCredential, MoreFileFields};
 use futures::{stream::FuturesUnordered, AsyncRead, StreamExt as _};
 
 use crate::{
-    file_repository::{Error, Result},
-    hex_must_decode,
-    paths::{RPath, RPathBuf},
-    DirectoryInfo, FileInfo, PathInfo,
+    file_repository::{Error, Result}, filetree::FileTree, hex_must_decode, paths::{RPath, RPathBuf}, DirectoryInfo, FileInfo, PathInfo
 };
 use cached::Cached;
 use std::fmt::Write;
@@ -357,7 +354,7 @@ impl GDriveClient {
         Ok(())
     }
 
-    pub async fn list_files(&self, path: &RPath, up_to_depth: u32) -> Result<Vec<PathInfo>> {
+    pub async fn file_tree(&self, path: &RPath, max_depth: usize) -> Result<FileTree<PathInfo>> {
         const BATCH_SIZE: usize = 12;
 
         // Another day, another (sort-of) BFS!
@@ -372,7 +369,7 @@ impl GDriveClient {
             },
         )];
 
-        for depth in 0..up_to_depth {
+        for depth in 0..max_depth {
             log::debug!("Reading directory {}, depth = {}", path, depth);
 
             // Invariant: At this point, all directories in the queue are directories of depth `depth`
@@ -449,6 +446,6 @@ impl GDriveClient {
             queue = next_queue;
         }
 
-        Ok(ret)
+        Ok(ret.try_into().unwrap())
     }
 }

@@ -24,6 +24,7 @@ pub use config::{load, init};
 use crate::file_repository::AsyncReader;
 use crate::file_repository::Change;
 use crate::file_repository::{FileRepository, Error, Result};
+use crate::filetree::FileTree;
 use crate::paths::RPath;
 use crate::FileInfo;
 use crate::PathInfo;
@@ -41,7 +42,7 @@ impl FileRepository for GDriveRepo {
 
     delegate! {
         to self.inner {
-            async fn list_files(&self, path: &RPath, up_to_depth: u32) -> Result<Vec<PathInfo>>;
+            async fn file_tree(&self, path: &RPath, depth: usize) -> Result<FileTree<PathInfo>>;
 
             async fn delete(&self, path: &RPath) -> Result<()>;
 

@@ -1,3 +1,4 @@
+use crate::filetree::FileTree;
 use crate::paths::{RPath, RPathBuf};
 use crate::{DirectoryInfo, FileInfo, PathInfo};
 use futures::AsyncRead;
@@ -33,19 +34,38 @@ pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
     /// on a "best effort" basis.
     const CONCURRENCY_LIMIT: usize;
 
-    /// Return all files and folder such that the given path is a subpath of their paths. That is,
+    /// Return a file tree, rooted at `Rpath::empty()` such that all nodes of
+    /// of this tree are comparable to the filter path. For the purposes of this method, that means that
+    /// any returned path is either a child or a parent (or both) of the filter path.
     ///
-    /// - If path is a directory this returns the directory itself and all of its children up to the given depth (depth 0 is just the directory itself,
-    ///   depth 1 includes the immediate children and so on)
-    /// - If path is a file, then this returns just that file and the given depth is irrelevant
+    /// In particular, this method should never error with "not found". The caller has to determine
+    /// whether the file was found or not from the result.
     ///
-    /// # Errors
-    /// - If path does not exist, this returns [`Error::NotFound`]
+    /// The depth parameter can be used to limit the height of returned tree.
+    fn file_tree(
+        &self,
+        filter: &RPath,
+        depth: usize,
+    ) -> impl Future<Output = Result<FileTree<PathInfo>>> + Send;
+
+    /// List all files and folders that are children of the given path. Returns not found if the
+    /// given path does not exist.
     fn list_files(
         &self,
         path: &RPath,
-        depth: u32,
-    ) -> impl Future<Output = Result<Vec<PathInfo>>> + Send;
+        depth: usize,
+    ) -> impl Future<Output = Result<Vec<PathInfo>>> + Send {
+        async move {
+            // Avoid overflow when depth is already usize::MAX
+            let depth = depth.saturating_add(path.len());
+
+            let tree = self.file_tree(path, depth).await?;
+            match tree.reroot(path) {
+                Ok(ret) => Ok(ret.into_vec()),
+                Err(_) => Err(Error::NotFound.into()),
+            }
+        }
+    }
 
     /// Read file with the given relative name. Return a reader and the file size in bytes.
     ///
@@ -91,11 +111,11 @@ pub enum ChangeKind {
     DirDeleted,
     FileUpdated,
     DirCreated,
-    FileCreated
+    FileCreated,
 }
 
 #[derive(Debug, Clone, PartialEq, Hash, Eq, PartialOrd, Ord)]
 pub struct Change {
     pub kind: ChangeKind,
-    pub path: RPathBuf
+    pub path: RPathBuf,
 }

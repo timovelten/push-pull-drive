@@ -34,8 +34,6 @@ pub(super) async fn status_of_dir<'a>(
     repo: &'a impl FileRepository,
     dir: &RPath,
 ) -> anyhow::Result<Vec<Change>> {
-    // Get a list of files...
-    let all_files = db.get_all_tracked(dir)?;
-    let res = todo!();
-    Ok(res)
+    let _ = (db, repo, dir);
+    todo!()
 }

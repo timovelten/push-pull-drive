@@ -8,7 +8,7 @@ pub struct LsArgs {
     path: Option<String>,
 
     #[arg(long)]
-    depth: Option<u32>,
+    depth: Option<usize>,
 
     /// Whether to print details such as size and hash of the files
     #[arg(long)]
@@ -24,6 +24,7 @@ pub fn remote_ls(
     }: LsArgs,
 ) -> anyhow::Result<()> {
     let Ctx { env, remote, .. } = ctx.get();
+    let depth = depth.unwrap_or(1);
 
     env.shell.print_transient("Reading directory...")?;
 
@@ -32,7 +33,7 @@ pub fn remote_ls(
     let path = env.wd.join(&path);
     let mut contents = env
         .handle
-        .block_on(remote.list_files(&path, depth.unwrap_or(1)))?;
+        .block_on(remote.list_files(&path, depth))?;
 
     // Sort directories first
     fn key(f: &PathInfo) -> (u8, &RPath) {

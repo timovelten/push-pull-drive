@@ -3,21 +3,14 @@ use anyhow::bail;
 use futures::TryFutureExt;
 use walkdir::WalkDir;
 
-use crate::db::Tracked;
-use crate::file_repository::Change;
-use crate::file_repository::ChangeKind;
 use crate::file_repository::Error;
 use crate::file_repository::Result;
-use crate::filetree as ft;
-use crate::filetree;
-use crate::filetree::FileTreeBuilder;
+use crate::filetree::FileTree;
 use crate::paths::RPath;
 use crate::paths::RPathBuf;
 use crate::{file_repository::FileRepository, DirectoryInfo, FileInfo, PathInfo};
 use futures::AsyncRead;
 use std::path::Path as StdPath;
-use std::time::Duration;
-use std::u32;
 use std::{
     fs::File,
     io::{ErrorKind, Seek},
@@ -267,12 +260,17 @@ impl FileRepository for LocalBackend {
         Ok(())
     }
 
-    async fn list_files(&self, path: &RPath, up_to_depth: u32) -> Result<Vec<PathInfo>> {
+    async fn file_tree(&self, path: &RPath, up_to_depth: usize) -> Result<FileTree<PathInfo>> {
         let mut ret = Vec::new();
-        let local_path = self.config.get_local_path(&path);
-        let walker = WalkDir::new(local_path).max_depth(up_to_depth as usize);
+        let filter_path = &self.config.get_local_path(&path);
 
-        // Try to access the root element here in order to catch "common" errors
+        let walker = WalkDir::new(&self.config.root_path)
+            .max_depth(up_to_depth as usize)
+            .into_iter()
+            .filter_entry(|x| {
+                x.path().starts_with(filter_path) || filter_path.starts_with(x.path())
+            });
+
         for entry in walker {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -316,61 +314,16 @@ impl FileRepository for LocalBackend {
             }
         }
 
-        Ok(ret)
+        Ok(ret.try_into().expect("these paths form a tree"))
     }
-}
-
-fn is_changed(path: &RPath, old: &Tracked, new: &PathInfo) -> bool {
-    const EPSILON: Duration = Duration::from_millis(10);
-
-    let Tracked::File {
-        size: old_size,
-        modified: old_modified,
-        ..
-    } = old
-    else {
-        panic!("expected a file")
-    };
-
-    let PathInfo::File(FileInfo {
-        size: new_size,
-        modified: new_modified,
-        ..
-    }) = new
-    else {
-        panic!("expected a file")
-    };
-
-    if old_size != new_size {
-        log::trace!(
-            "Considering {} as changed because of size change {} --> {}",
-            path,
-            old_size,
-            new_size
-        );
-        return true;
-    }
-
-    if *new_modified - *old_modified >= EPSILON {
-        log::trace!(
-            "Considering {} as changed because of modtime change {:?} --> {:?}",
-            path,
-            old_modified,
-            new_modified
-        );
-        return true;
-    }
-
-    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
-    use filetree::Node;
     use futures::io::Cursor;
-    use std::{any::Any, fs::OpenOptions, io::Write, path::Path};
+    use std::{any::Any, fs::OpenOptions, io::Write, path::Path, usize};
     use time::OffsetDateTime;
 
     fn default_config(root_path: PathBuf) -> Config {
@@ -440,6 +393,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_tree_returns_partial_trees() {
+        let (b, _, _, _drop_later) = setup_read_dir_test();
+        let tree = b
+            .file_tree("anothersubdir/d1/d2/does-not-exist".into(), usize::MAX)
+            .await
+            .unwrap();
+
+        let nodes = tree.as_slice().iter().map(|x| x.path()).collect::<Vec<_>>();
+        let expected: Vec<&'static RPath> = vec![
+            "".into(),
+            "anothersubdir".into(),
+            "anothersubdir/d1".into(),
+            "anothersubdir/d1/d2".into(),
+        ];
+
+        assert_eq!(nodes, expected);
+    }
+
+    #[tokio::test]
     async fn read_dir_depth_1() {
         let (b, files_should_be, dirs_should_be, _drop_later) = setup_read_dir_test();
 
@@ -480,7 +452,7 @@ mod tests {
     async fn read_dir_max_depth() {
         let (b, files_should_be, dirs_should_be, _drop_later) = setup_read_dir_test();
 
-        let retrieved = b.list_files(RPath::empty(), u32::MAX).await.unwrap();
+        let retrieved = b.list_files(RPath::empty(), usize::MAX).await.unwrap();
 
         let mut retrieved_files = vec![];
         let mut retrieved_dirs = vec![];
@@ -670,11 +642,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_dir_errors_on_not_exist() {
+    async fn list_files_errors_on_not_exist() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = RPathBuf::from_sep("should-not-exist", '/');
         let b = LocalBackend::from_config(default_config(tmp.path().to_owned()));
-        let res = b.list_files(&path, 0).await.unwrap_err();
+        let res = b
+            .list_files("should-not-exist".into(), 0)
+            .await
+            .unwrap_err();
 
         println!("{res:?}");
         assert_matches!(res.downcast().unwrap(), Error::NotFound);

@@ -27,10 +27,10 @@ impl filetree::Node for Tracked {
         }
     }
 
-    fn typ(&self) -> filetree::Type {
+    fn is_terminal(&self) -> bool {
         match self {
-            Self::Dir { .. } => filetree::Type::Dir,
-            Self::File { .. } => filetree::Type::File,
+            Self::Dir { .. } => false,
+            Self::File { .. } => true,
         }
     }
 }

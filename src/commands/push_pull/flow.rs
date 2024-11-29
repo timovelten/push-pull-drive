@@ -1,10 +1,16 @@
+use anyhow::bail;
+
 use super::PushPullArgs;
-use crate::db::{SqliteDatabase, Tracked};
-use crate::file_repository::Change;
-use crate::{context::ExecutionEnvironment, file_repository::FileRepository, FileChange};
+use crate::filetree::{self, Node, Patch, PatchKind};
+use crate::paths::RPath;
+use crate::{context::ExecutionEnvironment, file_repository::FileRepository};
+use crate::PathInfo;
+use std::collections::VecDeque;
 use std::io::Write as _;
+use std::time::Duration;
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub(super) struct PushPullFlow<A, B> {
     args: PushPullArgs,
     ctx: ExecutionEnvironment,
@@ -45,10 +51,6 @@ where
         }
     }
 
-    fn db(&self) -> &SqliteDatabase {
-        &self.ctx.db
-    }
-
     fn stderr(&self) -> impl std::io::Write + '_ {
         self.ctx.shell.err()
     }
@@ -58,8 +60,134 @@ where
         handle.block_on(self.execute_async())
     }
 
+    /// Try and do everything a patch wants us to do, except actually transfering files.
+    ///
+    /// Note that this does not check if the file is actually modified. We leave that
+    /// to somewhere else
+    async fn prepare_patch<'a>(
+        &self,
+        patch: &'a Patch<'_>,
+        to_be_updated: &mut Vec<&'a RPath>,
+        to_be_created: &mut Vec<&'a RPath>,
+    ) -> anyhow::Result<()> {
+        match patch.kind {
+            PatchKind::Create { terminal: true } => {
+                // Creating a file is done by someone eles
+                to_be_created.push(&patch.path);
+            }
+            PatchKind::Create { terminal: false } => {
+                self.to.mkdir(&patch.path).await?;
+            }
+            PatchKind::Delete { .. } => {
+                self.to.delete(&patch.path).await?;
+            }
+            PatchKind::Unchanged { terminal: true } => {
+                // If needed, file updates are handled by someone else.
+                to_be_updated.push(&patch.path);
+            }
+            PatchKind::Unchanged { terminal: false } => {
+                // Directory updates are unimportant to us
+            }
+            PatchKind::Replace { terminal: true } => {
+                // Replace a dir by a file
+                self.to.delete(&patch.path).await?;
+                to_be_created.push(&patch.path);
+            }
+            PatchKind::Replace { terminal: false } => {
+                // Replace a file by a directory
+                self.to.delete(&patch.path).await?;
+                self.to.mkdir(&patch.path).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn transfer_file(
+        &self,
+        path: &RPath,
+    ) -> anyhow::Result<()> {
+        let (info, reader) = self.from.read_file(path).await?;
+        let info = self
+            .to
+            .write_file(path, Some(info.modified), reader, info.size)
+            .await?;
+
+        writeln!(self.stderr(), "Wrote file {info:?} info")?;
+
+        Ok(())
+    }
+
     async fn execute_async(self) -> anyhow::Result<()> {
-        todo!()
+        let path = &self.ctx.wd;
+
+        let from_files = self.from.file_tree(path, usize::MAX).await?;
+        let to_files = self.to.file_tree(path, usize::MAX).await?;
+
+        let patches = filetree::diff(&to_files, &from_files);
+
+        let mut failures = Vec::new();
+        let mut to_be_created = Vec::new();
+        let mut to_be_updated = Vec::new();
+
+        // Go through what we have to do in BFS order, skipping over entire branches
+        // if a parent operation fails.
+        let mut queue: VecDeque<&RPath> = vec![RPath::empty()].into();
+        while let Some(path) = queue.pop_front() {
+            let patch = patches.get(path).expect("path is a node in the tree");
+            debug_assert_eq!(patch.path, path);
+
+            // Execute the operation associated with this patch
+            match self
+                .prepare_patch(patch, &mut to_be_updated, &mut to_be_created)
+                .await
+            {
+                Ok(b) => b,
+                Err(err) => {
+                    failures.push((patch, err));
+                    continue;
+                }
+            };
+
+            let children = patches
+                .children(path)
+                .expect("path is a node in the tree")
+                .map(|x| x.path())
+                .collect::<Vec<_>>();
+
+            queue.extend(children);
+        }
+
+        // Prune the files that need to be updated, leaving out the ones that are up to date
+        let to_be_updated = to_be_updated
+            .into_iter()
+            .filter(|path| {
+                let from_info = from_files.get(path).unwrap().unwrap_fileinfo();
+                let to_info = to_files.get(path).unwrap().unwrap_fileinfo();
+
+                let unchanged = from_info.size == to_info.size
+                    && (from_info.modified - to_info.modified) < Duration::from_secs(1);
+
+                if unchanged {
+                    let _ = writeln!(self.stderr(), "{path:?} is up to date");
+                }
+                !unchanged
+            })
+            .collect::<Vec<_>>();
+
+        let to_be_transferred = to_be_updated.into_iter().chain(to_be_created.into_iter());
+
+        // Now, go ahead and transfer files
+        for file in to_be_transferred {
+            if let Err(err) = self
+                .transfer_file(file)
+                .await
+            {
+                writeln!(self.stderr(), "Transferring file {file:?} failed: {err}")?;
+            }
+        }
+
+        Ok(())
     }
 }
 
