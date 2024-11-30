@@ -1,10 +1,10 @@
-use anyhow::bail;
+use anyhow::Error;
 
+use super::progress::{self, ProgressId, ProgressSender};
 use super::PushPullArgs;
 use crate::filetree::{self, Node, Patch, PatchKind};
-use crate::paths::RPath;
+use crate::paths::{RPath, RPathBuf};
 use crate::{context::ExecutionEnvironment, file_repository::FileRepository};
-use crate::PathInfo;
 use std::collections::VecDeque;
 use std::io::Write as _;
 use std::time::Duration;
@@ -61,6 +61,8 @@ where
     }
 
     /// Try and do everything a patch wants us to do, except actually transfering files.
+    /// That is, we record which files need to be transferred, and delete files that need
+    /// need to be deleted.
     ///
     /// Note that this does not check if the file is actually modified. We leave that
     /// to somewhere else
@@ -118,20 +120,41 @@ where
         Ok(())
     }
 
-    async fn execute_async(self) -> anyhow::Result<()> {
+    async fn transfer_files(&mut self, sender: ProgressSender, files: Vec<(RPathBuf, ProgressId)>) -> Vec<Error> {
+        let mut errors = Vec::new();
+
+        // TODO: Make this async
+        for (file, id) in files {
+            sender.notify_start(id);
+
+            if let Err(err) = self
+                .transfer_file(&file)
+                .await
+            {
+                errors.push(err);
+                sender.notify_failed(id);
+            } else {
+                sender.notify_done(id);
+            }
+        }
+
+        errors
+    }
+
+    async fn execute_async(mut self) -> anyhow::Result<()> {
         let path = &self.ctx.wd;
 
         let from_files = self.from.file_tree(path, usize::MAX).await?;
         let to_files = self.to.file_tree(path, usize::MAX).await?;
-
+        
         let patches = filetree::diff(&to_files, &from_files);
 
-        let mut failures = Vec::new();
         let mut to_be_created = Vec::new();
         let mut to_be_updated = Vec::new();
 
-        // Go through what we have to do in BFS order, skipping over entire branches
-        // if a parent operation fails.
+        // Go through what we have to do in BFS order, skipping over entire branches if a parent operation fails.
+        let _ = self.ctx.shell.print_transient("Preparing...");
+
         let mut queue: VecDeque<&RPath> = vec![RPath::empty()].into();
         while let Some(path) = queue.pop_front() {
             let patch = patches.get(path).expect("path is a node in the tree");
@@ -144,7 +167,6 @@ where
             {
                 Ok(b) => b,
                 Err(err) => {
-                    failures.push((patch, err));
                     continue;
                 }
             };
@@ -174,22 +196,33 @@ where
                 !unchanged
             })
             .collect::<Vec<_>>();
+        
+        // Now actually transfer files
+        let (sender, mut receiver) = progress::make();
+        let mut to_be_transferred: Vec<(RPathBuf, ProgressId)> = Vec::new();
+        for f in to_be_updated.into_iter().chain(to_be_created) {
+            let id = receiver.add_item(f);
 
-        let to_be_transferred = to_be_updated.into_iter().chain(to_be_created.into_iter());
-
-        // Now, go ahead and transfer files
-        for file in to_be_transferred {
-            if let Err(err) = self
-                .transfer_file(file)
-                .await
-            {
-                writeln!(self.stderr(), "Transferring file {file:?} failed: {err}")?;
-            }
+            // Sad clone :/ tokio::spawn requires static lifetimes below. 
+            // The scoped task trilemma strikes again.
+            to_be_transferred.push((f.to_owned(), id));
         }
+        
+        let shell = self.ctx.shell.clone();
+
+        let transfer_task = tokio::spawn(async move {
+            self.transfer_files(sender, to_be_transferred).await
+        });
+
+        receiver.run(&shell).await.unwrap();
+
+        transfer_task.await.unwrap();
 
         Ok(())
     }
 }
+
+
 
 // #[cfg(test)]
 // mod test {

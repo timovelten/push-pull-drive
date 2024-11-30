@@ -74,7 +74,7 @@ impl<T: Node> FileTree<T> {
         self.nodes.binary_search_by_key(&path, |node| &node.path())
     }
 
-    pub fn get(&self, path: &RPath) -> Option<&T> {
+    pub fn get<'a>(&'a self, path: &RPath) -> Option<&'a T> {
         self.get_index(path)
             .ok()
             .and_then(|idx| self.nodes.get(idx))

@@ -14,7 +14,7 @@ pin_project! {
 
 impl<R, F> InspectAsyncReader<R, F>
 where
-    F: FnMut(usize),
+    F: FnMut(&[u8]),
 {
     pub fn new(reader: R, f: F) -> Self {
         Self { reader, f }
@@ -24,7 +24,7 @@ where
 impl<R, F> AsyncRead for InspectAsyncReader<R, F>
 where
     R: AsyncRead,
-    F: FnMut(usize),
+    F: FnMut(&[u8]),
 {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -38,7 +38,7 @@ where
 
         let ret = ready!(this.reader.as_mut().poll_read(cx, buf));
         if let Ok(ret) = ret {
-            (this.f)(ret);
+            (this.f)(&buf[0..ret]);
         }
 
         Poll::Ready(ret)

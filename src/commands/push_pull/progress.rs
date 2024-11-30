@@ -1,6 +1,8 @@
-
 use crate::util::human_readable_bytes;
 use crate::util::Shell;
+use slotmap::new_key_type;
+use slotmap::SlotMap;
+use std::fmt::Display;
 use std::io::Write;
 use std::time::Instant;
 use std::{
@@ -14,67 +16,187 @@ use tokio::{sync::mpsc, time::timeout};
 
 #[derive(Debug)]
 enum ProgressUpdate {
-    #[allow(dead_code)]
-    Start { id: usize },
-    Done { id: usize },
-    Failed { id: usize }
+    Start { slot: ProgressId },
+    Done { slot: ProgressId },
+    Failed { slot: ProgressId },
 }
 
-// One could imagine that we might add a variant here to also make some changes on the src side (?)
-// For now, we do not have that though and all these represent changes we intend to make on the dst side.
-#[derive(PartialEq, Clone, Debug)]
-pub(super) enum ChangeRequest {
-    DeleteFile { rpath: RPathBuf },
-    DeleteDir { rpath: RPathBuf },
-    CreateFile { info: FileInfo },
-    UpdateFile { info: FileInfo },
+#[derive(Clone)]
+pub(super) struct ProgressSender {
+    sender: mpsc::UnboundedSender<ProgressUpdate>,
+    total_bytes_read: Arc<AtomicU64>,
 }
 
-impl std::fmt::Display for ChangeRequest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Note: It is somewhat important that whatever we return contains no line-breaks (so as to not break the asthetic...)
-        match self {
-            ChangeRequest::DeleteFile { rpath } => {
-                write!(f, "Delete {}", WithoutNewlines(&rpath.to_string()))?;
+new_key_type! {
+    pub(super) struct ProgressId;
+}
+
+impl ProgressSender {
+    pub fn notify_start(&self, id: ProgressId) {
+        self.sender
+            .send(ProgressUpdate::Start { slot: id })
+            .unwrap()
+    }
+
+    pub fn notify_bytes_read(&self, id: ProgressId, bytes: u64) {
+        let _ = id;
+        self.total_bytes_read.fetch_add(bytes, Ordering::SeqCst);
+    }
+
+    pub fn notify_done(&self, id: ProgressId) {
+        self.sender
+            .send(ProgressUpdate::Done { slot: id })
+            .unwrap();
+    }
+
+    pub fn notify_failed(&self, id: ProgressId) {
+        self.sender
+            .send(ProgressUpdate::Failed { slot: id })
+            .unwrap();
+    }
+}
+
+enum ItemState {
+    Unstarted,
+    Started,
+    Done,
+    Failed
+}
+
+struct Item<T> {
+    state: ItemState,
+    item: T
+}
+
+pub(super) struct ProgressReceiver<T> {
+    items: SlotMap<ProgressId, Item<T>>,
+    total_bytes_read: Arc<AtomicU64>,
+    /// List of changes so that we can determine their names and stuff. If we have ever lifetime troubles,
+    /// this can be changed to Arc<[FileChange]>.
+    receiver: mpsc::UnboundedReceiver<ProgressUpdate>,
+    /// How many changes already finished.
+    done: usize,
+    throughput: Throughput,
+}
+
+impl<T: Display> ProgressReceiver<T> {
+    /// mut since we modify the throughput here...
+    fn print_progress_line(&mut self, shell: &Shell) -> std::io::Result<()> {
+        if self.items.is_empty() {
+            return Ok(());
+        }
+
+        let bytes_read = self.total_bytes_read.load(Ordering::Acquire);
+        let throughput = self.throughput.update_and_get(bytes_read) as u64;
+
+        let percentage = (self.done * 100) / self.items.len();
+        let (thru, thru_unit) = human_readable_bytes(throughput);
+        let status_line =
+            format!("{percentage}% {thru:.2} {thru_unit}/s");
+        shell.print_transient(&status_line)?;
+
+        Ok(())
+    }
+
+    pub fn add_item(&mut self, item: T) -> ProgressId {
+        self.items.insert(Item {
+            state: ItemState::Unstarted,
+            item
+        })
+    }
+
+    pub async fn run(&mut self, shell: &Shell) -> anyhow::Result<()> {
+        let mut start = None;
+
+        loop {
+            let receive_and_update = async { self.receiver.recv().await };
+
+            // Documentation states that receiver does not have a problem with being cancelled.
+            let next_value = timeout(Duration::from_millis(500), receive_and_update).await;
+            let update = match next_value {
+                Ok(None) => {
+                    // Channel is closed
+                    break;
+                }
+                Err(_) => {
+                    // Timeout expired, let's say something
+                    self.print_progress_line(shell)?;
+                    continue;
+                }
+                Ok(Some(update)) => update,
+            };
+
+            match update {
+                ProgressUpdate::Start { slot } => {
+                    if start.is_none() {
+                        start = Some(Instant::now());
+                    }
+
+                    self.items[slot].state = ItemState::Started;
+                }
+                ProgressUpdate::Failed { slot } => {
+                    self.done += 1;
+                    writeln!(
+                        shell.err(),
+                        "({} / {}) Failed: {}",
+                        self.done,
+                        self.items.len(),
+                        &self.items[slot].item,
+                    )?;
+                    self.print_progress_line(shell)?;
+
+                    self.items[slot].state = ItemState::Failed;
+                }
+                ProgressUpdate::Done { slot } => {
+                    self.done += 1;
+                    writeln!(
+                        shell.err(),
+                        "({} / {}) Done: {}",
+                        self.done,
+                        self.items.len(),
+                        &self.items[slot].item,
+                    )?;
+                    self.print_progress_line(shell)?;
+                    self.items[slot].state = ItemState::Done;
+                }
             }
-            ChangeRequest::DeleteDir { rpath } => {
-                write!(f, "Delete {}", WithoutNewlines(&rpath.to_string()))?;
-            }
-            ChangeRequest::CreateFile { info } => {
-                write!(f, "Create {}", WithoutNewlines(&info.rpath.to_string()))?;
-            }
-            ChangeRequest::UpdateFile { info } => {
-                write!(f, "Update {}", WithoutNewlines(&info.rpath.to_string()))?;
-            }
-        };
+        }
+
+        // All items that are in started are now probably done. We could do something with that
+        // information, but we do not.
+
+        let elapsed = start.map(|start| start.elapsed()).unwrap_or(Duration::ZERO);
+
+        let avg_throughput = self.total_bytes_read.load(Ordering::SeqCst) as f64 / elapsed.as_secs_f64();
+        let (avg_throughput, avg_unit) = human_readable_bytes(avg_throughput as u64);
+        write!(
+            shell.err(),
+            "Finished in {}s (Average throughput: {avg_throughput:.2} {avg_unit})",
+            elapsed.as_secs()
+        )?;
 
         Ok(())
     }
 }
 
-#[derive(Clone)]
-pub(super) struct ProgressSender {
-    sender: mpsc::Sender<ProgressUpdate>,
-    total_bytes_read: Arc<AtomicU64>,
-}
+pub(super) fn make<T: Display>() -> (ProgressSender, ProgressReceiver<T>) {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let total_bytes_read = Arc::new(AtomicU64::new(0));
 
-impl ProgressSender {
-    pub async fn notify_done(&self, id: usize) {
-        let _ = self.sender.send(ProgressUpdate::Done { id }).await;
-    }
+    let sender = ProgressSender {
+        sender,
+        total_bytes_read: total_bytes_read.clone()
+    };
 
-    pub async fn notify_start(&self, id: usize) {
-        let _ = self.sender.send(ProgressUpdate::Start { id }).await;
-    }
+    let receiver = ProgressReceiver {
+        items: Default::default(),
+        total_bytes_read,
+        receiver,
+        done: 0,
+        throughput: Default::default()
+    };
 
-    pub async fn notify_failed(&self, id: usize) {
-        let _ = self.sender.send(ProgressUpdate::Failed { id }).await;
-    }
-
-    /// Note: However this is implemented, it is fast and synchronous (so that it can be called often)!
-    pub fn notify_bytes_read(&self, _id: usize, delta: u64) {
-        self.total_bytes_read.fetch_add(delta, Ordering::Relaxed);
-    }
+    (sender, receiver)
 }
 
 struct Throughput {
@@ -82,8 +204,14 @@ struct Throughput {
     // (so that we always average over a long enough timespan). Once the newer sample is "old enough"
     // it replaces the older sample
     samples: [(Instant, u64); 2],
-    // Index to old sample (as boolean, for convenience)
+    // Index to old sample
     cur: usize,
+}
+
+impl Default for Throughput {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Throughput {
@@ -111,137 +239,4 @@ impl Throughput {
         let (old_sampled_at, old_sample) = &self.samples[old];
         (cur - old_sample) as f64 / (now - *old_sampled_at).as_secs_f64()
     }
-}
-
-pub(super) struct ProgressReceiver<'a> {
-    /// List of changes so that we can determine their names and stuff. If we have ever lifetime troubles,
-    /// this can be changed to Arc<[FileChange]>.
-    changes: &'a [ChangeRequest],
-    receiver: mpsc::Receiver<ProgressUpdate>,
-    /// How many bytes we have transferred
-    total_bytes_read: Arc<AtomicU64>,
-    /// How many bytes we expect to transfer
-    total_bytes: u64,
-    /// How many changes already finished.
-    done: usize,
-    throughput: Throughput,
-}
-
-impl<'a> ProgressReceiver<'a> {
-    fn new(
-        changes: &'a [ChangeRequest],
-        receiver: mpsc::Receiver<ProgressUpdate>,
-        total_bytes_read: Arc<AtomicU64>,
-    ) -> Self {
-        // Careful: This can be zero (for example, if there are only deletions or maybe all files have zero bytes for some reason).
-        // Do not divide by it unchecked.
-        let total_bytes = changes
-            .iter()
-            .filter_map(|change| match change {
-                ChangeRequest::CreateFile { info } | ChangeRequest::UpdateFile { info } => {
-                    Some(info.size)
-                }
-                ChangeRequest::DeleteFile { .. } | ChangeRequest::DeleteDir { .. } => None,
-            })
-            .sum();
-
-        Self {
-            receiver,
-            total_bytes_read,
-            total_bytes,
-            throughput: Throughput::new(),
-            changes,
-            done: 0,
-        }
-    }
-
-    /// mut since we modify the throughput here...
-    fn print_progress_line(&mut self, shell: &Shell) -> std::io::Result<()> {
-        let bytes_read = self.total_bytes_read.load(Ordering::Acquire);
-        let remaining = self.total_bytes.saturating_sub(bytes_read);
-        let throughput = self.throughput.update_and_get(bytes_read) as u64;
-
-        let percentage = (100 * bytes_read)
-            .checked_div(self.total_bytes)
-            .unwrap_or(0);
-        let (rem, rem_unit) = human_readable_bytes(remaining);
-        let (thru, thru_unit) = human_readable_bytes(throughput);
-        let status_line =
-            format!("{percentage}%, Remaining: {rem:.2} {rem_unit} ({thru:.2} {thru_unit}/s)");
-        shell.print_transient(&status_line)?;
-
-        Ok(())
-    }
-
-    pub async fn run(&mut self, shell: &Shell) -> anyhow::Result<()> {
-        let mut start = None;
-
-        loop {
-            let receive_and_update = async {
-                let ret = self.receiver.recv().await;
-                if start.is_none() {
-                    start = Some(Instant::now());
-                }
-                ret
-            };
-
-            // Documentation states that receiver does not have a problem with being cancelled.
-            let next_value = timeout(Duration::from_millis(500), receive_and_update).await;
-
-            match next_value {
-                Ok(Some(ProgressUpdate::Done { id })) => {
-                    self.done += 1;
-                    writeln!(
-                        shell.err(),
-                        "({} / {}) Done: {}",
-                        self.done,
-                        self.changes.len(),
-                        &self.changes[id],
-                    )?;
-                    self.print_progress_line(shell)?;
-                }
-                Ok(Some(ProgressUpdate::Failed { id })) => {
-                    self.done += 1;
-                    writeln!(
-                        shell.err(),
-                        "({} / {}) Failed: {}",
-                        self.done,
-                        self.changes.len(),
-                        &self.changes[id],
-                    )?;
-                    self.print_progress_line(shell)?;
-                }
-                Ok(Some(ProgressUpdate::Start { .. })) => {},
-                Ok(None) => break,
-                Err(_) => {
-                    // Timeout has elapsed. Let's show a progress update.
-                    self.print_progress_line(shell)?;
-                }
-            }
-        }
-
-        let elapsed = start.map(|start| start.elapsed()).unwrap_or(Duration::ZERO);
-
-        let avg_throughput = self.total_bytes as f64 / elapsed.as_secs_f64();
-        let (avg_throughput, avg_unit) = human_readable_bytes(avg_throughput as u64);
-        write!(
-            shell.err(),
-            "Finished in {}s (Average throughput: {avg_throughput:.2} {avg_unit})",
-            elapsed.as_secs()
-        )?;
-
-        Ok(())
-    }
-}
-
-pub(super) fn make_progress(changes: &[ChangeRequest]) -> (ProgressSender, ProgressReceiver) {
-    let (sender, receiver) = mpsc::channel(16);
-    let total_bytes_read = Arc::new(AtomicU64::new(0));
-
-    let s = ProgressSender {
-        sender,
-        total_bytes_read: total_bytes_read.clone(),
-    };
-    let r = ProgressReceiver::new(changes, receiver, total_bytes_read);
-    (s, r)
 }
