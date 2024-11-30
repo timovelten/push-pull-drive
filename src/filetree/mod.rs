@@ -30,6 +30,9 @@ pub struct FileTree<T> {
     ///
     /// This ensures that the list is sorted properly, and that paths cannot appear twice.
     nodes: Vec<T>,
+
+    /// How many nodes do we need to skip to get to the next sibling of this node?
+    /// 0 indicates that this node has no siblings.
     sibling_offset: Vec<usize>,
 }
 
@@ -165,6 +168,7 @@ impl<T: Node> TryFrom<Vec<T>> for FileTree<T> {
         // Ensure the paths of the nodes are unique. Also make sure that all files are leafs (and have no children)
         // and that the tree is connected.
         let mut sibling_offset = vec![0; nodes.len()];
+        let root = nodes[0].path();
 
         // This contains the (unique) path up to the root node at all times
         let mut path: Vec<usize> = Vec::new();
@@ -186,6 +190,14 @@ impl<T: Node> TryFrom<Vec<T>> for FileTree<T> {
                 bail!(
                     "the node {:?} has children but is terminal and therefore may not have children",
                     nodes[i].path()
+                )
+            }
+
+            if !nodes[i].path().starts_with(root) {
+                bail!(
+                    "the node {:?} is not a child of the root node {:?}",
+                    nodes[i].path(),
+                    root
                 )
             }
 
@@ -430,7 +442,15 @@ mod test {
         .unwrap_err();
 
         let msg = err.to_string();
-        assert!(err.to_string().contains("connected"), "Wrong error: {msg}");
+        assert!(msg.contains("connected"), "Wrong error: {msg}");
+    }
+
+    #[test]
+    fn tree_must_be_rooted() {
+        let err = filetree(&["/dir/", "/dir/file", "/dir/file2", "/dir2/"]).unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("root"), "Wrong error: {msg}");
     }
 
     #[test]
@@ -487,7 +507,12 @@ mod test {
 
         assert_eq!(
             children,
-            vec!["a/2011".into(), "a/2012".into(), "a/2013".into(), "a/2014".into()]
+            vec![
+                "a/2011".into(),
+                "a/2012".into(),
+                "a/2013".into(),
+                "a/2014".into()
+            ]
         );
     }
 
@@ -524,77 +549,4 @@ mod test {
             ]
         );
     }
-
-    // #[test]
-    // fn folder_turns_into_file() {
-    //     let a = filetree(&[
-    //         "/",
-    //         "/2013/",
-    //         "/2012/",
-    //         "/2012/invoices/",
-    //         "/2013/readme",
-    //         "/2012/invoices/invoice 1",
-    //         "/2012/invoices/invoice 2",
-    //     ])
-    //     .unwrap();
-
-    //     let b = filetree(&["/", "/2013/", "/2013/readme", "/2012"]).unwrap();
-
-    //     // Note that we expect only one deleted item (the directory. We do not want the
-    //     // the deleted children to be listed)
-    //     let patches = diff(&b, &a).unwrap();
-    //     assert_equal_when_sorted(
-    //         &patches,
-    //         &[
-    //             patch("", PatchKind::Update(Type::Dir)),
-    //             patch("2013", PatchKind::Update(Type::Dir)),
-    //             patch("2013/readme", PatchKind::Update(Type::File)),
-    //             patch(
-    //                 "2012",
-    //                 PatchKind::Replace {
-    //                     old: Type::Dir,
-    //                     new: Type::File,
-    //                 },
-    //             ),
-    //         ],
-    //     );
-
-    //     let patches = diff(&a, &b).unwrap();
-    //     assert_equal_when_sorted(
-    //         &patches,
-    //         &[
-    //             patch("", PatchKind::Update(Type::Dir)),
-    //             patch("2013", PatchKind::Update(Type::Dir)),
-    //             patch("2013/readme", PatchKind::Update(Type::File)),
-    //             patch(
-    //                 "2012",
-    //                 PatchKind::Replace {
-    //                     old: Type::File,
-    //                     new: Type::Dir,
-    //                 },
-    //             ),
-    //             patch("2012/invoices", PatchKind::Create(Type::Dir)),
-    //             patch("2012/invoices/invoice 1", PatchKind::Create(Type::File)),
-    //             patch("2012/invoices/invoice 2", PatchKind::Create(Type::File)),
-    //         ],
-    //     );
-    // }
-
-    // #[test]
-    // fn deletions_are_short() {
-    //     // Keep deletion patches short. That is, if a parent path is already deleted,
-    //     // we do not need to list every single child that is deleted
-    //     let old = filetree(&["/", "/2013/", "2013/invoice 1", "2013/invoice 2"]).unwrap();
-
-    //     let new = filetree(&["/"]).unwrap();
-
-    //     let patches = diff(&new, &old).unwrap();
-    //     assert_equal_when_sorted(
-    //         &patches,
-    //         &[
-    //             patch("", PatchKind::Update(Type::Dir)),
-    //             patch("2013", PatchKind::Delete(Type::Dir)),
-    //         ],
-    //     );
-    // }
 }
