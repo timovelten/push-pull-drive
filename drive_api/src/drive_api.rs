@@ -1,3 +1,7 @@
+//! This module is dedicated to actually making the API calls we need to
+//! Google Drive. It does not much beyond that. In particular, it
+//! does not handle authentication by itself.
+
 use std::fmt::Write as _;
 use std::io::ErrorKind;
 use std::pin::pin;
@@ -21,10 +25,6 @@ use serde::{Deserializer, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
 use url::Url;
-
-/// This module is dedicated to actually making the API calls we need to
-/// Google Drive. It does not much beyond that. In particular, it
-/// does not handle authentication by itself.
 
 const EMPTY_BODY: &[u8] = &[];
 const REQUEST_IS_VALID: &str = "request is valid";

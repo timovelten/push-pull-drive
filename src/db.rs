@@ -22,8 +22,8 @@ pub enum Tracked {
 impl filetree::Node for Tracked {
     fn path(&self) -> &RPath {
         match self {
-            Self::Dir { path } => &path,
-            Self::File { path, .. } => &path,
+            Self::Dir { path } => path,
+            Self::File { path, .. } => path,
         }
     }
 
@@ -268,13 +268,13 @@ impl RawConn {
                 .prepare("SELECT * FROM tracked WHERE path >= ?1 AND path < ?2")?;
 
             let rows = stmt.query((lower, upper))?;
-            rows.mapped(|row| Self::tracked_file_from_row(row))
+            rows.mapped(Self::tracked_file_from_row)
                 .collect()
         } else {
             let mut stmt = self.conn.prepare("SELECT * FROM tracked")?;
             let rows = stmt.query([])?;
             let mut all = rows
-                .mapped(|row| Self::tracked_file_from_row(row))
+                .mapped(Self::tracked_file_from_row)
                 .collect::<Result<Vec<_>, _>>()?;
 
             // Pretend as if the empty directory is also tracked...
@@ -308,7 +308,7 @@ mod tests {
         let v = repo.get_value("SomeKey").unwrap();
         assert!(v.is_none(), "key should not yet exist");
 
-        let _ = repo.put_value("SomeKey", "SomeValue 123456").unwrap();
+        repo.put_value("SomeKey", "SomeValue 123456").unwrap();
 
         let v = repo.get_value("SomeKey").unwrap();
         assert!(v.is_some());

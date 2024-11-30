@@ -47,6 +47,6 @@ impl filetree::Node for PathInfo {
     }
 
     fn is_terminal(&self) -> bool {
-        Self::is_file(&self)
+        Self::is_file(self)
     }
 }

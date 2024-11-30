@@ -331,7 +331,7 @@ impl From<&'static str> for &'static RPath {
         use std::sync::{LazyLock, Mutex};
 
         static CACHE: LazyLock<Mutex<HashMap<&'static str, &'static RPath>>> =
-            LazyLock::new(|| Default::default());
+            LazyLock::new(Default::default);
         let mut map = CACHE.lock().unwrap();
 
         map.entry(value)

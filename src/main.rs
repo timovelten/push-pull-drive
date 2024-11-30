@@ -101,12 +101,12 @@ pub fn main() -> anyhow::Result<()> {
 }
 
 fn get_local_backend_config(root_dir: impl AsRef<Path>) -> local::Config {
-    return local::Config {
+    local::Config {
         root_path: root_dir.as_ref().to_owned(),
         ignore_prefixes: vec![
             RPathBuf::from_components([crate::context::CONFIG_DIR])
         ]
-    };
+    }
 }
 
 // This awkward construction enables us to have type parameters inside of the context, whose

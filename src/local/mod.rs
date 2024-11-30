@@ -251,10 +251,10 @@ impl FileRepository for LocalBackend {
 
     async fn file_tree(&self, path: &RPath, up_to_depth: usize) -> Result<FileTree<PathInfo>> {
         let mut ret = Vec::new();
-        let filter_path = &self.config.get_local_path(&path);
+        let filter_path = &self.config.get_local_path(path);
 
         let walker = WalkDir::new(&self.config.root_path)
-            .max_depth(up_to_depth as usize)
+            .max_depth(up_to_depth)
             .into_iter()
             .filter_entry(|x| {
                 x.path().starts_with(filter_path) || filter_path.starts_with(x.path())

@@ -40,7 +40,7 @@ fn to_fileinfo(file: drive_api::File, path: RPathBuf) -> Result<FileInfo> {
         None => anyhow!(Error::NotAllowed),
     };
 
-    return Err(err.context(path));
+    Err(err.context(path))
 }
 
 #[derive(Debug)]
@@ -200,7 +200,7 @@ impl GDriveClient {
             .files_create(req)
             .await?;
 
-        self.cache_file(&path, created_file.clone());
+        self.cache_file(path, created_file.clone());
 
         Ok(())
     }

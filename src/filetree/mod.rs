@@ -48,7 +48,7 @@ struct SiblingIndicesIterator<'a> {
     sibling_offset: &'a [usize],
 }
 
-impl<'a> Iterator for SiblingIndicesIterator<'a> {
+impl Iterator for SiblingIndicesIterator<'_> {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -74,7 +74,7 @@ impl<'a> Iterator for SiblingIndicesIterator<'a> {
 
 impl<T: Node> FileTree<T> {
     fn get_index(&self, path: &RPath) -> Result<usize, usize> {
-        self.nodes.binary_search_by_key(&path, |node| &node.path())
+        self.nodes.binary_search_by_key(&path, |node| node.path())
     }
 
     pub fn get<'a>(&'a self, path: &RPath) -> Option<&'a T> {
@@ -101,7 +101,7 @@ impl<T: Node> FileTree<T> {
     }
 
     pub fn root(&self) -> Option<&RPath> {
-        self.nodes.get(0).map(|x| x.path())
+        self.nodes.first().map(|x| x.path())
     }
 
     pub fn as_slice(&self) -> &[T] {
@@ -156,7 +156,7 @@ impl<T: Node> TryFrom<Vec<T>> for FileTree<T> {
     type Error = anyhow::Error;
 
     fn try_from(mut nodes: Vec<T>) -> Result<Self, Self::Error> {
-        nodes.sort_by(|a, b| a.path().cmp(&b.path()));
+        nodes.sort_by(|a, b| a.path().cmp(b.path()));
 
         if nodes.is_empty() {
             return Ok(FileTree {
@@ -256,9 +256,9 @@ pub enum PatchKind {
     Replace { terminal: bool },
 }
 
-impl<'a> Node for Patch<'a> {
+impl Node for Patch<'_> {
     fn path(&self) -> &RPath {
-        &self.path
+        self.path
     }
 
     fn is_terminal(&self) -> bool {
@@ -283,7 +283,7 @@ pub fn diff<'a, A: Node, B: Node>(
 ) -> FileTree<Patch<'a>> {
     let mut patches = Vec::new();
 
-    let merged: _ = Merge::new(old.nodes.iter(), new.nodes.iter(), |x, y| {
+    let merged = Merge::new(old.nodes.iter(), new.nodes.iter(), |x, y| {
         x.path().cmp(y.path())
     });
 
@@ -536,7 +536,7 @@ mod test {
         assert_eq!(tree.root().unwrap(), new_root);
 
         let children = tree
-            .children(&tree.root().unwrap())
+            .children(tree.root().unwrap())
             .unwrap()
             .map(|x| x.path().to_owned())
             .collect::<Vec<_>>();

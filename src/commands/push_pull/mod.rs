@@ -126,30 +126,30 @@ where
         match patch.kind {
             PatchKind::Create { terminal: true } => {
                 // Creating a file is done by someone eles
-                to_be_created.push(&patch.path);
+                to_be_created.push(patch.path);
             }
             PatchKind::Create { terminal: false } => {
-                self.to.mkdir(&patch.path).await?;
+                self.to.mkdir(patch.path).await?;
             }
             PatchKind::Delete { .. } => {
-                self.to.delete(&patch.path).await?;
+                self.to.delete(patch.path).await?;
             }
             PatchKind::Unchanged { terminal: true } => {
                 // If needed, file updates are handled by someone else.
-                to_be_updated.push(&patch.path);
+                to_be_updated.push(patch.path);
             }
             PatchKind::Unchanged { terminal: false } => {
                 // Directory updates are unimportant to us
             }
             PatchKind::Replace { terminal: true } => {
                 // Replace a dir by a file
-                self.to.delete(&patch.path).await?;
-                to_be_created.push(&patch.path);
+                self.to.delete(patch.path).await?;
+                to_be_created.push(patch.path);
             }
             PatchKind::Replace { terminal: false } => {
                 // Replace a file by a directory
-                self.to.delete(&patch.path).await?;
-                self.to.mkdir(&patch.path).await?;
+                self.to.delete(patch.path).await?;
+                self.to.mkdir(patch.path).await?;
             }
         }
 
@@ -158,7 +158,7 @@ where
 
     async fn transfer_file<F>(&self, path: &RPath, progress: F) -> anyhow::Result<FileInfo>
     where
-        F: Fn(usize) -> () + Sync,
+        F: Fn(usize) + Sync,
     {
         let (info, reader) = self.from.read_file(path).await?;
         let reader = InspectAsyncReader::new(reader, |buf| progress(buf.len()));
