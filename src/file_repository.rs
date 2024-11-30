@@ -1,6 +1,7 @@
 use crate::filetree::FileTree;
 use crate::paths::{RPath, RPathBuf};
 use crate::{FileInfo, PathInfo};
+use anyhow::anyhow;
 use futures::AsyncRead;
 use std::fmt::Debug;
 use std::future::Future;
@@ -11,7 +12,7 @@ pub enum Error {
     NotAllowed,
     IsADirectory,
     NotADirectory,
-    Exists
+    Exists,
 }
 impl std::error::Error for Error {}
 
@@ -64,8 +65,10 @@ pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
             match tree.reroot(path) {
                 Ok(ret) => Ok(ret.into_vec()),
                 Err(tree) => {
-                    log::debug!("Failed to re-root tree to '{path:?}': {tree:?}");
-                    Err(Error::NotFound.into())
+                    let err = anyhow!(Error::NotFound)
+                        .context(format!("Failed to re-root tree to '{path:?}': {tree:?}"));
+
+                    Err(err)
                 }
             }
         }
@@ -79,7 +82,7 @@ pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
 
     /// Read the given `src` reader to completion and write its contents to the given path name. If the file
     /// does not exist, it is created. This function does not create and directories.
-    /// 
+    ///
     /// If at all possible this operation should be atomic: If the operation fails half way through, the original
     /// contents should still be intact.
     fn write_file<R: AsyncReader>(
@@ -89,7 +92,7 @@ pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
         src: R,
         len: u64,
     ) -> impl Future<Output = Result<FileInfo>> + Send;
-    
+
     /// This function may or may not return an error if the directory already exists.
     fn mkdir(&self, path: &RPath) -> impl Future<Output = Result<()>> + Send;
 
