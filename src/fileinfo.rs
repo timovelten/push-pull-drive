@@ -3,14 +3,14 @@ use crate::{filetree::{self}, paths::{RPath, RPathBuf}};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum PathInfo {
-    Dir(DirectoryInfo),
+    Dir(RPathBuf),
     File(FileInfo),
 }
 
 impl PathInfo {
     pub fn path(&self) -> &RPath {
         match self {
-            Self::Dir(DirectoryInfo { path }) => path,
+            Self::Dir(path) => path,
             Self::File(FileInfo { path, .. }) => path
         }
     }
@@ -28,6 +28,10 @@ impl PathInfo {
             Self::Dir(_) => panic!("Called unwrap_fileinfo on PathInfo::Dir")
         }
     }
+
+    pub fn root_dir() -> Self {
+        Self::Dir(RPathBuf::empty())
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -35,11 +39,6 @@ pub struct FileInfo {
     pub path: RPathBuf,
     pub size: u64,
     pub modified: time::OffsetDateTime
-}
-
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct DirectoryInfo {
-    pub path: RPathBuf,
 }
 
 impl filetree::Node for PathInfo {

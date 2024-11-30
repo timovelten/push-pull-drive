@@ -8,7 +8,7 @@ use crate::file_repository::Result;
 use crate::filetree::FileTree;
 use crate::paths::RPath;
 use crate::paths::RPathBuf;
-use crate::{file_repository::FileRepository, DirectoryInfo, FileInfo, PathInfo};
+use crate::{file_repository::FileRepository, FileInfo, PathInfo};
 use futures::AsyncRead;
 use std::path::Path as StdPath;
 use std::{
@@ -23,7 +23,6 @@ use tokio::task::spawn_blocking;
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
 pub mod config;
-pub mod file_hasher;
 pub use config::*;
 
 #[derive(Debug, Clone)]
@@ -42,15 +41,35 @@ pub struct Config {
     pub ignore_prefixes: Vec<RPathBuf>,
 }
 
+impl Config {
+    fn get_local_path(&self, path: &RPath) -> PathBuf {
+        let slash_separated_path = path
+            .with_separator('/')
+            .expect("directory and filenames should not contain slashes");
+        self.root_path.join(slash_separated_path)
+    }
+
+    fn is_ignored(&self, path: &RPath) -> bool {
+        for prefix in self.ignore_prefixes.iter() {
+            if path.starts_with(prefix) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn get_path(&self, local_path: impl AsRef<StdPath>) -> anyhow::Result<RPathBuf> {
+        RPathBuf::try_from_path(&self.root_path, local_path.as_ref())
+    }
+}
 impl LocalBackend {
     pub fn from_config(config: Config) -> Self {
         Self {
             config: Arc::new(config),
         }
     }
-}
 
-impl LocalBackend {
     /// path is still needed because it is returned as part of the metadata. Otherwise, it is ignored.
     ///
     /// Note that this function might calculate the hash of the file and is therefore somewhat CPU bound. You should
@@ -74,12 +93,7 @@ impl LocalBackend {
             file.rewind()?;
             (PathInfo::File(info), file)
         } else if metadata.is_dir() {
-            (
-                PathInfo::Dir(DirectoryInfo {
-                    path: path.to_owned(),
-                }),
-                file,
-            )
+            (PathInfo::Dir(path), file)
         } else {
             bail!("symlinks cannot be opened (at {path:?})")
         };
@@ -118,29 +132,6 @@ fn map_io_error(err: std::io::Error) -> anyhow::Error {
     }
 }
 
-impl Config {
-    fn get_local_path(&self, path: &RPath) -> PathBuf {
-        let slash_separated_path = path
-            .with_separator('/')
-            .expect("directory and filenames should not contain slashes");
-        self.root_path.join(slash_separated_path)
-    }
-
-    fn is_ignored(&self, path: &RPath) -> bool {
-        for prefix in self.ignore_prefixes.iter() {
-            if path.starts_with(prefix) {
-                return true;
-            }
-        }
-
-        false
-    }
-
-    fn get_path(&self, local_path: impl AsRef<StdPath>) -> anyhow::Result<RPathBuf> {
-        RPathBuf::try_from_path(&self.root_path, local_path.as_ref())
-    }
-}
-
 impl FileRepository for LocalBackend {
     type Reader = Compat<TokioFile>;
     const CONCURRENCY_LIMIT: usize = 16;
@@ -158,15 +149,13 @@ impl FileRepository for LocalBackend {
         Ok((info, TokioFile::from_std(file).compat()))
     }
 
-    async fn mkdir(&self, path: &RPath) -> Result<DirectoryInfo> {
+    async fn mkdir(&self, path: &RPath) -> Result<()> {
         let local_path = self.config.get_local_path(path);
         tokio::fs::create_dir(local_path)
             .await
             .map_err(map_io_error)?;
 
-        Ok(DirectoryInfo {
-            path: path.to_owned(),
-        })
+        Ok(())
     }
 
     async fn write_file<R: AsyncRead + Send>(
@@ -194,7 +183,7 @@ impl FileRepository for LocalBackend {
         .await
         .unwrap();
 
-        log::info!("Writing to temp path {:?}", tmp_file_path);
+        log::debug!("Writing to temp path {:?}", tmp_file_path);
 
         tokio::io::copy(&mut src, &mut tmp_file).await?;
 
@@ -295,7 +284,7 @@ impl FileRepository for LocalBackend {
             }
 
             if entry.file_type().is_dir() {
-                ret.push(PathInfo::Dir(DirectoryInfo { path: entry_path }))
+                ret.push(PathInfo::Dir(entry_path))
             } else if entry.file_type().is_file() {
                 let meta = entry.metadata()?;
 
@@ -430,9 +419,9 @@ mod tests {
                 }
 
                 match info {
-                    PathInfo::Dir(d) => {
-                        retrieved_directories.push(d.path.with_separator('/').unwrap());
-                        next_directories.push(d.path);
+                    PathInfo::Dir(path) => {
+                        retrieved_directories.push(path.with_separator('/').unwrap());
+                        next_directories.push(path);
                     }
                     PathInfo::File(info) => {
                         retrieved_files.push(info.path.with_separator('/').unwrap())
@@ -458,7 +447,7 @@ mod tests {
         let mut retrieved_dirs = vec![];
         for info in retrieved {
             match info {
-                PathInfo::Dir(DirectoryInfo { path }) => {
+                PathInfo::Dir(path) => {
                     retrieved_dirs.push(path.with_separator('/').unwrap())
                 }
                 PathInfo::File(FileInfo { path, .. }) => {

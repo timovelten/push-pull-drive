@@ -1,6 +1,6 @@
 use crate::filetree::FileTree;
 use crate::paths::{RPath, RPathBuf};
-use crate::{DirectoryInfo, FileInfo, PathInfo};
+use crate::{FileInfo, PathInfo};
 use futures::AsyncRead;
 use std::fmt::Debug;
 use std::future::Future;
@@ -11,6 +11,7 @@ pub enum Error {
     NotAllowed,
     IsADirectory,
     NotADirectory,
+    Exists
 }
 impl std::error::Error for Error {}
 
@@ -62,35 +63,25 @@ pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
             let tree = self.file_tree(path, depth).await?;
             match tree.reroot(path) {
                 Ok(ret) => Ok(ret.into_vec()),
-                Err(_) => Err(Error::NotFound.into()),
+                Err(tree) => {
+                    log::debug!("Failed to re-root tree to '{path:?}': {tree:?}");
+                    Err(Error::NotFound.into())
+                }
             }
         }
     }
 
-    /// Read file with the given relative name. Return a reader and the file size in bytes.
-    ///
-    /// # Errors
-    ///
-    /// - If the file at path is a directory, this returns [`Error::IsADirectory`]
-    /// - If a subpath of `path` is a file, this returns either [`Error::NotADirectory`] or [`Error::NotFound`] (up to the implementation).
+    /// Read file with the given relative name.
     fn read_file(
         &self,
         path: &RPath,
     ) -> impl Future<Output = Result<(FileInfo, Self::Reader)>> + Send;
 
-    /// Read the given `src` reader to completion and write its contents to the given path name. Do note the following behavior (which more or less mimicks the behavior
-    /// of `mkdir -p rpath_dir` and then writing the file on Linux):
-    ///
-    /// - If a file exists at path, then it is overwritten by the contents of src.
-    /// - If rpath is of the form base/filename AND base is the rpath of a directory, a file named filename is created
-    ///    with the contents src inside of that directory.
-    ///
-    /// # Errors
-    ///
-    /// - If rpath is a directory, this returns [`Error::IsADirectory`]. Consider deleting the directory in this case and trying again. Also
-    ///   see [`Self::delete_orphaned_directory`]. This particular case is very important. We rely on this behavior in push_pull.
-    /// - If a subpath of `path` is a file itself, this returns either [`Error::NotADirectory`] or [`Error::NotFound`] (up to the implementation).
-    /// - If the directory part of `path` does not exist, this returns [`Error::NotFound`].
+    /// Read the given `src` reader to completion and write its contents to the given path name. If the file
+    /// does not exist, it is created. This function does not create and directories.
+    /// 
+    /// If at all possible this operation should be atomic: If the operation fails half way through, the original
+    /// contents should still be intact.
     fn write_file<R: AsyncReader>(
         &self,
         path: &RPath,
@@ -98,8 +89,9 @@ pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
         src: R,
         len: u64,
     ) -> impl Future<Output = Result<FileInfo>> + Send;
-
-    fn mkdir(&self, path: &RPath) -> impl Future<Output = Result<DirectoryInfo>> + Send;
+    
+    /// This function may or may not return an error if the directory already exists.
+    fn mkdir(&self, path: &RPath) -> impl Future<Output = Result<()>> + Send;
 
     /// Delete a file or a folder at `path` (including all subfolders, if necessary).
     fn delete(&self, path: &RPath) -> impl Future<Output = Result<()>> + Send;

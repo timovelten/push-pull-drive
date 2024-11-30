@@ -3,10 +3,11 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, bail, Context};
 use cached::TimedCache;
 use drive_api::{DriveApi, File, FilesReq, GoogleCredential, MoreFileFields};
-use futures::{stream::FuturesUnordered, AsyncRead, StreamExt as _};
+use futures::{stream::FuturesUnordered, AsyncRead, StreamExt as _, TryFutureExt};
+use tokio::task::JoinSet;
 
 use crate::{
-    file_repository::{Error, Result}, filetree::FileTree, hex_must_decode, paths::{RPath, RPathBuf}, DirectoryInfo, FileInfo, PathInfo
+    file_repository::{self, Error, Result}, filetree::FileTree, paths::{RPath, RPathBuf}, FileInfo, PathInfo
 };
 use cached::Cached;
 use std::fmt::Write;
@@ -22,7 +23,7 @@ fn to_pathinfo(file: drive_api::File, path: RPathBuf) -> (Option<PathInfo>, Stri
             size,
             modified: file.modified_time
         }),
-        _ if file.is_folder() => PathInfo::Dir(DirectoryInfo { path }),
+        _ if file.is_folder() => PathInfo::Dir(path),
         _ => return (None, file.id),
     };
 
@@ -35,7 +36,7 @@ fn to_pathinfo(file: drive_api::File, path: RPathBuf) -> (Option<PathInfo>, Stri
 fn to_fileinfo(file: drive_api::File, path: RPathBuf) -> Result<FileInfo> {
     let err = match to_pathinfo(file, path.clone()).0 {
         Some(PathInfo::File(info)) => return Ok(info),
-        Some(PathInfo::Dir(DirectoryInfo { path: rpath })) => anyhow!(Error::IsADirectory),
+        Some(PathInfo::Dir(_)) => anyhow!(Error::IsADirectory),
         None => anyhow!(Error::NotAllowed),
     };
 
@@ -59,6 +60,9 @@ pub(super) struct GDriveClient {
 }
 
 impl GDriveClient {
+    /// Google does not really like too many concurrent connections. In my personal testing, the limit seemed to be somewhere below 10.
+    pub const CONCURRENCY_LIMIT: usize = 8;
+
     pub fn new(credential: GoogleCredential) -> Self {
         let api_client = DriveApi::new(Default::default(), credential);
 
@@ -98,6 +102,15 @@ impl GDriveClient {
         }
     }
 
+    async fn root_file(&self) -> Result<drive_api::File> {
+        let root_file = self
+            .api_client
+            .files_get("root")
+            .await?;
+
+        Ok(root_file)
+    }
+
     /// Try and find a drive_file by rpath. The return value of this function is always computed "from scratch",
     /// i.e. we do not use the cache to compute anything here. However, running this function will update the cache
     /// with all the files and folders it discovers along the way.
@@ -112,10 +125,8 @@ impl GDriveClient {
         // behavior in the read_dir function, that concurrently fetches multiple directory contents
         // in a single request.
         // See also: https://developers.google.com/drive/api/guides/folder
-        let root_file = self
-            .api_client
-            .files_get("root")
-            .await?;
+        let root_file = self.root_file().await?;
+
         debug_assert_eq!(root_file.parents, None);
         self.cache_file(RPath::empty(), root_file.clone());
 
@@ -175,8 +186,23 @@ impl GDriveClient {
     ///
     /// It is important that mkdir_all is NOT called concurrently with itself. For this reason,
     /// the caller should aquire all permits (`self.api_exclusive()`) to call this function.
-    pub async fn mkdir_all(&self, rpath: &RPath) -> Result<Arc<drive_api::File>> {
-        todo!()
+    pub async fn mkdir(&self, path: &RPath) -> Result<()> {
+        let Some((parent, name)) = path.split_right() else {
+            bail!(Error::Exists)
+        };
+
+        log::debug!("mkdir {:?}", path);
+
+        let parent = self.drive_file_by_rpath_cached(parent).await?;
+        let req = FilesReq::new_create_folder(name.to_owned(), parent.id.to_owned());
+
+        let created_file = self.api_client
+            .files_create(req)
+            .await?;
+
+        self.cache_file(&path, created_file.clone());
+
+        Ok(())
     }
 
     /// This is a helper method. It takes a list of targets, which are google drive ids of folders (or not,
@@ -218,43 +244,8 @@ impl GDriveClient {
         Ok(ret)
     }
 
-    pub async fn create_file<R: AsyncRead + Send>(
-        &self,
-        path: &RPath,
-        src: R,
-        len: u64,
-    ) -> Result<Arc<drive_api::File>> {
-        // We need to create the file. For that, we need to place it in the right path
-        let (parent, filename) = path.split_right().ok_or(Error::IsADirectory)?;
-        
-        let parent_file = self.mkdir_all(parent).await?;
-        let file = self
-            .api_client
-            .files_create_upload(
-                FilesReq {
-                    name: Some(filename.to_string()),
-                    parents: Some(vec![parent_file.id.clone()]),
-                    ..Default::default()
-                },
-                src,
-                len,
-            )
-            .await?;
-
-        let ret = self.cache_file(path, file);
-        Ok(ret)
-    }
-
-    async fn update_file<R: AsyncRead + Send>(&self, file: File, src: R, len: u64) -> Result<File> {
-        let file = self.api_client
-            .files_update_upload(&file.id, src, len)
-            .await?;
-
-        Ok(file)
-    }
-
-    pub async fn get_metadata(&self, cpath: &RPath) -> Result<PathInfo> {
-        let drive_id = &self.drive_file_by_rpath_cached(cpath).await?.id;
+    pub async fn get_metadata(&self, path: &RPath) -> Result<PathInfo> {
+        let drive_id = &self.drive_file_by_rpath_cached(path).await?.id;
         let info = match self.api_client.files_get(drive_id).await {
             Ok(file) => match file.more {
                 Some(MoreFileFields::BinaryFile {
@@ -263,12 +254,10 @@ impl GDriveClient {
                     ..
                 }) => PathInfo::File(FileInfo {
                     size,
-                    path: cpath.to_owned(),
+                    path: path.to_owned(),
                     modified: file.modified_time
                 }),
-                None if file.is_folder() => PathInfo::Dir(DirectoryInfo {
-                    path: cpath.to_owned(),
-                }),
+                None if file.is_folder() => PathInfo::Dir(path.to_owned()),
                 _ => {
                     bail!(Error::NotAllowed);
                 }
@@ -309,6 +298,38 @@ impl GDriveClient {
         }
     }
 
+    async fn create_file<R: AsyncRead + Send>(
+        &self,
+        path: &RPath,
+        src: R,
+        len: u64,
+    ) -> Result<drive_api::File> {
+        // We need to create the file. For that, we need to place it in the right path
+        let (parent, filename) = path.split_right().ok_or(Error::IsADirectory)?;
+
+        let parent = self.drive_file_by_rpath_cached(parent).await?;
+        if !parent.is_folder() {
+            bail!(Error::NotADirectory);
+        }
+        
+        let file = self
+            .api_client
+            .files_create_upload(
+                FilesReq {
+                    name: Some(filename.to_string()),
+                    parents: Some(vec![parent.id.clone()]),
+                    ..Default::default()
+                },
+                src,
+                len,
+            )
+            .await?;
+
+        self.cache_file(path, file.clone());
+
+        Ok(file)
+    }
+
     pub async fn write_file<R: crate::file_repository::AsyncReader>(
         &self,
         path: &RPath,
@@ -316,9 +337,27 @@ impl GDriveClient {
         src: R,
         len: u64,
     ) -> Result<FileInfo> {
-        let cpath = path.to_owned();
+        let path = path.to_owned();
+        let res = self.drive_file_by_rpath(&path).await.map_err(|err| err.downcast::<file_repository::Error>());
 
-        todo!("Check if the file exists and then update it. Otherwise, create it");
+        let file = match res {
+            Ok(file) => {
+                log::debug!("Updating file at {}", path);
+
+                self.api_client
+                    .files_update_upload(&file.id, src, len)
+                    .await?
+            }
+            Err(Ok(err)) => {
+                // We were able to determine that this is a not found, so create the file
+                log::debug!("Creating file at {}", path);
+
+                self.create_file(&path, src, len).await?
+            }
+            Err(Err(err)) => return Err(err)
+        };
+
+        to_fileinfo(file, path)
     }
 
     pub async fn delete(&self, path: &RPath) -> Result<()> {
@@ -354,41 +393,49 @@ impl GDriveClient {
         Ok(())
     }
 
-    pub async fn file_tree(&self, path: &RPath, max_depth: usize) -> Result<FileTree<PathInfo>> {
+    pub async fn file_tree(self: &Arc<Self>, filter: &RPath, max_depth: usize) -> Result<FileTree<PathInfo>> {
         const BATCH_SIZE: usize = 12;
+        log::debug!("file_tree with filter '{filter:?}'");
 
         // Another day, another (sort-of) BFS!
-        let mut ret = Vec::new();
+        let mut ret = vec![
+            PathInfo::root_dir()
+        ];
 
-        // TODO: This needs to support the case where path is the path to a file
-        let id = self.drive_file_by_rpath_cached(path).await?.id.to_owned();
+        let root = self.root_file().await?;
         let mut queue = vec![(
-            id,
-            DirectoryInfo {
-                path: path.to_owned(),
-            },
+            root.id, RPathBuf::empty()
         )];
 
         for depth in 0..max_depth {
-            log::debug!("Reading directory {}, depth = {}", path, depth);
-
-            // Invariant: At this point, all directories in the queue are directories of depth `depth`
-            // and depth <= up_to_depth.
+            // Invariant: At this point, all directories in the queue are directories of depth
+            // `depth` and depth <= max_depth
             if queue.is_empty() {
                 break;
             }
 
-            let mut next_queue = Vec::new();
-            let mut fts = FuturesUnordered::new();
+            // Limit concurrency somewhat
+            let sem = Arc::new(tokio::sync::Semaphore::new(Self::CONCURRENCY_LIMIT));
+            let mut fts = JoinSet::new();
+            
+            // Only consider those queue items that match the current filter
+            let mut queue_items = queue.into_iter();
 
-            // Take up to BATCH_SIZE directories, and explore them using a single API call.
-            // But: We can make several of these API calls concurrently, so let's do that :)
-            for chunk in queue.chunks(BATCH_SIZE) {
-                fts.push(async move {
+            loop {
+                let batch: Vec<_> = (&mut queue_items).take(BATCH_SIZE).collect();
+                if batch.is_empty() {
+                    break
+                }
+
+                let this = self.clone();
+                let sem = sem.clone();
+                fts.spawn(async move {
+                    let _permit = sem.acquire().await.unwrap();
+
                     let mut ret = Vec::new();
-                    let files = self
-                        .read_dirs(chunk.iter().map(|(x, _)| x.as_str()))
-                        .await?;
+                    let files = this
+                        .read_dirs(batch.iter().map(|(x, _)| x.as_str()))
+                        .await?; 
 
                     for file in files {
                         let parent_id = &file
@@ -396,14 +443,14 @@ impl GDriveClient {
                             .as_ref()
                             .expect("Google drive files we request have a parent")[0];
 
-                        let parent_cpath = chunk
+                        let parent_path = batch
                             .iter()
                             .find(|(id, _)| id == parent_id)
-                            .map(|(_, info)| &info.path)
-                            .with_context(|| format!("List of targets is {chunk:?} and we recevied a file with parent id {parent_id:?}"))
+                            .map(|(_, path)| path)
+                            .with_context(|| format!("List of targets is {batch:?} and we recevied a file with parent id {parent_id:?}"))
                             .expect("Every file we receive should have a parent we know of");
 
-                        let cpath = parent_cpath.join_single(&file.name);
+                        let path = parent_path.join_single(&file.name);
 
                         let info = match file.more {
                             Some(MoreFileFields::BinaryFile {
@@ -411,13 +458,11 @@ impl GDriveClient {
                                 size,
                                 ..
                             }) => PathInfo::File(FileInfo {
-                                path: cpath.to_owned(),
+                                path: path.to_owned(),
                                 size,
                                 modified: file.modified_time
                             }),
-                            None if file.is_folder() => PathInfo::Dir(DirectoryInfo {
-                                path: cpath.to_owned(),
-                            }),
+                            None if file.is_folder() => PathInfo::Dir(path.to_owned()),
                             _ => {
                                 // Ignore Google docs etc for now..
                                 continue;
@@ -431,19 +476,24 @@ impl GDriveClient {
                 });
             }
 
-            while let Some(next) = fts.next().await {
-                // TODO: Do not return immediately on error
+            // Extract folders that we found and queue them up
+            queue = Vec::new();
+            while let Some(next) = fts.join_next().await {
+                let next = next.unwrap();
+
                 for (next_id, next_info) in next? {
-                    if let PathInfo::Dir(info) = &next_info {
-                        next_queue.push((next_id, info.clone()));
+                    // Filter out paths that are not requested
+                    if !next_info.path().is_related_to(filter) {
+                        continue;
                     }
+
+                    if let PathInfo::Dir(path) = &next_info {
+                        queue.push((next_id, path.clone()));
+                    }
+
                     ret.push(next_info);
                 }
             }
-
-            drop(fts);
-
-            queue = next_queue;
         }
 
         Ok(ret.try_into().unwrap())

@@ -171,7 +171,7 @@ impl<T: Display> ProgressReceiver<T> {
         let (avg_throughput, avg_unit) = human_readable_bytes(avg_throughput as u64);
         write!(
             shell.err(),
-            "Finished in {}s (Average throughput: {avg_throughput:.2} {avg_unit})",
+            "Finished in {}s (Average throughput: {avg_throughput:.2} {avg_unit}/s)",
             elapsed.as_secs()
         )?;
 

@@ -93,6 +93,12 @@ impl ShellImpl {
     }
 }
 
+impl Drop for ShellImpl {
+    fn drop(&mut self) {
+        self.clear_if_needed();
+    }
+}
+
 pub struct OwnedStderrWriter {
     inner: Arc<Shell>,
 }

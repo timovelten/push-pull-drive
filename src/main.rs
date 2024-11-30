@@ -41,10 +41,7 @@ struct Cli {
     /// Possible values include off, error, warn, info, debug and trace. Default is warn.
     #[arg(long, default_value_t = log::LevelFilter::Warn)]
     level: log::LevelFilter,
-    /// Pretend as if the current working directory was the given directory. Useful for operating
-    /// on folders that are elsewhere.
-    #[arg(long)]
-    dir: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -73,10 +70,6 @@ trait CommandHandler {
 //  - otherwise print a link to the web interface of google drive so the user may fix it themselves.
 pub fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let wd = match cli.dir {
-        Some(wd) => wd.into(),
-        _ => std::env::current_dir()?,
-    };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -95,6 +88,7 @@ pub fn main() -> anyhow::Result<()> {
         .filter_level(cli.level)
         .init();
 
+    let wd = std::env::current_dir()?;
     if let Commands::Init { backend } = &cli.command {
         // Handle init separately
         init::init(backend.clone(), &wd, shell, rt.handle().clone())

@@ -12,9 +12,9 @@ pub struct StatusArgs;
 pub fn local_status<R: FileRepository>(ctx: &Ctx<R>, _args: StatusArgs) -> anyhow::Result<()> {
     let Ctx { env, local, .. } = ctx;
     let status_of_dir_future = status_of_dir(&ctx.env.db, local, &ctx.env.wd);
-    env.shell.print_transient("Reading directories...")?;
+    env.print_transient("Reading directories...")?;
     let res = env.handle.block_on(status_of_dir_future)?;
-    writeln!(env.shell.err(), "{res:?}")?;
+    writeln!(env.err(), "{res:?}")?;
 
     Ok(())
 }
@@ -22,9 +22,9 @@ pub fn local_status<R: FileRepository>(ctx: &Ctx<R>, _args: StatusArgs) -> anyho
 pub fn remote_status<R: FileRepository>(ctx: &Ctx<R>, _args: StatusArgs) -> anyhow::Result<()> {
     let Ctx { env, remote, .. } = ctx;
     let status_of_dir_future = status_of_dir(&ctx.env.db, remote, &ctx.env.wd);
-    env.shell.print_transient("Reading directories...")?;
+    env.print_transient("Reading directories...")?;
     let res = env.handle.block_on(status_of_dir_future)?;
-    writeln!(env.shell.err(), "{res:?}")?;
+    writeln!(env.err(), "{res:?}")?;
 
     Ok(())
 }

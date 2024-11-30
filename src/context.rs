@@ -6,9 +6,9 @@ use crate::{
     util::Shell,
 };
 use anyhow::bail;
+use delegate::delegate;
 use std::{
-    path::{Path as StdPath, PathBuf as StdPathBuf},
-    sync::Arc,
+    io, path::{Path as StdPath, PathBuf as StdPathBuf}, sync::Arc
 };
 use tokio::runtime::Handle as TokioHandle;
 
@@ -29,6 +29,18 @@ pub struct ExecutionEnvironment {
     pub root_dir: StdPathBuf,
     pub db: Arc<SqliteDatabase>,
     pub handle: tokio::runtime::Handle,
+}
+
+impl ExecutionEnvironment {
+    delegate! {
+        to self.shell {
+            pub fn err(&self) -> impl io::Write + '_ ;
+
+            pub fn out(&self) -> impl io::Write + '_ ;
+
+            pub fn print_transient(&self, s: impl std::fmt::Display) -> io::Result<()>;
+        }
+    }
 }
 
 /// Full context needed for most operations
@@ -81,7 +93,7 @@ pub fn find_context<P: AsRef<StdPath>>(
         let db = Arc::new(SqliteDatabase::new_from_path(db_path, false)?);
 
         let wd = RPathBuf::try_from_path(root_dir, &wd)?;
-        log::info!("Root directory is {root_dir:?}, relative working directory is {wd}");
+        log::info!("Root directory is {root_dir:?}, relative working directory is {wd:?}");
         return Ok(ExecutionEnvironment {
             shell,
             wd,

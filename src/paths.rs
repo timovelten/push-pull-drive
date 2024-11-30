@@ -93,6 +93,14 @@ impl RPathBuf {
         self
     }
 
+    pub fn deserialize_sloppy(s: &str) -> Self {
+        if !s.ends_with('/') {
+            Self::deserialize(&format!("{s}/"))
+        } else {
+            Self::deserialize(s)
+        }
+    }
+
     pub fn deserialize(s: &str) -> Self {
         let mut ret = Self::empty();
         let mut current_component = Vec::new();
@@ -124,8 +132,8 @@ impl RPathBuf {
             }
         }
 
-        debug_assert!(current_component.is_empty());
-        assert!(!is_escaped, "Expected escaped character");
+        assert!(current_component.is_empty(), "should end with /");
+        assert!(!is_escaped, "expected escaped character");
 
         ret
     }
@@ -165,7 +173,7 @@ pub struct RPath {
 
 impl Debug for RPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.serialize())
+        write!(f, "\"{}\"", self.serialize())
     }
 }
 
@@ -186,6 +194,9 @@ impl RPath {
         self.inner.is_empty()
     }
 
+    /// This returns `None` if and only if self is empty. If this is called on a path
+    /// with only one segment, that is segment is returned as a str, and the first
+    /// return value is empty
     pub fn split_right(&self) -> Option<(&RPath, &str)> {
         let (last, rest) = self.inner.split_last()?;
         Some((RPath::new(rest), last))
@@ -213,6 +224,12 @@ impl RPath {
         buf.push(other);
 
         buf
+    }
+
+    /// Determine if there is a relationship between these two paths (i.e. one is a child of the other),
+    /// according to starts_with.
+    pub fn is_related_to(&self, other: &RPath) -> bool {
+        self.starts_with(other) || other.starts_with(self)
     }
 
     /// Returns all the subpaths of a path. Note that this ALWAYS included the empty path as

@@ -1,5 +1,5 @@
 use crate::{
-    context::{Context, Ctx}, file_repository::FileRepository, human_readable_bytes, paths::{RPath, RPathBuf}, DirectoryInfo, FileInfo, PathInfo
+    context::{Context, Ctx}, file_repository::FileRepository, human_readable_bytes, paths::{RPath, RPathBuf}, FileInfo, PathInfo
 };
 use std::io::Write;
 
@@ -10,7 +10,7 @@ pub struct LsArgs {
     #[arg(long)]
     depth: Option<usize>,
 
-    /// Whether to print details such as size and hash of the files
+    /// Whether to print details such as size and modified times of the files
     #[arg(long)]
     details: bool,
 }
@@ -26,9 +26,9 @@ pub fn remote_ls(
     let Ctx { env, remote, .. } = ctx.get();
     let depth = depth.unwrap_or(1);
 
-    env.shell.print_transient("Reading directory...")?;
+    env.print_transient("Reading directory...")?;
 
-    let path = path.map(|path| RPathBuf::from_sep(&path, '/'))
+    let path = path.map(|path| RPathBuf::deserialize_sloppy(&path))
         .unwrap_or(RPathBuf::empty());
     let path = env.wd.join(&path);
     let mut contents = env
@@ -38,9 +38,7 @@ pub fn remote_ls(
     // Sort directories first
     fn key(f: &PathInfo) -> (u8, &RPath) {
         match f {
-            PathInfo::Dir(DirectoryInfo {
-                path: relative_name,
-            }) => (0, relative_name),
+            PathInfo::Dir(path) => (0, path),
             PathInfo::File(FileInfo { path: rpath, .. }) => (1, rpath),
         }
     }
@@ -48,19 +46,17 @@ pub fn remote_ls(
 
     for file in contents {
         match file {
-            PathInfo::Dir(DirectoryInfo {
-                path: relative_name,
-            }) => {
-                writeln!(env.shell.out(), "{}/", relative_name)?;
+            PathInfo::Dir(path) => {
+                writeln!(env.out(), "{}/", path)?;
             }
             PathInfo::File(FileInfo {
                 path: rpath, size, ..
             }) => {
                 if details {
                     let (num, unit) = human_readable_bytes(size);
-                    writeln!(env.shell.out(), "{rpath} [{num} {unit}]")?;
+                    writeln!(env.out(), "{rpath} [{num} {unit}]")?;
                 } else {
-                    writeln!(env.shell.out(), "{rpath}")?;
+                    writeln!(env.out(), "{rpath}")?;
                 }
             }
         }

@@ -6,35 +6,34 @@ use crate::{
     FileInfo, InspectAsyncReader,
 };
 use anyhow::Error;
-use clap::ValueEnum;
 use progress::{ProgressId, ProgressSender};
-use std::{collections::VecDeque, io::Write as _, time::Duration};
+use tokio::{sync::Semaphore, task::JoinSet};
+use std::{collections::VecDeque, io::Write as _, sync::Arc, time::Duration};
 
 mod progress;
-// mod conflicts;
 
 #[derive(clap::Args, Clone)]
 pub struct PushPullArgs {
-    #[arg(long, value_enum, default_value_t=ConflictResolution::Interactive)]
-    conflict_resolution: ConflictResolution,
-    verbose: bool,
+    path: Option<String>,
 }
 
-#[derive(ValueEnum, Clone, Copy, PartialEq, Eq)]
-pub enum ConflictResolution {
-    Interactive,
-    Normal,
-    Aggressive,
-    Conservative,
+fn get_path(path: Option<String>, wd: &RPath) -> RPathBuf {
+    match path {
+        Some(path) => {
+            let path = RPathBuf::deserialize_sloppy(&path);
+            wd.join(&path)
+        }
+        None => wd.to_owned()
+    }
 }
 
 pub fn push(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> {
     let Ctx { env, local, remote } = ctx.get();
     PushPull {
-        args,
         env: env.clone(),
         from: local.clone(),
         to: remote.clone(),
+        path: get_path(args.path, &env.wd)
     }
     .execute()?;
 
@@ -44,10 +43,10 @@ pub fn push(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> {
 pub fn pull(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> {
     let Ctx { env, local, remote } = ctx.get();
     PushPull {
-        args,
         env: env.clone(),
         from: remote.clone(),
         to: local.clone(),
+        path: get_path(args.path, &env.wd)
     }
     .execute()?;
 
@@ -56,10 +55,10 @@ pub fn pull(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> {
 
 #[derive(Clone)]
 pub(super) struct PushPull<A, B> {
-    args: PushPullArgs,
     env: ExecutionEnvironment,
     from: A,
     to: B,
+    path: RPathBuf,
 }
 
 impl<A, B> PushPull<A, B>
@@ -72,27 +71,44 @@ where
         handle.block_on(self.execute_async())
     }
 
+    fn concurrency_limit(&self) -> usize {
+        std::cmp::min(A::CONCURRENCY_LIMIT, B::CONCURRENCY_LIMIT)
+    }
+
     async fn transfer_files(
-        self,
+        self: Arc<Self>,
         sender: ProgressSender,
         files: Vec<(RPathBuf, ProgressId)>,
     ) -> Vec<(RPathBuf, Error)> {
-        let mut errors = Vec::new();
+        let sem = Arc::new(Semaphore::new(self.concurrency_limit()));
 
-        // TODO: Make this async
+        let mut fts = JoinSet::new();
+
         for (file, id) in files {
-            sender.notify_start(id);
+            let sender = sender.clone();
+            let this = self.clone();
+            let sem = sem.clone();
 
-            let progress_callback = |bytes: usize| sender.notify_bytes_read(id, bytes as u64);
-            if let Err(err) = self.transfer_file(&file, progress_callback).await {
-                errors.push((file, err));
-                sender.notify_failed(id);
-            } else {
-                sender.notify_done(id);
-            }
+            fts.spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+
+                sender.notify_start(id);
+
+                let progress_callback = |bytes: usize| sender.notify_bytes_read(id, bytes as u64);
+                if let Err(err) = this.transfer_file(&file, progress_callback).await {
+                    sender.notify_failed(id);
+                    Err((file, err))
+                } else {
+                    sender.notify_done(id);
+                    Ok(())
+                }
+            });
         }
 
-        errors
+        let res = fts.join_all().await;
+        res.into_iter()
+            .filter_map(|res| res.err())
+            .collect()
     }
 
     /// Try and do everything a patch wants us to do, except actually transfering files.
@@ -165,13 +181,11 @@ where
     /// That is, to the best of our knowledge, the files we return can actually be transferred without
     /// any further conflicts.
     async fn prepare_transfer(&self) -> anyhow::Result<Vec<RPathBuf>> {
-        let path = &self.env.wd;
+        writeln!(self.env.err(), "Reading 'from' files...").unwrap();
+        let from_files = self.from.file_tree(&self.path, usize::MAX).await?;
 
-        writeln!(self.env.shell.err(), "Reading 'from' files...").unwrap();
-        let from_files = self.from.file_tree(path, usize::MAX).await?;
-
-        let _ = self.env.shell.print_transient("Reading 'to' files...");
-        let to_files = self.to.file_tree(path, usize::MAX).await?;
+        writeln!(self.env.err(), "Reading 'to' files...").unwrap();
+        let to_files = self.to.file_tree(&self.path, usize::MAX).await?;
 
         let patches = filetree::diff(&to_files, &from_files);
 
@@ -182,7 +196,6 @@ where
         // Go through what we have to do in BFS order, skipping over entire branches if a parent operation fails.
         let _ = self
             .env
-            .shell
             .print_transient("Preparing directory structures...");
 
         let mut queue: VecDeque<&RPath> = vec![RPath::empty()].into();
@@ -211,6 +224,15 @@ where
             queue.extend(children);
         }
 
+        if !early_failures.is_empty() {
+            writeln!(self.env.err(), "The following errors occurred:").unwrap();
+
+            for (patch, err) in early_failures {
+                writeln!(self.env.err(), "{:?}: {:?}", patch.path(), err).unwrap()
+            }
+        }
+
+
         // Prune the files that need to be updated, leaving out the ones that are up to date
         let to_be_updated = to_be_updated
             .into_iter()
@@ -221,8 +243,8 @@ where
                 let unchanged = from_info.size == to_info.size
                     && (from_info.modified - to_info.modified) < Duration::from_secs(1);
 
-                if unchanged && self.args.verbose {
-                    writeln!(self.env.shell.err(), "{path:?} is unchanged").unwrap()
+                if unchanged {
+                    log::debug!("{:?} is unchanged", path);
                 }
                 !unchanged
             })
@@ -250,17 +272,20 @@ where
 
         // Actually transfer files. Note that the sender is moved below, so the sender will be
         // dropped when transfer_files finishes
-        let this = self.clone();
+        let this = Arc::new(self.clone());
         let transfer_task =
             tokio::spawn(async move { this.transfer_files(sender, to_be_transferred).await });
 
         // Progress task ends when all senders are dropped
         receiver.run(&self.env.shell).await.unwrap();
 
-        // TODO
         let errors = transfer_task.await.unwrap();
-        for err in errors {
-            println!("{:?}", err);
+        if !errors.is_empty() {
+            writeln!(self.env.err(), "The following errors occurred:").unwrap();
+
+            for (path, err) in errors {
+                writeln!(self.env.err(), "{path:?}: {err:?}").unwrap()
+            }
         }
 
         Ok(())

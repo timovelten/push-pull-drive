@@ -12,13 +12,9 @@ impl UrlExt for Url {
     fn with_query_pairs<T: Serialize + ?Sized>(mut self, query: &T) -> Self {
         let mut pairs = self.query_pairs_mut();
         let serializer = serde_urlencoded::Serializer::new(&mut pairs);
-
-        if let Err(err) = query.serialize(serializer) {
-            todo!("handle serialization error {:?}", err);
-        }
-
+        query.serialize(serializer).unwrap();
         drop(pairs);
-
+        
         self
     }
 }
