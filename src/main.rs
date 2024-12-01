@@ -1,15 +1,19 @@
 use anyhow::anyhow;
 use clap::{Parser, Subcommand};
 use env_logger::Target;
-use std::{fs::File, path::Path, sync::Arc};
+use log::LevelFilter;
+use std::{path::Path, sync::Arc};
 
 pub mod commands;
 use commands::{
-    init::{self, InitBackendCmd}, ls::{self, LsArgs}, push_pull::{self, PushPullArgs}, status::{self, StatusArgs}
+    init::{self, InitBackendCmd},
+    ls::{self, LsArgs},
+    push_pull::{self, PushPullArgs},
+    status::{self, StatusArgs},
 };
 
 pub mod context;
-use context::{find_context, ExecutionEnvironment, Context, Ctx};
+use context::{find_context, Context, Ctx, ExecutionEnvironment};
 
 mod fileinfo;
 pub use fileinfo::*;
@@ -25,8 +29,8 @@ pub use util::*;
 
 pub mod db;
 pub mod file_repository;
-pub mod gdrive;
 pub mod filetree;
+pub mod gdrive;
 
 // Note that the level argument is implemented through the LevelFilter::from_str implementation.
 // Therefore, clap cannot possibly know all values (and therefore also cannot list them in the help).
@@ -34,13 +38,9 @@ pub mod filetree;
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 struct Cli {
-    /// A path to a logfile. If not set, log to stderr.
-    #[arg(long)]
-    log: Option<String>,
-
     /// Possible values include off, error, warn, info, debug and trace. Default is warn.
-    #[arg(long, default_value_t = log::LevelFilter::Warn)]
-    level: log::LevelFilter,
+    #[arg(long)]
+    level: Option<log::LevelFilter>,
 
     #[command(subcommand)]
     command: Commands,
@@ -62,6 +62,16 @@ trait CommandHandler {
     fn handle(&mut self, cmd: Commands) -> anyhow::Result<()>;
 }
 
+fn init_logger(err: impl std::io::Write + Send + 'static, level: Option<LevelFilter>) {
+    let mut builder = env_logger::Builder::from_default_env();
+    builder.target(Target::Pipe(Box::new(err)));
+    if let Some(level) = level {
+        builder.filter_level(level);
+    }
+
+    builder.init();
+}
+
 // TODO: When deleting a file, do not leave behind orphaned (empty) directories
 // TODO: Handle long windows filenames. Probably like this https://gal.hagever.com/posts/windows-long-paths-in-rust
 // TODO: Have a command like maintenance fix-duplicates that fixes "two files/folders having the same name" by
@@ -70,23 +80,14 @@ trait CommandHandler {
 //  - otherwise print a link to the web interface of google drive so the user may fix it themselves.
 pub fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let shell = Arc::new(Shell::new());
+    
+    init_logger(shell.clone().owned_err(), cli.level);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .expect("failed to build tokio runtime");
-
-    let shell = Arc::new(Shell::new());
-    let target = if let Some(path) = cli.log {
-        let f: Box<File> = File::create(path).expect("could not open log file").into();
-        Target::Pipe(f)
-    } else {
-        Target::Pipe(Box::new(shell.clone().owned_err()))
-    };
-    env_logger::Builder::new()
-        .target(target)
-        .filter_level(cli.level)
-        .init();
+        .unwrap();
 
     let wd = std::env::current_dir()?;
     if let Commands::Init { backend } = &cli.command {
@@ -103,9 +104,7 @@ pub fn main() -> anyhow::Result<()> {
 fn get_local_backend_config(root_dir: impl AsRef<Path>) -> local::Config {
     local::Config {
         root_path: root_dir.as_ref().to_owned(),
-        ignore_prefixes: vec![
-            RPathBuf::from_components([crate::context::CONFIG_DIR])
-        ]
+        ignore_prefixes: vec![RPathBuf::from_components([crate::context::CONFIG_DIR])],
     }
 }
 
@@ -135,7 +134,7 @@ impl<C: Context> CommandHandler for C {
             Commands::RemoteLs(args) => ls::remote_ls(self, args),
             Commands::Status(args) => status::local_status(self.get(), args),
             Commands::RemoteStatus(args) => status::remote_status(self.get(), args),
-            Commands::Pull(args) => push_pull::pull(self.get(), args)
+            Commands::Pull(args) => push_pull::pull(self.get(), args),
         }
     }
 }
