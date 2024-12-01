@@ -1,6 +1,5 @@
 mod credential;
 mod extensions;
-mod util;
 
 mod drive_api;
 

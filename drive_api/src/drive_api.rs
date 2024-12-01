@@ -9,8 +9,6 @@ use std::sync::LazyLock;
 use std::time::Duration;
 use std::{fmt::Display, str::FromStr};
 
-use crate::util::clone_request;
-
 use super::extensions::RequestBuilderExt;
 use super::extensions::UrlExt;
 use super::GoogleCredential;
@@ -223,7 +221,7 @@ impl DriveApi {
 
         let mut retries = 0u32;
         loop {
-            let converted_req: reqwest::Request = clone_request(&req).try_into().unwrap();
+            let converted_req: reqwest::Request = req.clone().try_into().unwrap();
             let resp = self.client.execute(converted_req).await;
 
             let (err, retryable): (_, bool) = match resp {
