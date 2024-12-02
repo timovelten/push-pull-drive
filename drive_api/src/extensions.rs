@@ -14,7 +14,7 @@ impl UrlExt for Url {
         let serializer = serde_urlencoded::Serializer::new(&mut pairs);
         query.serialize(serializer).unwrap();
         drop(pairs);
-        
+
         self
     }
 }
@@ -27,7 +27,10 @@ pub trait RequestBuilderExt {
 
 impl RequestBuilderExt for http::request::Builder {
     fn bearer_auth(self, token: &AccessToken) -> Self {
-        self.header(http::header::AUTHORIZATION, format!("Bearer {}", token.secret()))
+        self.header(
+            http::header::AUTHORIZATION,
+            format!("Bearer {}", token.secret()),
+        )
     }
 
     fn json_body<T: ?Sized + Serialize>(

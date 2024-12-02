@@ -16,8 +16,10 @@ thiserror = { workspace = true }
 log = { workspace = true }
 oauth2 = { workspace = true }
 reqwest = { workspace = true }
+pin-project-lite = { workspace = true }
 serde_urlencoded = "0.7.1"
 url = "2.3.1"
 
 [dev-dependencies]
 clap = { version = "4.5.20", features = ["derive"] }
+env_logger.workspace = true

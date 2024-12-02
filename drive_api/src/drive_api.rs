@@ -4,7 +4,7 @@
 
 use std::fmt::Write as _;
 use std::io::ErrorKind;
-use std::pin::pin;
+use std::pin::{pin, Pin};
 use std::sync::LazyLock;
 use std::time::Duration;
 use std::{fmt::Display, str::FromStr};
@@ -16,6 +16,7 @@ use anyhow::anyhow;
 use futures::{AsyncRead, AsyncReadExt, TryStreamExt};
 use http::Request;
 use oauth2::AccessToken;
+use pin_project_lite::pin_project;
 use rand::Rng;
 use serde::de::DeserializeOwned;
 use serde::{de, Deserialize};
@@ -38,7 +39,7 @@ pub enum ApiError {
     #[error("HTTP request had non 2xx status code (retries: {retries}): {inner:?}")]
     RequestFailed { inner: GoogleError, retries: u32 },
     #[error(transparent)]
-    Other(anyhow::Error),
+    Other(#[from] anyhow::Error),
 }
 
 #[derive(Deserialize, Debug)]
@@ -50,7 +51,7 @@ pub struct GoogleErrorDetails {
 
 /// I can't seem to find an official document stating that all errors of all Google APIs look
 /// like this. The Google Drive ones are (kind of) detailed here [https://developers.google.com/drive/api/guides/handle-errors].
-/// 
+///
 /// Also the official go client api library also assumes this structure [https://github.com/googleapis/google-api-go-client/blob/e3868f25dbd081e7d28a8d75d0ea4a5364027f80/googleapi/googleapi.go#L136]
 /// so it probably is specified somehwere (at least internally).
 #[derive(Deserialize, Debug)]
@@ -195,19 +196,18 @@ impl FilesReq {
 #[derive(Debug)]
 pub struct DriveApi {
     client: reqwest::Client,
-    credential: GoogleCredential
+    credential: GoogleCredential,
 }
 
 impl DriveApi {
-    // Chunksize of 20 MiB seems like a reasonable choice.
-    const CHUNKSIZE: usize = (256 * 1024 * 4) * 20;
-
     pub fn new(client: reqwest::Client, credential: GoogleCredential) -> Self {
         Self { client, credential }
     }
 
     async fn token(&self) -> Result<AccessToken, ApiError> {
-        self.credential.get_or_refresh_token().await
+        self.credential
+            .get_or_refresh_token()
+            .await
             .map_err(ApiError::Other)
     }
 
@@ -438,7 +438,6 @@ impl DriveApi {
         &self,
         create_request: FilesReq,
         src: R,
-        len: u64,
     ) -> Result<File, ApiError> {
         let url =
             Url::parse("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable")
@@ -454,7 +453,7 @@ impl DriveApi {
 
         let resumable_session_url = resp.headers().get("Location").unwrap().to_str().unwrap();
 
-        let value = self.upload(resumable_session_url, src, len).await?;
+        let value = self.upload(resumable_session_url, src).await?;
         serde_json::from_value(value).map_err(|err| ApiError::Other(err.into()))
     }
 
@@ -462,7 +461,6 @@ impl DriveApi {
         &self,
         id: &str,
         src: R,
-        len: u64,
     ) -> Result<File, ApiError> {
         let url = Url::parse(&format!(
             "https://www.googleapis.com/upload/drive/v3/files/{id}?uploadType=resumable"
@@ -482,7 +480,7 @@ impl DriveApi {
 
         let resumable_session_url = resp.headers().get("Location").unwrap().to_str().unwrap();
 
-        let value = self.upload(resumable_session_url, src, len).await?;
+        let value = self.upload(resumable_session_url, src).await?;
         serde_json::from_value(value).map_err(|err| ApiError::Other(err.into()))
     }
 
@@ -511,87 +509,229 @@ impl DriveApi {
         &self,
         resumable_session_url: &str,
         src: R,
-        len: u64,
     ) -> Result<serde_json::Value, ApiError> {
-        let mut src = pin!(src);
+        /// Google requires all but the last request to have at least a body length of 256 KB,
+        /// and also for buffer lengths to be multiples of 256 kb.
+        const MIN_SIZE: usize = 256 * 1024;
 
-        let mut buf = vec![0u8; Self::CHUNKSIZE].into_boxed_slice();
-        let mut buf_len = 0;
+        /// Chunksize of 20 MiB seems like a reasonable choice. Should be quite a bit larger than [Self::MIN_SIZE].
+        const CHUNKSIZE: usize = (256 * 1024 * 4) * 20;
 
-        let mut resend = 0;
-        let mut cursor = 0;
-        let value: serde_json::Value = loop {
-            if resend == 0 {
-                buf_len = 0;
-                while buf_len < Self::CHUNKSIZE {
-                    let just_read = src
-                        .read(&mut buf[buf_len..])
-                        .await
-                        .map_err(ApiError::IoError)?;
-                    if just_read == 0 {
-                        break;
-                    }
+        // See https://developers.google.com/drive/api/guides/manage-uploads#http---multiple-requests
+        let mut upload_buffer = pin!(UploadBuffer::new(src, MIN_SIZE, CHUNKSIZE));
 
-                    buf_len += just_read;
-                }
-            }
-            let send_buffer = &buf[0..buf_len];
+        let ret: serde_json::Value = loop {
+            upload_buffer
+                .as_mut()
+                .fill()
+                .await
+                .map_err(ApiError::IoError)?;
 
-            let mut req = Request::put(resumable_session_url)
-                .header(http::header::CONTENT_LENGTH, send_buffer.len());
-            if !send_buffer.is_empty() {
-                let range_header = &format!(
-                    "bytes {}-{}/{}",
-                    cursor,
-                    cursor + send_buffer.len() - 1,
-                    len
-                );
+            let (send_buf, last) = match upload_buffer.buffer() {
+                Ok(send_buf) => (send_buf, false),
+                Err(send_buf) if send_buf.is_empty() => return self.upload_empty_file(resumable_session_url).await,
+                Err(send_buf) => (send_buf, true)
+            };
 
-                req = req.header(http::header::CONTENT_RANGE, range_header);
-            }
-            let req = req.body(send_buffer.to_vec()).expect(REQUEST_IS_VALID);
+            let pos = upload_buffer.pos();
+            let end_pos = pos + send_buf.len() - 1;
 
-            // Note how the retrying will end up cloning the body contained in this request.
-            // But the "body" is just a *reference* to an array, and cloning a reference is cheap.
+            // Build the PUT request, making sure to not generate an invalid content range header
+            let range_header = if last {
+                format!("bytes {pos}-{end_pos}/{}", end_pos + 1)
+            } else {
+                format!("bytes {pos}-{end_pos}/*")
+            };
+
+            let req = Request::put(resumable_session_url)
+                .header(http::header::CONTENT_RANGE, range_header)
+                .header(http::header::CONTENT_LENGTH, send_buf.len())
+                .body(NoDebugBody(send_buf.to_vec()))
+                .unwrap();
+
+            log::debug!("UPLOAD {req:?}");
+
+            // 3. Send the request
             let resp = self
                 .client
                 .execute(req.try_into().unwrap())
                 .await
                 .map_err(ApiError::HttpError)?;
 
-            match resp.status().as_u16() {
-                // Success. We are done, extract the field and return it
+            // 4. Process the response
+            let bytes_received: usize = match resp.status().as_u16() {
                 200..=299 => break resp.json().await.map_err(ApiError::HttpError)?,
-
-                // Not yet finished
+                // 308 is actually 'Permanent Redirect' but Google uses it as 'Resume Incomplete'
                 308 => {
-                    if let Some(range) = resp.headers().get(http::header::RANGE) {
-                        let (from, to) = parse_range_header(range.to_str().unwrap());
-                        assert_eq!(from, 0, "range header indicates that remote has not receveived the beginning of a file but has received later parts");
+                    match resp.headers().get(http::header::RANGE) {
+                        Some(range_header) => {
+                            log::debug!("Received range header {:?}", range_header);
+                            // Ignore the "from" part of a range. I believe these should start at zero,
+                            // but if they don't there is also nothing we can really do with that information
+                            // except crash.
+                            let (_, to) = parse_range_header(range_header.to_str().unwrap());
 
-                        let bytes_received = 1 + to - cursor;
-
-                        if bytes_received < send_buffer.len() {
-                            resend += 1;
-                        } else {
-                            cursor += bytes_received;
-                            resend = 0;
+                            // We know that to >= consumed - 1, so this value is >= 0
+                            (1 + to) - upload_buffer.global_pos
                         }
-                    } else {
-                        // Remote has received no bytes. Loop...
-                        // Note that the try counter prevents us from looping indefinitely.
-                        todo!("Remote has received no bytes.")
-                        // FIXME: Retry here, but be careful: We must ensure that the old bytes are
-                        // not overwritten, perhaps by setting offset to its maximum?
+                        None => 0,
                     }
                 }
-                x => panic!("unexpected status code {}", x),
-            }
+                404 => return Err(ApiError::Other(anyhow!("Expired upload session"))),
+
+                x => {
+                    let mut err = anyhow!("Unexpected status code: {x}");
+                    if let Ok(body) = resp.text().await {
+                        err = err.context(body);
+                    }
+                    return Err(ApiError::Other(err));
+                }
+            };
+
+            upload_buffer.as_mut().consume(bytes_received);
         };
 
-        log::debug!("Uploaded file and got {:?}", value);
+        Ok(ret)
+    }
 
-        Ok(value)
+    async fn upload_empty_file(
+        &self,
+        resumable_session_url: &str
+    ) -> Result<serde_json::Value, ApiError> {
+        // https://developers.google.com/drive/api/guides/manage-uploads#http---single-request
+        let req = Request::put(resumable_session_url)
+            .header(http::header::CONTENT_LENGTH, 0)
+            .body(&[] as &'static [u8])
+            .unwrap();
+
+        self.client
+            .execute(req.try_into().unwrap())
+            .await
+            .map_err(ApiError::HttpError)?
+            .json()
+            .await
+            .map_err(ApiError::HttpError)
+    }
+}
+
+struct NoDebugBody<T>(T);
+
+impl<T: Into<reqwest::Body>> From<NoDebugBody<T>> for reqwest::Body {
+    fn from(value: NoDebugBody<T>) -> Self {
+        value.0.into()
+    }
+}
+
+impl<T> std::fmt::Debug for NoDebugBody<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[omitted]")
+    }
+}
+
+pin_project! {
+    struct UploadBuffer<R> {
+        #[pin]
+        reader: R,
+        exhausted: bool,
+
+        min_size: usize,
+
+        buf: Box<[u8]>,
+
+        // This is always a multiple of min_size.
+        pos: usize,
+
+        end: usize,
+        global_pos: usize,
+    }
+}
+
+impl<R: AsyncRead> UploadBuffer<R> {
+    fn new(reader: R, min_size: usize, capacity: usize) -> Self {
+        let cap = if capacity % min_size == 0 {
+            capacity + 1
+        } else {
+            capacity
+        };
+        let buffer = vec![0; cap];
+
+        Self {
+            reader,
+            buf: buffer.into_boxed_slice(),
+            end: 0,
+            pos: 0,
+            global_pos: 0,
+            min_size,
+            exhausted: false
+        }
+    }
+
+    async fn fill(self: Pin<&mut Self>) -> Result<(), std::io::Error> {
+        // After calling fill the following invariant is upheld:
+        // !self.exhausted ==> self.end % self.min_size != 0
+        // That is, as long as exhausted is false, self.end will never be a multiple of min_size.
+
+        let buf_len = self.end - self.pos;
+        if self.exhausted || buf_len >= self.min_size {
+            return Ok(());
+        }
+
+        let mut this = self.project();
+
+        let extra = *this.pos..*this.end;
+        let extra_bytes = extra.len();
+        this.buf.copy_within(extra, 0);
+        log::debug!("Copying bytes {extra_bytes}");
+
+        *this.end = extra_bytes;
+        *this.pos = 0;
+
+        while *this.end < *this.min_size || *this.end % *this.min_size == 0 {
+            let r = this.reader.read(&mut this.buf[*this.end..]).await?;
+            *this.end += r;
+            if r == 0 {
+                // This break is not technically needed. At this point, *this.end
+                // is equal to the capacity, which we statically ensured is not a multiple
+                // of min_size, so the while loop would end either way
+                *this.exhausted = true;
+                println!("Exhausted");
+                return Ok(());
+            }
+        }
+
+        // Now: self.end is definitely not a multiple of self.min_size
+        println!("Buf size {}", *this.end);
+
+        Ok(())
+    }
+
+    /// Ok(buf) is guaranteed to not be the last buffer, and also
+    /// to be a multiple of `min_size`.
+    /// 
+    /// Err(buf) is guranteed to be the last buffer (i.e. the inner reader has reached EOF).
+    /// It may or may not be a multiple of `min_size`.
+    fn buffer(&self) -> Result<&[u8], &[u8]> {
+        if self.exhausted {
+            Err(&self.buf[self.pos..self.end])
+        } else {
+            // If exhausted is false, then fill was definitely able to make sure that
+            // end is not a multiple of min_size, and we can leave a bit in the buffer
+            let end = round_down_to_multiple(self.end, self.min_size);
+            Ok(&self.buf[self.pos..end])
+        }
+    }
+
+    fn pos(&self) -> usize {
+        self.global_pos
+    }
+
+    fn consume(self: Pin<&mut Self>, bytes: usize) {
+        let bytes = round_down_to_multiple(bytes, self.min_size);
+
+        let this = self.project();
+
+        *this.pos += bytes;
+        *this.global_pos += bytes;
     }
 }
 
@@ -602,6 +742,10 @@ fn parse_range_header(s: &str) -> (usize, usize) {
         usize::from_str(left).unwrap(),
         usize::from_str(right).unwrap(),
     )
+}
+
+fn round_down_to_multiple(a: usize, b: usize) -> usize {
+    (a / b) * b
 }
 
 // Serde functions we need to serialize and deserialize the data correctly
@@ -714,5 +858,74 @@ mod test {
         "#;
 
         let _: GoogleError = serde_json::from_str(data).unwrap();
+    }
+
+    const MIB: usize = 256 * 1024 * 4;
+
+    #[tokio::test]
+    async fn upload_buffer_exact_match() {
+        let n = 256 * 1024;
+        let reader = vec![0; n];
+
+        let mut buffer = pin!(UploadBuffer::new(&reader[..], n, 10 * n));
+        
+        buffer.as_mut().fill().await.unwrap();
+        assert_eq!(buffer.buffer().unwrap_err().len(), n);
+    }
+
+    #[tokio::test]
+    async fn large() {
+        let n = 256 * 1024;
+        let reader = vec![0; MIB * 500];
+        
+        let mut buffer = pin!(UploadBuffer::new(&reader[..], n, 20 * MIB));
+
+        let mut len = 0;
+        loop {
+            buffer.as_mut().fill().await.unwrap();
+            let (end, buf_len) = match buffer.buffer() {
+                Ok(buf) => {
+                    (false, buf.len())
+                }
+                Err(buf) => {
+                    (true, buf.len())
+                }
+            };
+            len += buf_len;
+            println!("{len}");
+
+            if end {
+                break
+            }
+
+            buffer.as_mut().consume(buf_len);
+        }
+
+        assert_eq!(len, reader.len());
+    }
+
+    #[tokio::test]
+    async fn not_as_large() {
+
+        let n = 256 * 1024;
+        let reader = vec![0; n + 1];
+        let mut buffer = pin!(UploadBuffer::new(&reader[..], n, 20 * MIB));
+
+        buffer.as_mut().fill().await.unwrap();
+        assert_eq!(buffer.buffer().unwrap().len(), n);
+        buffer.as_mut().consume(n);
+
+        buffer.as_mut().fill().await.unwrap();
+        assert_eq!(buffer.buffer().unwrap_err().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_reader() {
+        let n = 256 * 1024;
+        let reader = vec![0; 0];
+        let mut buffer = pin!(UploadBuffer::new(&reader[..], n, 20 * MIB));
+
+        buffer.as_mut().fill().await.unwrap();
+        assert_eq!(buffer.buffer().unwrap_err().len(), 0);
     }
 }
