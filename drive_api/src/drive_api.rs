@@ -565,7 +565,6 @@ impl DriveApi {
                 308 => {
                     match resp.headers().get(http::header::RANGE) {
                         Some(range_header) => {
-                            log::debug!("Received range header {:?}", range_header);
                             // Ignore the "from" part of a range. I believe these should start at zero,
                             // but if they don't there is also nothing we can really do with that information
                             // except crash.

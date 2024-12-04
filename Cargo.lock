@@ -413,10 +413,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "env_logger",
  "futures",
  "http 1.1.0",
  "log",
  "oauth2",
+ "pin-project-lite",
  "rand",
  "reqwest 0.12.9",
  "serde",

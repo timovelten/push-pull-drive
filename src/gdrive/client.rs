@@ -320,8 +320,7 @@ impl GDriveClient {
                     parents: Some(vec![parent.id.clone()]),
                     ..Default::default()
                 },
-                src,
-                len,
+                src
             )
             .await?;
 
@@ -345,7 +344,7 @@ impl GDriveClient {
                 log::debug!("Updating file at {}", path);
 
                 self.api_client
-                    .files_update_upload(&file.id, src, len)
+                    .files_update_upload(&file.id, src)
                     .await?
             }
             Err(Ok(err)) => {
