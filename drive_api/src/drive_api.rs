@@ -16,7 +16,6 @@ use anyhow::anyhow;
 use futures::{AsyncRead, AsyncReadExt, TryStreamExt};
 use http::Request;
 use oauth2::AccessToken;
-use pin_project_lite::pin_project;
 use rand::Rng;
 use serde::de::DeserializeOwned;
 use serde::{de, Deserialize};
@@ -518,22 +517,23 @@ impl DriveApi {
         const CHUNKSIZE: usize = (256 * 1024 * 4) * 20;
 
         // See https://developers.google.com/drive/api/guides/manage-uploads#http---multiple-requests
-        let mut upload_buffer = pin!(UploadBuffer::new(src, MIN_SIZE, CHUNKSIZE));
+        let mut reader = pin!(src);
+        let mut upload_buffer = pin!(UploadBuffer::new(MIN_SIZE, CHUNKSIZE));
 
         let ret: serde_json::Value = loop {
             upload_buffer
                 .as_mut()
-                .fill()
+                .fill(&mut reader)
                 .await
                 .map_err(ApiError::IoError)?;
 
             let (send_buf, last) = match upload_buffer.buffer() {
                 Ok(send_buf) => (send_buf, false),
-                Err(send_buf) if send_buf.is_empty() => return self.upload_empty_file(resumable_session_url).await,
+                Err([]) => return self.upload_empty_file(resumable_session_url).await,
                 Err(send_buf) => (send_buf, true)
             };
 
-            let pos = upload_buffer.pos();
+            let pos = upload_buffer.global_pos();
             let end_pos = pos + send_buf.len() - 1;
 
             // Build the PUT request, making sure to not generate an invalid content range header
@@ -627,27 +627,24 @@ impl<T> std::fmt::Debug for NoDebugBody<T> {
     }
 }
 
-pin_project! {
-    struct UploadBuffer<R> {
-        #[pin]
-        reader: R,
-        exhausted: bool,
-
-        min_size: usize,
-
-        buf: Box<[u8]>,
-
-        // This is always a multiple of min_size.
-        pos: usize,
-
-        end: usize,
-        global_pos: usize,
-    }
+struct UploadBuffer {
+    buf: Box<[u8]>,
+    pos: usize,
+    end: usize,
+    /// Number of bytes that have been consumed so far.
+    global_pos: usize,
+    
+    /// The preferred chunksize. Every single chunk that is emitted by this (via
+    /// a call to [Self::buffer]) should ideally be a multiple of this value.
+    unit: usize,
+    /// Indicates whether the reader is exhausted.
+    exhausted: bool,
 }
 
-impl<R: AsyncRead> UploadBuffer<R> {
-    fn new(reader: R, min_size: usize, capacity: usize) -> Self {
-        let cap = if capacity % min_size == 0 {
+
+impl UploadBuffer {
+    fn new(unit: usize, capacity: usize) -> Self {
+        let cap = if capacity % unit == 0 {
             capacity + 1
         } else {
             capacity
@@ -655,51 +652,42 @@ impl<R: AsyncRead> UploadBuffer<R> {
         let buffer = vec![0; cap];
 
         Self {
-            reader,
             buf: buffer.into_boxed_slice(),
             end: 0,
             pos: 0,
             global_pos: 0,
-            min_size,
+            unit,
             exhausted: false
         }
     }
 
-    async fn fill(self: Pin<&mut Self>) -> Result<(), std::io::Error> {
-        // After calling fill the following invariant is upheld:
-        // !self.exhausted ==> self.end % self.min_size != 0
-        // That is, as long as exhausted is false, self.end will never be a multiple of min_size.
-
-        let buf_len = self.end - self.pos;
-        if self.exhausted || buf_len >= self.min_size {
+    async fn fill<R: AsyncRead>(&mut self, reader: &mut Pin<&mut R>) -> Result<(), std::io::Error> {
+        // This function tries to ensure that after it finishes, the buffers length is not a multiple of 
+        // of unit. So that buffer can give out some multiple of unit without giving away the whole buffer.
+        let remaining_buf_len = self.end - self.pos;
+        if remaining_buf_len >= self.unit {
             return Ok(());
         }
 
-        let mut this = self.project();
+        // This is what is still in the buffer, preserve it to be emitted another time.
+        // This is definitely < unit. And in fact, usually, it will only be a single byte
+        // (because we chose capacity that way).
+        self.buf.copy_within(self.pos..self.end, 0);
+        self.end = remaining_buf_len;
+        self.pos = 0;
 
-        let extra = *this.pos..*this.end;
-        let extra_bytes = extra.len();
-        this.buf.copy_within(extra, 0);
-        log::debug!("Copying bytes {extra_bytes}");
-
-        *this.end = extra_bytes;
-        *this.pos = 0;
-
-        while *this.end < *this.min_size || *this.end % *this.min_size == 0 {
-            let r = this.reader.read(&mut this.buf[*this.end..]).await?;
-            *this.end += r;
+        while self.end < self.unit || self.end % self.unit == 0 {
+            let r = reader.read(&mut self.buf[self.end..]).await?;
+            self.end += r;
             if r == 0 {
-                // This break is not technically needed. At this point, *this.end
-                // is equal to the capacity, which we statically ensured is not a multiple
-                // of min_size, so the while loop would end either way
-                *this.exhausted = true;
-                println!("Exhausted");
-                return Ok(());
+                self.exhausted = true;
+                break;
             }
         }
 
-        // Now: self.end is definitely not a multiple of self.min_size
-        println!("Buf size {}", *this.end);
+        // At this point either
+        // 1) The buffer is >= self.unit and its length is not divisible by unit
+        // 2) The reader is exhausted
 
         Ok(())
     }
@@ -715,22 +703,21 @@ impl<R: AsyncRead> UploadBuffer<R> {
         } else {
             // If exhausted is false, then fill was definitely able to make sure that
             // end is not a multiple of min_size, and we can leave a bit in the buffer
-            let end = round_down_to_multiple(self.end, self.min_size);
+            let end = round_down_to_multiple(self.end, self.unit);
             Ok(&self.buf[self.pos..end])
         }
     }
 
-    fn pos(&self) -> usize {
+    fn global_pos(&self) -> usize {
         self.global_pos
     }
 
-    fn consume(self: Pin<&mut Self>, bytes: usize) {
-        let bytes = round_down_to_multiple(bytes, self.min_size);
+    /// Note that this may consume fewer bytes if bytes is not a multiple of `unit``
+    fn consume(&mut self, bytes: usize) {
+        let bytes = round_down_to_multiple(bytes, self.unit);
 
-        let this = self.project();
-
-        *this.pos += bytes;
-        *this.global_pos += bytes;
+        self.pos += bytes;
+        self.global_pos += bytes;
     }
 }
 
@@ -864,11 +851,11 @@ mod test {
     #[tokio::test]
     async fn upload_buffer_exact_match() {
         let n = 256 * 1024;
-        let reader = vec![0; n];
 
-        let mut buffer = pin!(UploadBuffer::new(&reader[..], n, 10 * n));
+        let mut reader = pin!(&vec![0; n][..]);
+        let mut buffer = pin!(UploadBuffer::new(n, 10 * n));
         
-        buffer.as_mut().fill().await.unwrap();
+        buffer.fill(&mut reader).await.unwrap();
         assert_eq!(buffer.buffer().unwrap_err().len(), n);
     }
 
@@ -877,11 +864,12 @@ mod test {
         let n = 256 * 1024;
         let reader = vec![0; MIB * 500];
         
-        let mut buffer = pin!(UploadBuffer::new(&reader[..], n, 20 * MIB));
+        let mut reader = pin!(&reader[..]);
+        let mut buffer = UploadBuffer::new(n, 20 * MIB);
 
         let mut len = 0;
         loop {
-            buffer.as_mut().fill().await.unwrap();
+            buffer.fill(&mut reader).await.unwrap();
             let (end, buf_len) = match buffer.buffer() {
                 Ok(buf) => {
                     (false, buf.len())
@@ -897,7 +885,7 @@ mod test {
                 break
             }
 
-            buffer.as_mut().consume(buf_len);
+            buffer.consume(buf_len);
         }
 
         assert_eq!(len, reader.len());
@@ -907,24 +895,24 @@ mod test {
     async fn not_as_large() {
 
         let n = 256 * 1024;
-        let reader = vec![0; n + 1];
-        let mut buffer = pin!(UploadBuffer::new(&reader[..], n, 20 * MIB));
+        let mut reader = pin!(&vec![0; n + 1][..]);
+        let mut buffer = pin!(UploadBuffer::new(n, 20 * MIB));
 
-        buffer.as_mut().fill().await.unwrap();
+        buffer.fill(&mut reader).await.unwrap();
         assert_eq!(buffer.buffer().unwrap().len(), n);
         buffer.as_mut().consume(n);
 
-        buffer.as_mut().fill().await.unwrap();
+        buffer.fill(&mut reader).await.unwrap();
         assert_eq!(buffer.buffer().unwrap_err().len(), 1);
     }
 
     #[tokio::test]
     async fn empty_reader() {
         let n = 256 * 1024;
-        let reader = vec![0; 0];
-        let mut buffer = pin!(UploadBuffer::new(&reader[..], n, 20 * MIB));
+        let mut reader = pin!(&vec![0; 0][..]);
+        let mut buffer = pin!(UploadBuffer::new(n, 20 * MIB));
 
-        buffer.as_mut().fill().await.unwrap();
+        buffer.fill(&mut reader).await.unwrap();
         assert_eq!(buffer.buffer().unwrap_err().len(), 0);
     }
 }

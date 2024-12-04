@@ -26,8 +26,8 @@ async fn main() -> anyhow::Result<()> {
         println!("{:?}", file.name);
     }
 
-    // Now create a file
-    let len = 0;
+    // Now create a 30 mb file (that uses multiple chunks!)
+    let len = 1024 * 1024 * 30 + 1;
     let test_file_id = create_test_file(&api_client, root_file.id.clone(), len).await;
     let files = files_in_root(&api_client, &root_file.id).await?;
     let retrieved = files.iter().find(|file| file.id == test_file_id).unwrap();
