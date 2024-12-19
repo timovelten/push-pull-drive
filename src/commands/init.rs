@@ -1,5 +1,5 @@
 use crate::{
-    context::{self, ExecutionEnvironment}, db::SqliteDatabase, gdrive::{self, config::GoogleDriveInitArgs}, local::{self, LocalInitArgs}, paths::RPath, util::Shell
+    config::Config, context::{self, ExecutionEnvironment}, gdrive::{self, config::GoogleDriveInitArgs}, local::{self, LocalInitArgs}, paths::RPath, util::Shell
 };
 use std::{io::ErrorKind, path::Path, sync::Arc};
 use tokio::runtime::Handle as RuntimeHandle;
@@ -25,19 +25,13 @@ pub fn init(
         Err(err) => return Err(err.into()),
     };
 
-    let db_path = {
-        let mut tmp = config_dir;
-        tmp.push(context::DATABASE_NAME);
-        tmp
-    };
-
     // Open or create the dabase
-    let db: Arc<SqliteDatabase> = Arc::new(SqliteDatabase::new_from_path(db_path, true)?);
+    let config = Config::new(&config_dir);
 
     let ctx: ExecutionEnvironment = ExecutionEnvironment {
         shell,
+        config,
         wd: RPath::empty().to_owned(),
-        db,
         root_dir: root_dir.to_owned(),
         handle,
     };

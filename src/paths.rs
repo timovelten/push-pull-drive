@@ -2,6 +2,7 @@ use anyhow::bail;
 use core::str;
 use rusqlite::types::{FromSql, ToSqlOutput};
 use rusqlite::ToSql;
+use serde::Deserialize;
 use std::borrow::Borrow;
 use std::fmt::{Debug, Display};
 use std::ops::Deref;
@@ -320,6 +321,34 @@ impl RPath {
 
         // We could make this unsafe if we wanted to
         String::from_utf8(ret).expect("valid utf8 in valid utf8 out")
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RPathBuf {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let inner: Vec<String> = Deserialize::deserialize(deserializer)?;
+        Ok(RPathBuf { inner })
+    }
+}
+
+impl serde::Serialize for RPathBuf {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serde::Serialize::serialize(&self.as_rpath(), serializer)
+    }
+}
+
+impl serde::Serialize for &RPath {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.inner.serialize(serializer)
     }
 }
 

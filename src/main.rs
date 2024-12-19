@@ -15,6 +15,7 @@ use commands::{
 pub mod context;
 use context::{find_context, Context, Ctx, ExecutionEnvironment};
 
+mod config;
 mod fileinfo;
 pub use fileinfo::*;
 use paths::RPathBuf;

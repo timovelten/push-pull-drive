@@ -2,13 +2,14 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use oauth2::{basic::BasicClient, AccessToken, RefreshToken, TokenResponse};
+use serde::{Deserialize, Serialize};
 use time::ext::NumericalDuration;
 use time::OffsetDateTime;
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::oauth::{new_google_oauth_client, ClientConfig};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FatAccessToken {
     pub(crate) access_token: AccessToken,
     pub(crate) expires: OffsetDateTime,
@@ -68,7 +69,7 @@ pub struct GoogleCredential {
 impl GoogleCredential {
     pub fn new<F: Fn(FatAccessToken) + 'static + Send>(
         client_config: ClientConfig,
-        refresh_token: String,
+        refresh_token: RefreshToken,
         last_token: Option<FatAccessToken>,
         new_token_callback: F,
     ) -> Self {
@@ -76,7 +77,7 @@ impl GoogleCredential {
 
         let inner = GoogleCredentialImpl {
             client,
-            refresh_token: RefreshToken::new(refresh_token),
+            refresh_token,
             token: last_token,
             callback: Box::new(new_token_callback),
         };

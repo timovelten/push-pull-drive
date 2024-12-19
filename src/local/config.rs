@@ -1,9 +1,6 @@
+use super::{Config, LocalBackend};
 use crate::context::ExecutionEnvironment;
-use super::LocalBackend;
-
-const LOCAL_BACKEND: &str = "local";
-const KEY_LOCAL_PATH: &str = "local_path";
-const KEY_BACKEND: &str = "backend";
+use std::{path::PathBuf, sync::Arc};
 
 #[derive(clap::Args, Clone)]
 pub struct LocalInitArgs {
@@ -12,8 +9,13 @@ pub struct LocalInitArgs {
 }
 
 pub fn init(ctx: &ExecutionEnvironment, args: LocalInitArgs) -> anyhow::Result<()> {
-    ctx.db.put_value(KEY_BACKEND, LOCAL_BACKEND)?;
-    ctx.db.put_value(KEY_LOCAL_PATH, &args.path)?;
+    let root_path: PathBuf = args.path.into();
+    let config = Config {
+        root_path,
+        ignore_prefixes: vec![],
+    };
+
+    ctx.config.edit_backend_config(|_| Ok(config))?;
 
     Ok(())
 }
@@ -23,22 +25,11 @@ pub fn init(ctx: &ExecutionEnvironment, args: LocalInitArgs) -> anyhow::Result<(
 // only one hasher associated with it) as SHA1.
 
 pub fn load(ctx: &ExecutionEnvironment) -> anyhow::Result<Option<LocalBackend>> {
-    if ctx.db.get_value(KEY_BACKEND)?.as_deref() == Some(LOCAL_BACKEND) {
-        Ok(Some(load_internal(ctx)?))
-    } else {
-        Ok(None)
-    }
-}
-
-fn load_internal(ctx: &ExecutionEnvironment) -> anyhow::Result<LocalBackend> {
-    log::debug!("Loading local backend");
-
-    let local_path = ctx
-        .db
-        .must_get_value(KEY_LOCAL_PATH)?;
-    let config = super::Config {
-        root_path: local_path.into(),
-        ignore_prefixes: vec![]
+    let Some(config) = ctx.config.backend_config()? else {
+        return Ok(None);
     };
-    Ok(LocalBackend::from_config(config))
+
+    Ok(Some(LocalBackend {
+        config: Arc::new(config),
+    }))
 }

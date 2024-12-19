@@ -1,9 +1,9 @@
 use crate::context::ExecutionEnvironment;
 use crate::gdrive::client::GDriveClient;
-use anyhow::{anyhow, Context as _};
-use drive_api::oauth::{new_google_oauth_client, ClientConfig};
-use drive_api::{FatAccessToken, GoogleCredential};
-use serde::Deserialize;
+use anyhow::{anyhow, bail, Context as _};
+use drive_api::oauth::{self, new_google_oauth_client, ClientConfig};
+use drive_api::{FatAccessToken, GoogleCredential, RefreshToken};
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -11,17 +11,14 @@ use time::OffsetDateTime;
 
 use super::GDriveRepo;
 
-struct Cfg;
-
-const THIS_BACKEND: &str = "gdrive";
-
-impl Cfg {
-    pub const BACKEND: &str = "backend";
-    pub const CLIENT_SECRET: &str = "s";
-    pub const CLIENT_ID: &str = "cid";
-    pub const TOKEN: &str = "t";
-    pub const TOKEN_EXPIRES: &str = "exp";
-    pub const REFRESH_TOKEN: &str = "rt";
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "backend")]
+#[serde(rename = "gdrive")]
+struct Config {
+    client_secret: String,
+    cid: String,
+    token: FatAccessToken,
+    rt: RefreshToken,
 }
 
 #[derive(clap::Args, Clone)]
@@ -46,19 +43,14 @@ pub fn init(
     // Login the user using the OAuth device flow
     let (fat_token, refresh_token) = drive_api::oauth::sign_in(&client)?;
 
-    // Store them in the database and return
-    ctx.db.put_value(Cfg::BACKEND, THIS_BACKEND)?;
-    ctx.db.put_value(Cfg::CLIENT_ID, &client_config.client_id)?;
-    ctx.db
-        .put_value(Cfg::CLIENT_SECRET, &client_config.client_secret)?;
+    let initial_config = Config {
+        client_secret: client_config.client_secret,
+        cid: client_config.client_id,
+        token: fat_token.clone(),
+        rt: refresh_token,
+    };
 
-    ctx.db
-        .put_value(Cfg::REFRESH_TOKEN, refresh_token.secret())?;
-    ctx.db.put_value(Cfg::TOKEN, fat_token.secret())?;
-    ctx.db.put_value(
-        Cfg::TOKEN_EXPIRES,
-        &format!("{}", fat_token.expires().unix_timestamp()),
-    )?;
+    ctx.config.edit_backend_config(|_| Ok(initial_config))?;
 
     writeln!(ctx.shell.err(), "Success!")?;
 
@@ -66,58 +58,32 @@ pub fn init(
 }
 
 pub fn load(ctx: &ExecutionEnvironment) -> anyhow::Result<Option<GDriveRepo>> {
-    if ctx.db.get_value(Cfg::BACKEND)?.as_deref() == Some(THIS_BACKEND) {
-        Ok(Some(load_internal(ctx)?))
-    } else {
-        Ok(None)
-    }
-}
-
-fn load_internal(ctx: &ExecutionEnvironment) -> anyhow::Result<GDriveRepo> {
-    log::debug!("Loading google drive backend");
-
-    // Read what we previously saved from the database
-    let client_id = ctx.db.must_get_value(Cfg::CLIENT_ID)?;
-    let client_secret = ctx.db.must_get_value(Cfg::CLIENT_SECRET)?;
-
-    // Last token may or may not exist
-    let last_token = ctx.db.get_value(Cfg::TOKEN)?;
-    let last_token_expires = ctx.db.get_value(Cfg::TOKEN_EXPIRES)?;
-    let last_token = match (last_token, last_token_expires) {
-        (Some(tok), Some(exp)) => {
-            let expires = exp
-                .parse::<i64>()
-                .with_context(|| "failed to parse expiration date")
-                .and_then(|val| {
-                    OffsetDateTime::from_unix_timestamp(val)
-                        .with_context(|| "expiration date is not valid unix timestamp")
-                })?;
-
-            Some(FatAccessToken::from_parts(tok, expires))
-        }
-        (_, _) => None,
+    let Some(config) = ctx.config.backend_config::<Config>()? else {
+        return Ok(None);
     };
 
-    let refresh_token = ctx.db.must_get_value(Cfg::REFRESH_TOKEN)?;
-
-    // Create some objects in a DI kind of way and initialize the backend
     let client_config = ClientConfig {
-        client_id,
-        client_secret,
+        client_id: config.cid,
+        client_secret: config.client_secret,
     };
 
-    let db = ctx.db.clone();
-    let credential: GoogleCredential =
-        GoogleCredential::new(client_config, refresh_token, last_token, move |token| {
-            // Note how we fail silently here. Maybe we shouldn't (?), we'll see
-            let _ = db.put_value(Cfg::TOKEN, token.secret());
-            let _ = db.put_value(
-                Cfg::TOKEN_EXPIRES,
-                &token.expires().unix_timestamp().to_string(),
-            );
-        });
+    let ctx = ctx.clone();
+    let on_new_token = move |token: FatAccessToken| {
+        let _ = ctx.config.edit_backend_config(|config: Option<Config>| {
+            let Some(mut config) = config else {
+                bail!("config is initialized");
+            };
 
-    Ok(GDriveRepo {
-        inner: Arc::new(GDriveClient::new(credential)),
-    })
+            config.token = token;
+            Ok(config)
+        });
+    };
+
+    let cred = GoogleCredential::new(client_config, config.rt, Some(config.token), on_new_token);
+    let client = GDriveClient::new(cred);
+    let repo = GDriveRepo {
+        inner: Arc::new(client)
+    };
+
+    Ok(Some(repo))
 }

@@ -1,14 +1,13 @@
 use crate::{
-    db::SqliteDatabase,
-    file_repository::FileRepository,
-    local::LocalBackend,
-    paths::RPathBuf,
-    util::Shell,
+    config::Config, file_repository::FileRepository, local::LocalBackend,
+    paths::RPathBuf, util::Shell,
 };
 use anyhow::bail;
 use delegate::delegate;
 use std::{
-    io, path::{Path as StdPath, PathBuf as StdPathBuf}, sync::Arc
+    io::{self},
+    path::{Path as StdPath, PathBuf as StdPathBuf},
+    sync::Arc,
 };
 use tokio::runtime::Handle as TokioHandle;
 
@@ -18,7 +17,7 @@ pub const DATABASE_NAME: &str = "database.sqlite3";
 /// This contains the whole application context except for the two backends we use
 /// as source and destination. In other words, this struct can be intialized whenever the
 /// database is created (but might itself not be initialized).
-/// 
+///
 /// The "full" context is defined below.
 #[derive(Clone)]
 pub struct ExecutionEnvironment {
@@ -27,7 +26,7 @@ pub struct ExecutionEnvironment {
     pub wd: RPathBuf,
     /// Root dir. That is, the directory that contains the config directory
     pub root_dir: StdPathBuf,
-    pub db: Arc<SqliteDatabase>,
+    pub config: Config,
     pub handle: tokio::runtime::Handle,
 }
 
@@ -85,19 +84,18 @@ pub fn find_context<P: AsRef<StdPath>>(
             continue;
         }
 
-        log::debug!("Using config dir {:?}", config_dir);
-
         // This may fail. We then do not check folder further up,
         // but instead notify the user that the config folder that exists is somehow invalid.
-        let db_path = config_dir.join(DATABASE_NAME);
-        let db = Arc::new(SqliteDatabase::new_from_path(db_path, false)?);
+        let config = Config::new(&config_dir);
+        log::debug!("Using config dir {:?}", config_dir);
 
         let wd = RPathBuf::try_from_path(root_dir, &wd)?;
         log::info!("Root directory is {root_dir:?}, relative working directory is {wd:?}");
+
         return Ok(ExecutionEnvironment {
             shell,
             wd,
-            db,
+            config,
             root_dir: root_dir.to_owned(),
             handle,
         });

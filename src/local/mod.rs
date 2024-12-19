@@ -1,6 +1,8 @@
 use anyhow::anyhow;
 use anyhow::bail;
 use futures::TryFutureExt;
+use serde::Deserialize;
+use serde::Serialize;
 use walkdir::WalkDir;
 
 use crate::file_repository::Error;
@@ -30,7 +32,9 @@ pub struct LocalBackend {
     config: Arc<Config>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "backend")]
+#[serde(rename = "gdrive")]
 pub struct Config {
     /// A path on the local file system. Note that although from this type definition
     /// it may look like we support non-valid-unicode paths, this is not the case
