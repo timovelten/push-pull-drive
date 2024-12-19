@@ -15,13 +15,10 @@ use url::Url;
 
 use super::FatAccessToken;
 
-// Note: We intentionally do not have a debug implementation for this type (so that we do not
-// print the client secret. Though doing so in this specific context also wouldn't be the end
-// of the world)
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, Debug)]
 pub struct ClientConfig {
-    pub client_secret: String,
-    pub client_id: String,
+    pub client_secret: ClientSecret,
+    pub client_id: ClientId,
 }
 
 impl ClientConfig {
@@ -36,8 +33,8 @@ impl ClientConfig {
         }
         #[derive(Deserialize)]
         struct InstalledClient {
-            client_id: String,
-            client_secret: String,
+            client_id: ClientId,
+            client_secret: ClientSecret,
         }
 
         let cfg: Config = serde_json::from_slice(bytes)?;
@@ -51,8 +48,8 @@ impl ClientConfig {
 /// oauth2 BasicClient with Google's AuthUrl, TokenUrl and RevocationUrl set.
 pub fn new_google_oauth_client(config: ClientConfig) -> BasicClient {
     let client = BasicClient::new(
-        ClientId::new(config.client_id),
-        Some(ClientSecret::new(config.client_secret)),
+        config.client_id,
+        Some(config.client_secret),
         AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string()).unwrap(),
         Some(TokenUrl::new("https://www.googleapis.com/oauth2/v3/token".to_string()).unwrap()),
     );

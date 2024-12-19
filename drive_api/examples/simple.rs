@@ -1,5 +1,5 @@
 use drive_api::{DriveApi, FilesReq, GoogleCredential, MoreFileFields};
-use oauth2::RefreshToken;
+use oauth2::{ClientId, ClientSecret, RefreshToken};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -8,8 +8,8 @@ async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_default_env().init();
 
     let client_config = drive_api::oauth::ClientConfig {
-        client_id: std::env::var("GOOGLE_CID").unwrap(),
-        client_secret: std::env::var("GOOGLE_SECRET").unwrap()
+        client_id: ClientId::new(std::env::var("GOOGLE_CID").unwrap()),
+        client_secret: ClientSecret::new(std::env::var("GOOGLE_SECRET").unwrap())
     };
     let refresh_token = RefreshToken::new(std::env::var("GOOGLE_RT").unwrap());
 

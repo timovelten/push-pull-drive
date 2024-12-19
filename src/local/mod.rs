@@ -33,8 +33,6 @@ pub struct LocalBackend {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "backend")]
-#[serde(rename = "gdrive")]
 pub struct Config {
     /// A path on the local file system. Note that although from this type definition
     /// it may look like we support non-valid-unicode paths, this is not the case

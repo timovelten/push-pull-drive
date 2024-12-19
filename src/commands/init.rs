@@ -1,5 +1,5 @@
 use crate::{
-    config::Config, context::{self, ExecutionEnvironment}, gdrive::{self, config::GoogleDriveInitArgs}, local::{self, LocalInitArgs}, paths::RPath, util::Shell
+    context::{self, ExecutionEnvironment}, db::SqliteDatabase, gdrive::{self, config::GoogleDriveInitArgs}, local::{self, LocalInitArgs}, paths::RPath, util::Shell
 };
 use std::{io::ErrorKind, path::Path, sync::Arc};
 use tokio::runtime::Handle as RuntimeHandle;
@@ -20,21 +20,25 @@ pub fn init(
 
     // Make sure the config directory exists
     match std::fs::create_dir(&config_dir) {
-        Ok(_) => {}
+        Ok(_) => {
+            log::debug!("Created config dir");
+        }
         Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
         Err(err) => return Err(err.into()),
     };
 
     // Open or create the dabase
-    let config = Config::new(&config_dir);
+    let db: SqliteDatabase = SqliteDatabase::new_in_dir(&config_dir, true)?;
 
     let ctx: ExecutionEnvironment = ExecutionEnvironment {
+        db: Arc::new(db),
         shell,
-        config,
         wd: RPath::empty().to_owned(),
         root_dir: root_dir.to_owned(),
         handle,
     };
+
+    log::debug!("Initializing at root directory {:?}", root_dir);
 
     match b {
         InitBackendCmd::Local(args) => local::init(&ctx, args),

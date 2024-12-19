@@ -15,7 +15,7 @@ pub fn init(ctx: &ExecutionEnvironment, args: LocalInitArgs) -> anyhow::Result<(
         ignore_prefixes: vec![],
     };
 
-    ctx.config.edit_backend_config(|_| Ok(config))?;
+    ctx.db.put_value("local", &config)?;
 
     Ok(())
 }
@@ -25,8 +25,9 @@ pub fn init(ctx: &ExecutionEnvironment, args: LocalInitArgs) -> anyhow::Result<(
 // only one hasher associated with it) as SHA1.
 
 pub fn load(ctx: &ExecutionEnvironment) -> anyhow::Result<Option<LocalBackend>> {
-    let Some(config) = ctx.config.backend_config()? else {
-        return Ok(None);
+    let config= match ctx.db.get_value::<Config>("local")? {
+        Some(config) => config,
+        None => return Ok(None)
     };
 
     Ok(Some(LocalBackend {

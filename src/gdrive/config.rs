@@ -12,13 +12,10 @@ use time::OffsetDateTime;
 use super::GDriveRepo;
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "backend")]
-#[serde(rename = "gdrive")]
 struct Config {
-    client_secret: String,
-    cid: String,
     token: FatAccessToken,
-    rt: RefreshToken,
+    refresh_token: RefreshToken,
+    client_config: ClientConfig,
 }
 
 #[derive(clap::Args, Clone)]
@@ -41,16 +38,14 @@ pub fn init(
     let client = new_google_oauth_client(client_config.clone());
 
     // Login the user using the OAuth device flow
-    let (fat_token, refresh_token) = drive_api::oauth::sign_in(&client)?;
-
-    let initial_config = Config {
-        client_secret: client_config.client_secret,
-        cid: client_config.client_id,
-        token: fat_token.clone(),
-        rt: refresh_token,
+    let (token, refresh_token) = drive_api::oauth::sign_in(&client)?;
+    let config = Config {
+        client_config,
+        token,
+        refresh_token,
     };
 
-    ctx.config.edit_backend_config(|_| Ok(initial_config))?;
+    ctx.db.put_value("gdrive_config", config)?;
 
     writeln!(ctx.shell.err(), "Success!")?;
 
@@ -58,31 +53,28 @@ pub fn init(
 }
 
 pub fn load(ctx: &ExecutionEnvironment) -> anyhow::Result<Option<GDriveRepo>> {
-    let Some(config) = ctx.config.backend_config::<Config>()? else {
-        return Ok(None);
-    };
-
-    let client_config = ClientConfig {
-        client_id: config.cid,
-        client_secret: config.client_secret,
+    let config = match ctx.db.get_value::<Config>("gdrive_config")? {
+        Some(config) => config,
+        _ => return Ok(None),
     };
 
     let ctx = ctx.clone();
     let on_new_token = move |token: FatAccessToken| {
-        let _ = ctx.config.edit_backend_config(|config: Option<Config>| {
-            let Some(mut config) = config else {
-                bail!("config is initialized");
-            };
-
+        let _ = ctx.db.edit_value::<Config, _>("gdrive_config", |mut config| {
             config.token = token;
             Ok(config)
         });
     };
 
-    let cred = GoogleCredential::new(client_config, config.rt, Some(config.token), on_new_token);
+    let cred = GoogleCredential::new(
+        config.client_config,
+        config.refresh_token,
+        Some(config.token),
+        on_new_token,
+    );
     let client = GDriveClient::new(cred);
     let repo = GDriveRepo {
-        inner: Arc::new(client)
+        inner: Arc::new(client),
     };
 
     Ok(Some(repo))

@@ -1,6 +1,5 @@
 use crate::{
-    config::Config, file_repository::FileRepository, local::LocalBackend,
-    paths::RPathBuf, util::Shell,
+    db::SqliteDatabase, file_repository::FileRepository, local::LocalBackend, paths::RPathBuf, util::Shell
 };
 use anyhow::bail;
 use delegate::delegate;
@@ -26,7 +25,7 @@ pub struct ExecutionEnvironment {
     pub wd: RPathBuf,
     /// Root dir. That is, the directory that contains the config directory
     pub root_dir: StdPathBuf,
-    pub config: Config,
+    pub db: Arc<SqliteDatabase>,
     pub handle: tokio::runtime::Handle,
 }
 
@@ -86,16 +85,17 @@ pub fn find_context<P: AsRef<StdPath>>(
 
         // This may fail. We then do not check folder further up,
         // but instead notify the user that the config folder that exists is somehow invalid.
-        let config = Config::new(&config_dir);
+        let db = SqliteDatabase::new_in_dir(&config_dir, false)?;
+
         log::debug!("Using config dir {:?}", config_dir);
 
         let wd = RPathBuf::try_from_path(root_dir, &wd)?;
         log::info!("Root directory is {root_dir:?}, relative working directory is {wd:?}");
 
         return Ok(ExecutionEnvironment {
+            db: Arc::new(db),
             shell,
             wd,
-            config,
             root_dir: root_dir.to_owned(),
             handle,
         });

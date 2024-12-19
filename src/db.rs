@@ -2,7 +2,7 @@ use crate::{
     filetree::{self, Node},
     paths::{RPath, RPathBuf},
 };
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use rusqlite::{named_params, types::Null, Connection, OpenFlags, OptionalExtension, Row};
 use std::{path::Path, sync::Mutex};
 
@@ -57,6 +57,12 @@ impl SqliteDatabase {
         }
     }
 
+    /// Same as new_from_path, but uses the default name of the database as a filename
+    pub fn new_in_dir(dir: &Path, create_if_not_exists: bool) -> anyhow::Result<Self> {
+        let path = dir.join("database.sqlite3");
+        Self::new_from_path(path, create_if_not_exists)
+    }
+
     pub fn new_from_path<P: AsRef<Path>>(
         path: P,
         create_if_not_exists: bool,
@@ -90,12 +96,48 @@ impl SqliteDatabase {
         Ok(Self::new(raw_conn.into_connection()))
     }
 
+    pub fn put_value<T: serde::Serialize>(&self, key: &str, val: T) -> anyhow::Result<()> {
+        let as_str = serde_json::to_string_pretty(&val)?;
+        self.raw.lock().unwrap().put_value(key, &as_str)?;
+        Ok(())
+    }
+
+    pub fn get_value<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> anyhow::Result<Option<T>> {
+        let as_str = self.raw.lock().unwrap().get_value(key)?;
+        let ret = match as_str {
+            None => None,
+            Some(x) => Some(serde_json::from_str(&x)?),
+        };
+        Ok(ret)
+    }
+
+    pub fn edit_value<T, S>(
+        &self,
+        key: &str,
+        func: impl FnOnce(T) -> anyhow::Result<S>,
+    ) -> anyhow::Result<()>
+    where
+        T: serde::de::DeserializeOwned,
+        S: serde::Serialize,
+    {
+        let db = self.raw.lock().unwrap();
+
+        let old_val: T = serde_json::from_str(
+            &db.get_value(key)?
+                .ok_or_else(|| anyhow!("key {key} does not exist"))?,
+        )?;
+        let new_val = func(old_val)?;
+
+        db.put_value(key, &serde_json::to_string_pretty(&new_val)?)?;
+        
+        Ok(())
+    }
+
     delegate::delegate! {
         to self.raw.lock().unwrap() {
-            pub fn get_value(&self, key: &str) -> rusqlite::Result<Option<String>>;
-
-            pub fn put_value(&self, key: &str, value: &str) -> rusqlite::Result<()>;
-
             pub fn update_tracked(&self, tracked: &Tracked) -> rusqlite::Result<()>;
 
             pub fn delete_tracked(&self, path: &RPath) -> rusqlite::Result<()>;
@@ -209,7 +251,10 @@ impl RawConn {
 
     fn update_tracked(&self, t: &Tracked) -> rusqlite::Result<()> {
         if t.path().is_empty() {
-            assert!(matches!(t, Tracked::Dir {.. }), "The root must be a directory");
+            assert!(
+                matches!(t, Tracked::Dir { .. }),
+                "The root must be a directory"
+            );
             return Ok(());
         }
 
@@ -268,8 +313,7 @@ impl RawConn {
                 .prepare("SELECT * FROM tracked WHERE path >= ?1 AND path < ?2")?;
 
             let rows = stmt.query((lower, upper))?;
-            rows.mapped(Self::tracked_file_from_row)
-                .collect()
+            rows.mapped(Self::tracked_file_from_row).collect()
         } else {
             let mut stmt = self.conn.prepare("SELECT * FROM tracked")?;
             let rows = stmt.query([])?;
@@ -305,12 +349,12 @@ mod tests {
     fn key_value() {
         let repo = empty_in_memory_repository();
 
-        let v = repo.get_value("SomeKey").unwrap();
+        let v = repo.get_value::<String>("SomeKey").unwrap();
         assert!(v.is_none(), "key should not yet exist");
 
         repo.put_value("SomeKey", "SomeValue 123456").unwrap();
 
-        let v = repo.get_value("SomeKey").unwrap();
+        let v = repo.get_value::<String>("SomeKey").unwrap();
         assert!(v.is_some());
         assert_eq!(v.unwrap(), "SomeValue 123456");
     }
