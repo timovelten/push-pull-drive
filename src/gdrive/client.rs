@@ -244,7 +244,7 @@ impl GDriveClient {
         Ok(ret)
     }
 
-    pub async fn get_metadata(&self, path: &RPath) -> Result<PathInfo> {
+    pub async fn metadata(&self, path: &RPath) -> Result<PathInfo> {
         let drive_id = &self.drive_file_by_rpath_cached(path).await?.id;
         let info = match self.api_client.files_get(drive_id).await {
             Ok(file) => match file.more {
@@ -392,109 +392,7 @@ impl GDriveClient {
         Ok(())
     }
 
-    pub async fn file_tree(self: &Arc<Self>, filter: &RPath, max_depth: usize) -> Result<FileTree<PathInfo>> {
-        const BATCH_SIZE: usize = 12;
-        log::debug!("file_tree with filter '{filter:?}'");
-
-        // Another day, another (sort-of) BFS!
-        let mut ret = vec![
-            PathInfo::root_dir()
-        ];
-
-        let root = self.root_file().await?;
-        let mut queue = vec![(
-            root.id, RPathBuf::empty()
-        )];
-
-        for depth in 0..max_depth {
-            // Invariant: At this point, all directories in the queue are directories of depth
-            // `depth` and depth <= max_depth
-            if queue.is_empty() {
-                break;
-            }
-
-            // Limit concurrency somewhat
-            let sem = Arc::new(tokio::sync::Semaphore::new(Self::CONCURRENCY_LIMIT));
-            let mut fts = JoinSet::new();
-            
-            // Only consider those queue items that match the current filter
-            let mut queue_items = queue.into_iter();
-
-            loop {
-                let batch: Vec<_> = (&mut queue_items).take(BATCH_SIZE).collect();
-                if batch.is_empty() {
-                    break
-                }
-
-                let this = self.clone();
-                let sem = sem.clone();
-                fts.spawn(async move {
-                    let _permit = sem.acquire().await.unwrap();
-
-                    let mut ret = Vec::new();
-                    let files = this
-                        .read_dirs(batch.iter().map(|(x, _)| x.as_str()))
-                        .await?; 
-
-                    for file in files {
-                        let parent_id = &file
-                            .parents
-                            .as_ref()
-                            .expect("Google drive files we request have a parent")[0];
-
-                        let parent_path = batch
-                            .iter()
-                            .find(|(id, _)| id == parent_id)
-                            .map(|(_, path)| path)
-                            .with_context(|| format!("List of targets is {batch:?} and we recevied a file with parent id {parent_id:?}"))
-                            .expect("Every file we receive should have a parent we know of");
-
-                        let path = parent_path.join_single(&file.name);
-
-                        let info = match file.more {
-                            Some(MoreFileFields::BinaryFile {
-                                sha1_checksum,
-                                size,
-                                ..
-                            }) => PathInfo::File(FileInfo {
-                                path: path.to_owned(),
-                                size,
-                                modified: file.modified_time
-                            }),
-                            None if file.is_folder() => PathInfo::Dir(path.to_owned()),
-                            _ => {
-                                // Ignore Google docs etc for now..
-                                continue;
-                            }
-                        };
-
-                        ret.push((file.id, info));
-                    }
-
-                    Ok::<_, anyhow::Error>(ret)
-                });
-            }
-
-            // Extract folders that we found and queue them up
-            queue = Vec::new();
-            while let Some(next) = fts.join_next().await {
-                let next = next.unwrap();
-
-                for (next_id, next_info) in next? {
-                    // Filter out paths that are not requested
-                    if !next_info.path().is_related_to(filter) {
-                        continue;
-                    }
-
-                    if let PathInfo::Dir(path) = &next_info {
-                        queue.push((next_id, path.clone()));
-                    }
-
-                    ret.push(next_info);
-                }
-            }
-        }
-
-        Ok(ret.try_into().unwrap())
+    pub async fn list_files(self: &Arc<Self>, filter: &RPath, max_depth: usize) -> Result<Vec<PathInfo>> {
+        todo!()
     }
 }

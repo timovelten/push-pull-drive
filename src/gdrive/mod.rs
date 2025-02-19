@@ -41,13 +41,15 @@ impl FileRepository for GDriveRepo {
 
     delegate! {
         to self.inner {
-            async fn file_tree(
+            async fn list_files(
                 &self,
                 filter: &RPath,
                 depth: usize,
-            ) -> Result<FileTree<PathInfo>>;
+            ) -> Result<Vec<PathInfo>>;
 
             async fn delete(&self, path: &RPath) -> Result<()>;
+
+            async fn metadata(&self, path: &RPath) -> Result<PathInfo>;
 
             async fn write_file<R: AsyncReader>(
                 &self,

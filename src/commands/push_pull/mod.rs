@@ -1,14 +1,14 @@
 use crate::{
     context::{Context, Ctx, ExecutionEnvironment},
     file_repository::FileRepository,
-    filetree::{self, Node as _, Patch, PatchKind},
+    filetree::{self, FileTree, Node as _, Patch, PatchKind},
     paths::{RPath, RPathBuf},
-    FileInfo, InspectAsyncReader,
+    FileInfo, InspectAsyncReader, PathInfo,
 };
 use anyhow::Error;
 use progress::{ProgressId, ProgressSender};
+use std::{collections::VecDeque, io::Write as _, sync::Arc, time::Duration, usize};
 use tokio::{sync::Semaphore, task::JoinSet};
-use std::{collections::VecDeque, io::Write as _, sync::Arc, time::Duration};
 
 mod progress;
 
@@ -23,7 +23,7 @@ fn get_path(path: Option<String>, wd: &RPath) -> RPathBuf {
             let path = RPathBuf::deserialize_sloppy(&path);
             wd.join(&path)
         }
-        None => wd.to_owned()
+        None => wd.to_owned(),
     }
 }
 
@@ -33,7 +33,7 @@ pub fn push(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> {
         env: env.clone(),
         from: local.clone(),
         to: remote.clone(),
-        path: get_path(args.path, &env.wd)
+        path: get_path(args.path, &env.wd),
     }
     .execute()?;
 
@@ -46,7 +46,7 @@ pub fn pull(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> {
         env: env.clone(),
         from: remote.clone(),
         to: local.clone(),
-        path: get_path(args.path, &env.wd)
+        path: get_path(args.path, &env.wd),
     }
     .execute()?;
 
@@ -106,9 +106,7 @@ where
         }
 
         let res = fts.join_all().await;
-        res.into_iter()
-            .filter_map(|res| res.err())
-            .collect()
+        res.into_iter().filter_map(|res| res.err()).collect()
     }
 
     /// Try and do everything a patch wants us to do, except actually transfering files.
@@ -182,10 +180,10 @@ where
     /// any further conflicts.
     async fn prepare_transfer(&self) -> anyhow::Result<Vec<RPathBuf>> {
         writeln!(self.env.err(), "Reading 'from' files...").unwrap();
-        let from_files = self.from.file_tree(&self.path, usize::MAX).await?;
+        let from_files = file_tree(&self.from, &self.path).await?;
 
         writeln!(self.env.err(), "Reading 'to' files...").unwrap();
-        let to_files = self.to.file_tree(&self.path, usize::MAX).await?;
+        let to_files = file_tree(&self.to, &self.path).await?;
 
         let patches = filetree::diff(&to_files, &from_files);
 
@@ -231,7 +229,6 @@ where
                 writeln!(self.env.err(), "{:?}: {:?}", patch.path(), err).unwrap()
             }
         }
-
 
         // Prune the files that need to be updated, leaving out the ones that are up to date
         let to_be_updated = to_be_updated
@@ -289,5 +286,142 @@ where
         }
 
         Ok(())
+    }
+}
+
+async fn file_tree<A: FileRepository>(
+    repo: &A,
+    path: &RPath,
+) -> anyhow::Result<FileTree<PathInfo>> {
+    // Start out by walking the components of the path, and checking which component is
+    // the first to not exist
+    let mut ret = Vec::new();
+    let mut done = false;
+    for path in path.subpaths() {
+        match repo.maybe_metadata(path).await? {
+            Some(info @ PathInfo::Dir(_)) => ret.push(info),
+            Some(info @ PathInfo::File(_)) => {
+                ret.push(info);
+                done = true;
+            },
+            None => {
+                done = true;
+            }
+        }
+    }
+
+    if done {
+        return Ok(ret.try_into().unwrap())
+    }
+
+    // Last element will be added in a second. Remove it here to avoid duplicates.
+    let _ = ret.pop();
+
+    // Now actually read the directory (we already know it exists)
+    let files = repo.list_files(path, usize::MAX).await?;
+    ret.extend(files);
+
+    Ok(ret.try_into().expect("is a tree"))
+}
+
+#[cfg(test)]
+mod tests {
+    use time::OffsetDateTime;
+
+    use super::*;
+    use crate::file_repository;
+
+    #[tokio::test]
+    async fn file_tree_is_equivalent_to_list_files_root() {
+        let tree: FileTree<PathInfo> = vec![
+            PathInfo::Dir(RPathBuf::empty()),
+            PathInfo::Dir("some".into()),
+            PathInfo::Dir("some/dir".into()),
+            PathInfo::Dir("some/dir/that".into()),
+            PathInfo::File(FileInfo {
+                path: "some/dir/that/file".into(),
+                size: 42,
+                modified: OffsetDateTime::now_utc(),
+            }),
+            PathInfo::File(FileInfo {
+                path: "file".into(),
+                size: 42,
+                modified: OffsetDateTime::now_utc(),
+            }),
+        ]
+        .try_into()
+        .unwrap();
+
+        let repo = file_repository::util::MockRepository::new(tree.clone());
+
+        let output = file_tree(&repo, RPath::empty()).await.unwrap();
+
+        dbg!(&output);
+        assert_eq!(output.len(), tree.len());
+    }
+
+    #[tokio::test]
+    async fn file_tree_returns_partial_trees() {
+        let tree: FileTree<PathInfo> = vec![
+            PathInfo::Dir(RPathBuf::empty()),
+            PathInfo::Dir("some".into()),
+            PathInfo::Dir("some/dir".into()),
+            PathInfo::Dir("some/dir/that".into()),
+        ]
+        .try_into()
+        .unwrap();
+
+        let repo = file_repository::util::MockRepository::new(tree.clone());
+
+        let output = file_tree(&repo, "some/dir/that/does/not/exist".into())
+            .await
+            .unwrap();
+
+        assert_eq!(output, tree);
+    }
+
+    #[tokio::test]
+    async fn file_tree_returns_partial_trees_when_called_on_files() {
+        let tree: FileTree<PathInfo> = vec![
+            PathInfo::Dir(RPathBuf::empty()),
+            PathInfo::Dir("some".into()),
+            PathInfo::Dir("some/dir".into()),
+            PathInfo::File(FileInfo {
+                path: "some/dir/that".into(),
+                size: 42,
+                modified: OffsetDateTime::now_utc()
+            })
+        ]
+        .try_into()
+        .unwrap();
+
+        let repo = file_repository::util::MockRepository::new(tree.clone());
+
+        let output = file_tree(&repo, "some/dir/that".into())
+            .await
+            .unwrap();
+
+        assert_eq!(output, tree);
+    }
+
+    #[tokio::test]
+    async fn file_might_be_empty() {
+        let tree: FileTree<PathInfo> = vec![
+            PathInfo::Dir(RPathBuf::empty()),
+            PathInfo::Dir("some".into()),
+            PathInfo::Dir("some/dir".into()),
+            PathInfo::Dir("some/dir/that".into()),
+        ]
+        .try_into()
+        .unwrap();
+
+        let repo = file_repository::util::MockRepository::new(tree.clone());
+
+        let output = file_tree(&repo, "something/else/entirely".into())
+            .await
+            .unwrap()
+            .into_vec();
+
+        assert_eq!(output, vec![PathInfo::Dir(RPathBuf::empty())]);
     }
 }

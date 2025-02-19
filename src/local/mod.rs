@@ -7,7 +7,6 @@ use walkdir::WalkDir;
 
 use crate::file_repository::Error;
 use crate::file_repository::Result;
-use crate::filetree::FileTree;
 use crate::paths::RPath;
 use crate::paths::RPathBuf;
 use crate::{file_repository::FileRepository, FileInfo, PathInfo};
@@ -140,8 +139,8 @@ impl FileRepository for LocalBackend {
 
     async fn read_file(&self, path: &RPath) -> Result<(FileInfo, Self::Reader)> {
         let me = self.clone();
-        let cp = path.to_owned();
-        let (PathInfo::File(info), file) = spawn_blocking(move || me.read_file_impl(cp))
+        let rp = path.to_owned();
+        let (PathInfo::File(info), file) = spawn_blocking(move || me.read_file_impl(rp))
             .await
             .unwrap()?
         else {
@@ -149,6 +148,14 @@ impl FileRepository for LocalBackend {
         };
 
         Ok((info, TokioFile::from_std(file).compat()))
+    }
+
+    async fn metadata(&self, path: &RPath) -> Result<PathInfo> {
+        let this = self.clone();
+        let rp = path.to_owned();
+        let (info, _file) = spawn_blocking(move || this.read_file_impl(rp)).await.unwrap()?;
+
+        Ok(info)
     }
 
     async fn mkdir(&self, path: &RPath) -> Result<()> {
@@ -251,16 +258,13 @@ impl FileRepository for LocalBackend {
         Ok(())
     }
 
-    async fn file_tree(&self, path: &RPath, up_to_depth: usize) -> Result<FileTree<PathInfo>> {
+    async fn list_files(&self, path: &RPath, up_to_depth: usize) -> Result<Vec<PathInfo>> {
         let mut ret = Vec::new();
-        let filter_path = &self.config.get_local_path(path);
+        let local_path = &self.config.get_local_path(path);
 
-        let walker = WalkDir::new(&self.config.root_path)
+        let walker = WalkDir::new(local_path)
             .max_depth(up_to_depth)
-            .into_iter()
-            .filter_entry(|x| {
-                x.path().starts_with(filter_path) || filter_path.starts_with(x.path())
-            });
+            .into_iter();
 
         for entry in walker {
             let entry = match entry {
@@ -279,8 +283,6 @@ impl FileRepository for LocalBackend {
 
             let entry_path = self.config.get_path(entry.path())?;
 
-            // Note: This means that we just return an empty list when this is called with a directory
-            // that we are not allowed to access (is that okay?)
             if self.config.is_ignored(&entry_path) {
                 continue;
             }
@@ -305,7 +307,7 @@ impl FileRepository for LocalBackend {
             }
         }
 
-        Ok(ret.try_into().expect("these paths form a tree"))
+        Ok(ret)
     }
 }
 
@@ -384,22 +386,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_tree_returns_partial_trees() {
+    async fn list_files_checks_for_existence() {
         let (b, _, _, _drop_later) = setup_read_dir_test();
-        let tree = b
-            .file_tree("anothersubdir/d1/d2/does-not-exist".into(), usize::MAX)
+        let err = b
+            .list_files("anothersubdir/d1/d2/does-not-exist".into(), usize::MAX)
             .await
-            .unwrap();
+            .unwrap_err();
 
-        let nodes = tree.as_slice().iter().map(|x| x.path()).collect::<Vec<_>>();
-        let expected: Vec<&'static RPath> = vec![
-            "".into(),
-            "anothersubdir".into(),
-            "anothersubdir/d1".into(),
-            "anothersubdir/d1/d2".into(),
-        ];
-
-        assert_eq!(nodes, expected);
+        assert_matches!(err.downcast().unwrap(), Error::NotFound);
     }
 
     #[tokio::test]

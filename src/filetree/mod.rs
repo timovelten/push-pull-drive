@@ -100,6 +100,15 @@ impl<T: Node> FileTree<T> {
         Some(siblings.map(|i| &self.nodes[i]))
     }
 
+    pub fn all_children<'a>(&'a self, path: &'a RPath) -> Option<impl Iterator<Item = &'a T> + 'a> {
+        let idx = self.get_index(path).ok()?;
+        let ret = self.nodes[idx..]
+            .iter()
+            .take_while(|node| node.path().starts_with(path));
+
+        Some(ret)
+    }
+
     pub fn root(&self) -> Option<&RPath> {
         self.nodes.first().map(|x| x.path())
     }
