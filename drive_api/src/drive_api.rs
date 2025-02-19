@@ -868,9 +868,9 @@ mod test {
     #[tokio::test]
     async fn large() {
         let n = 256 * 1024;
-        let reader = vec![0; MIB * 500];
+        let src = vec![0; MIB * 500];
         
-        let mut reader = pin!(&reader[..]);
+        let mut reader = pin!(&src[..]);
         let mut buffer = UploadBuffer::new(n, 20 * MIB);
 
         let mut len = 0;
@@ -894,7 +894,7 @@ mod test {
             buffer.consume(buf_len);
         }
 
-        assert_eq!(len, reader.len());
+        assert_eq!(len, src.len());
     }
 
     #[tokio::test]
