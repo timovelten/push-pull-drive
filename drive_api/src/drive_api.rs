@@ -80,12 +80,15 @@ impl GoogleError {
     }
 
     pub fn is_rate_limit_exceeded(&self) -> bool {
-        if self.code() != 403 {
-            return false;
-        }
+        self.code() == 403 && self.has_reason("userRateLimitExceeded")
+    }
 
+    /// The reasons are not well documented. I am aware of the following:
+    /// - All the reasons listed here https://developers.google.com/drive/api/guides/handle-errors
+    /// - parentNotAFolder
+    pub fn has_reason(&self, reason: &str) -> bool {
         for error in self.errors() {
-            if error.reason == "userRateLimitExceeded" {
+            if error.reason == reason {
                 return true;
             }
         }
@@ -93,6 +96,8 @@ impl GoogleError {
         false
     }
 }
+
+
 
 const FILE_FIELDS: [&str; 8] = [
     "id",
@@ -281,7 +286,7 @@ impl DriveApi {
             }
 
             let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..=1000));
-            // Note: For the third fourth try, retries is 3 and we wait 16 seconds
+
             let delay = Duration::from_secs(2u64.pow(retries + 1));
             tokio::time::sleep(delay + jitter).await;
 
@@ -420,6 +425,7 @@ impl DriveApi {
         Ok(())
     }
 
+    /// Note that this will error if the specified parent is not a folder (403, with reason parentNotAFolder)
     pub async fn files_create(&self, create_request: FilesReq) -> Result<File, ApiError> {
         let url = Url::parse("https://www.googleapis.com/drive/v3/files")
             .unwrap()
