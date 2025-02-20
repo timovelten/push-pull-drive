@@ -22,7 +22,6 @@ mod client;
 pub use config::{load, init};
 
 use crate::file_repository::AsyncReader;
-use crate::file_repository::Change;
 use crate::file_repository::{FileRepository, Error, Result};
 use crate::filetree::FileTree;
 use crate::paths::RPath;

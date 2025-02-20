@@ -1,4 +1,4 @@
-use crate::paths::{RPath, RPathBuf};
+use crate::paths::RPath;
 use crate::{FileInfo, PathInfo};
 use futures::AsyncRead;
 use std::fmt::Debug;
@@ -83,93 +83,4 @@ pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
 
     /// Delete a file or a folder at `path` (including all subfolders, if necessary).
     fn delete(&self, path: &RPath) -> impl Future<Output = Result<()>> + Send;
-}
-
-#[derive(Debug, Clone, PartialEq, Hash, Eq, PartialOrd, Ord)]
-pub enum ChangeKind {
-    FileDeleted,
-    DirDeleted,
-    FileUpdated,
-    DirCreated,
-    FileCreated,
-}
-
-#[derive(Debug, Clone, PartialEq, Hash, Eq, PartialOrd, Ord)]
-pub struct Change {
-    pub kind: ChangeKind,
-    pub path: RPathBuf,
-}
-
-#[cfg(test)]
-pub mod util {
-    use super::*;
-    use crate::filetree::FileTree;
-    use futures::io::Cursor;
-    use anyhow::anyhow;
-
-    #[derive(Clone, Debug)]
-    pub struct MockRepository {
-        tree: FileTree<PathInfo>,
-    }
-
-    impl MockRepository {
-        pub fn new(tree: FileTree<PathInfo>) -> MockRepository {
-            Self { tree }
-        }
-    }
-
-    impl FileRepository for MockRepository {
-        type Reader = Cursor<Vec<u8>>;
-
-        const CONCURRENCY_LIMIT: usize = 4;
-
-        async fn list_files(
-            &self,
-            path: &crate::paths::RPath,
-            depth: usize,
-        ) -> super::Result<Vec<PathInfo>> {
-            let ret = self
-                .tree
-                .all_children(path)
-                .ok_or(Error::NotFound)?
-                .filter(|other| other.path().len() - path.len() <= depth)
-                .cloned()
-                .collect();
-
-            Ok(ret)
-        }
-
-        /// Get metadata of the file at the specified path.
-        async fn metadata(&self, path: &RPath) -> Result<PathInfo> {
-            match self.tree.get(path) {
-                Some(info) => Ok(info.clone()),
-                None => return Err(anyhow!(Error::NotFound)),
-            }
-        }
-
-        async fn read_file(
-            &self,
-            _path: &crate::paths::RPath,
-        ) -> super::Result<(crate::FileInfo, Self::Reader)> {
-            unimplemented!()
-        }
-
-        async fn write_file<R: super::AsyncReader>(
-            &self,
-            _path: &crate::paths::RPath,
-            _modified_time: Option<time::OffsetDateTime>,
-            _src: R,
-            _len: u64,
-        ) -> Result<crate::FileInfo> {
-            unimplemented!()
-        }
-
-        async fn mkdir(&self, _path: &crate::paths::RPath) -> super::Result<()> {
-            unimplemented!()
-        }
-
-        async fn delete(&self, _path: &crate::paths::RPath) -> super::Result<()> {
-            unimplemented!()
-        }
-    }
 }
