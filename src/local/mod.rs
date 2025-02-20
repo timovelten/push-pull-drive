@@ -113,6 +113,76 @@ impl LocalBackend {
         let file = File::open(local_path).map_err(map_io_error)?;
         self.read_file_impl_for_open_file(path, file)
     }
+
+    async fn write_file_impl<R: AsyncRead + Send>(
+        &self,
+        path: &RPath,
+        src: R,
+        _len: u64,
+        create: bool
+    ) -> Result<FileInfo> {
+        let mut src = pin!(src.compat());
+        if self.config.is_ignored(path) {
+            bail!(Error::NotAllowed);
+        }
+
+        // We are optimistic: Start writing the file to a temporary location
+        // and maybe fail later when we cannot move it for whatever reason...
+        let config = self.config.clone();
+        let (mut tmp_file, tmp_file_path) = spawn_blocking(move || {
+            // Use the temp file crate to at least more or less make sure that we do not leave the file behind.
+            let (f, guard) = tempfile::NamedTempFile::new_in(&config.root_path)
+                .expect("failed to create temp file")
+                .into_parts();
+            (tokio::fs::File::from_std(f), guard)
+        })
+        .await
+        .unwrap();
+
+        log::debug!("Writing to temp path {:?}", tmp_file_path);
+
+        tokio::io::copy(&mut src, &mut tmp_file).await?;
+
+        // Drop the source as early as possible. It is conceivable that our call tracks how long
+        // the source reader is around (via the drop trait) and maybe terminate a connection or something.
+        // (Though Clippy complains because, currently, all types we use this with have trivial drop implementation)
+        #[allow(clippy::drop_non_drop)]
+        drop(src);
+
+        tmp_file.sync_all().await.unwrap();
+
+        // We need to set the modified time, and return the files metadata. To do so, go back to std-land.
+        let file = tmp_file.into_std().await;
+        let me = self.clone();
+        let cp = path.to_owned();
+        let (PathInfo::File(info), _) = spawn_blocking(move || {
+            me.read_file_impl_for_open_file(cp, file)
+        })
+        .await
+        .unwrap()?
+        else {
+            unreachable!()
+        };
+
+        // Make sure the directories exist..
+        let local_path = self.config.get_local_path(path);
+
+        // Make sure the file exists..
+        let _ = tokio::fs::OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create_new(create)
+            .open(&local_path)
+            .map_err(map_io_error)
+            .await?;
+
+        // Actually rename. This should succeed now that we have created the file.
+        spawn_blocking(|| tmp_file_path.persist(local_path))
+            .await
+            .unwrap()?;
+
+        Ok(info)
+    }
 }
 
 fn map_io_error(err: std::io::Error) -> anyhow::Error {
@@ -167,78 +237,22 @@ impl FileRepository for LocalBackend {
         Ok(())
     }
 
-    async fn write_file<R: AsyncRead + Send>(
-        &self,
-        path: &RPath,
-        modified_time: Option<time::OffsetDateTime>,
-        src: R,
-        _len: u64,
-    ) -> Result<FileInfo> {
-        let mut src = pin!(src.compat());
-        if self.config.is_ignored(path) {
-            bail!(Error::NotAllowed);
-        }
+    async fn create_file<R: crate::file_repository::AsyncReader>(
+            &self,
+            path: &RPath,
+            src: R,
+            len: u64,
+        ) -> Result<FileInfo> {
+        self.write_file_impl(path, src, len, true).await
+    }
 
-        // We are optimistic: Start writing the file to a temporary location
-        // and maybe fail later when we cannot move it for whatever reason...
-        let config = self.config.clone();
-        let (mut tmp_file, tmp_file_path) = spawn_blocking(move || {
-            // Use the temp file crate to at least more or less make sure that we do not leave the file behind.
-            let (f, guard) = tempfile::NamedTempFile::new_in(&config.root_path)
-                .expect("failed to create temp file")
-                .into_parts();
-            (tokio::fs::File::from_std(f), guard)
-        })
-        .await
-        .unwrap();
-
-        log::debug!("Writing to temp path {:?}", tmp_file_path);
-
-        tokio::io::copy(&mut src, &mut tmp_file).await?;
-
-        // Drop the source as early as possible. It is conceivable that our call tracks how long
-        // the source reader is around (via the drop trait) and maybe terminate a connection or something.
-        // (Though Clippy complains because, currently, all types we use this with have trivial drop implementation)
-        #[allow(clippy::drop_non_drop)]
-        drop(src);
-
-        tmp_file.sync_all().await.unwrap();
-
-        // We need to set the modified time, and return the files metadata. To do so, go back to std-land.
-        let file = tmp_file.into_std().await;
-        let me = self.clone();
-        let cp = path.to_owned();
-        let (PathInfo::File(info), _) = spawn_blocking(move || {
-            if let Some(modified_time) = modified_time {
-                file.set_modified(modified_time.into())?;
-            }
-            me.read_file_impl_for_open_file(cp, file)
-        })
-        .await
-        .unwrap()?
-        else {
-            unreachable!()
-        };
-
-        // Make sure the directories exist..
-        let local_path = self.config.get_local_path(path);
-
-        // Make sure the file exists..
-        let _ = tokio::fs::OpenOptions::new()
-            .write(true)
-            .read(true)
-            .create(true)
-            .truncate(false)
-            .open(&local_path)
-            .map_err(map_io_error)
-            .await?;
-
-        // Actually rename. This should succeed now that we have created the file.
-        spawn_blocking(|| tmp_file_path.persist(local_path))
-            .await
-            .unwrap()?;
-
-        Ok(info)
+    async fn update_file<R: crate::file_repository::AsyncReader>(
+            &self,
+            path: &RPath,
+            src: R,
+            len: u64,
+        ) -> Result<FileInfo> {
+        self.write_file_impl(path, src, len, false).await
     }
 
     async fn delete(&self, path: &RPath) -> Result<()> {
@@ -308,6 +322,26 @@ impl FileRepository for LocalBackend {
         }
 
         Ok(ret)
+    }
+
+    async fn set_modified_time(
+            &self,
+            path: &RPath,
+            time: time::OffsetDateTime,
+        ) -> Result<()> {
+        let local_path = self.config.get_local_path(path);
+
+        spawn_blocking(move || {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .read(true)
+                .open(&local_path)
+                .map_err(map_io_error)?;
+
+            f.set_modified(time.into())?;
+
+            Ok::<_, anyhow::Error>(())
+        }).await.unwrap()
     }
 }
 
@@ -509,7 +543,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_file() {
+    async fn create_file() {
         let tmp = tempfile::tempdir().unwrap();
         let b: LocalBackend = LocalBackend::from_config(Config {
             ignore_prefixes: vec![RPathBuf::from_components(["dir", "we", "ignore"])],
@@ -519,9 +553,8 @@ mod tests {
 
         // Test if we can write to ignored locations
         let x = b
-            .write_file(
+            .create_file(
                 &RPathBuf::from(["dir", "we", "ignore", "subdir", "test"]),
-                None,
                 futures::io::empty(),
                 0,
             )
@@ -532,11 +565,9 @@ mod tests {
         // Now write an actual file
         let fpath = tmp.path().join("a-directory/somefile");
 
-        let modtime_should_be = OffsetDateTime::now_utc();
         b.mkdir(&RPathBuf::from(["a-directory"])).await.unwrap();
-        b.write_file(
+        b.create_file(
             &RPathBuf::from(["a-directory", "somefile"]),
-            Some(modtime_should_be),
             Cursor::new(&test_bytes),
             test_bytes.len() as u64,
         )
@@ -550,9 +581,6 @@ mod tests {
 
         assert_eq!(file_bytes.len(), test_bytes.len());
         assert_eq!(file_bytes, test_bytes);
-
-        let modtime = OffsetDateTime::from(f.metadata().unwrap().modified().unwrap());
-        assert_eq!(modtime, modtime_should_be);
     }
 
     #[tokio::test]
@@ -565,9 +593,8 @@ mod tests {
         });
 
         let res = b
-            .write_file(
+            .update_file(
                 &RPathBuf::from(["dir", "subdir", "test"]),
-                None,
                 futures::io::empty(),
                 0,
             )
@@ -650,9 +677,8 @@ mod tests {
         });
 
         let result = b
-            .write_file(
+            .update_file(
                 &RPathBuf::from(["testdir", "nested"]),
-                None,
                 futures::io::empty(),
                 0,
             )

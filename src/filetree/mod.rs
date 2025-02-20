@@ -646,13 +646,29 @@ mod test {
             unimplemented!()
         }
 
-        async fn write_file<R: AsyncReader>(
-            &self,
-            _path: &crate::paths::RPath,
-            _modified_time: Option<time::OffsetDateTime>,
-            _src: R,
-            _len: u64,
-        ) -> anyhow::Result<crate::FileInfo> {
+        async fn create_file<R: AsyncReader>(
+                &self,
+                _path: &RPath,
+                _src: R,
+                _len: u64,
+            ) -> crate::file_repository::Result<FileInfo> {
+            unimplemented!()
+        }
+
+        async fn update_file<R: AsyncReader>(
+                &self,
+                _path: &RPath,
+                _src: R,
+                _len: u64,
+            ) -> crate::file_repository::Result<FileInfo> {
+            unimplemented!()
+        }
+
+        async fn set_modified_time(
+                &self,
+                _path: &RPath,
+                _time: time::OffsetDateTime,
+            ) -> crate::file_repository::Result<()> {
             unimplemented!()
         }
 

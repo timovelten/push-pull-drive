@@ -65,18 +65,26 @@ pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
         path: &RPath,
     ) -> impl Future<Output = Result<(FileInfo, Self::Reader)>> + Send;
 
-    /// Read the given `src` reader to completion and write its contents to the given path name. If the file
-    /// does not exist, it is created. This function does not create and directories.
-    ///
-    /// If at all possible this operation should be atomic: If the operation fails half way through, the original
-    /// contents should still be intact.
-    fn write_file<R: AsyncReader>(
+    /// Read the given `src` reader to completion and write its contents to the given path name.
+    fn update_file<R: AsyncReader>(
         &self,
         path: &RPath,
-        modified_time: Option<time::OffsetDateTime>,
         src: R,
         len: u64,
     ) -> impl Future<Output = Result<FileInfo>> + Send;
+
+    fn create_file<R: AsyncReader>(
+        &self,
+        path: &RPath,
+        src: R,
+        len: u64,
+    ) -> impl Future<Output = Result<FileInfo>> + Send;
+
+    fn set_modified_time(
+        &self,
+        path: &RPath,
+        time: time::OffsetDateTime,
+    ) -> impl Future<Output = Result<()>> + Send;
 
     /// This function may or may not return an error if the directory already exists.
     fn mkdir(&self, path: &RPath) -> impl Future<Output = Result<()>> + Send;

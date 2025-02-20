@@ -49,13 +49,25 @@ impl FileRepository for GDriveRepo {
 
             async fn delete(&self, path: &RPath) -> Result<()>;
 
-            async fn write_file<R: AsyncReader>(
+            async fn update_file<R: AsyncReader>(
                 &self,
                 path: &RPath,
-                modified_time: Option<time::OffsetDateTime>,
                 src: R,
                 len: u64,
             ) -> Result<FileInfo>;
+
+            async fn create_file<R: AsyncReader>(
+                &self,
+                path: &RPath,
+                src: R,
+                len: u64
+            ) -> Result<FileInfo>;
+
+            async fn set_modified_time(
+                &self,
+                path: &RPath,
+                time: time::OffsetDateTime,
+            ) -> Result<()>;
 
             async fn mkdir(&self, path: &RPath) -> Result<()>;
 
@@ -67,4 +79,6 @@ impl FileRepository for GDriveRepo {
         let (info, reader) = self.inner.read_file(path).await?;
         Ok((info, Box::into_pin(reader)))
     }
+
+
 }

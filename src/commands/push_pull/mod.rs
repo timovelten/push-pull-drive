@@ -7,7 +7,7 @@ use crate::{
 };
 use anyhow::Error;
 use progress::{ProgressId, ProgressSender};
-use std::{collections::VecDeque, io::Write as _, sync::Arc, time::Duration, usize};
+use std::{collections::VecDeque, fmt::Display, io::Write as _, sync::Arc, time::Duration, usize};
 use tokio::{sync::Semaphore, task::JoinSet};
 
 mod progress;
@@ -53,6 +53,30 @@ pub fn pull(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+enum Transfer {
+    Update(RPathBuf),
+    Create(RPathBuf),
+}
+
+impl Transfer {
+    pub fn path(&self) -> &RPath {
+        let (Self::Update(path) | Self::Create(path)) = self;
+        path
+    }
+}
+
+impl Display for Transfer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Update(path) => write!(f, "{}", path)?,
+            Self::Create(path) => write!(f, "Create: {}", path)?,
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct PushPull<A, B> {
     env: ExecutionEnvironment,
@@ -78,13 +102,13 @@ where
     async fn transfer_files(
         self: Arc<Self>,
         sender: ProgressSender,
-        files: Vec<(RPathBuf, ProgressId)>,
-    ) -> Vec<(RPathBuf, Error)> {
+        files: Vec<(Transfer, ProgressId)>,
+    ) -> Vec<(Transfer, Error)> {
         let sem = Arc::new(Semaphore::new(self.concurrency_limit()));
 
         let mut fts = JoinSet::new();
 
-        for (file, id) in files {
+        for (transfer, id) in files {
             let sender = sender.clone();
             let this = self.clone();
             let sem = sem.clone();
@@ -95,9 +119,9 @@ where
                 sender.notify_start(id);
 
                 let progress_callback = |bytes: usize| sender.notify_bytes_read(id, bytes as u64);
-                if let Err(err) = this.transfer_file(&file, progress_callback).await {
+                if let Err(err) = this.transfer_file(&transfer, progress_callback).await {
                     sender.notify_failed(id);
-                    Err((file, err))
+                    Err((transfer, err))
                 } else {
                     sender.notify_done(id);
                     Ok(())
@@ -154,19 +178,31 @@ where
         Ok(())
     }
 
-    async fn transfer_file<F>(&self, path: &RPath, progress: F) -> anyhow::Result<FileInfo>
+    async fn transfer_file<F>(&self, transfer: &Transfer, progress: F) -> anyhow::Result<FileInfo>
     where
         F: Fn(usize) + Sync,
     {
-        let (info, reader) = self.from.read_file(path).await?;
+        let (info, reader) = self.from.read_file(transfer.path()).await?;
         let reader = InspectAsyncReader::new(reader, |buf| progress(buf.len()));
 
-        let info = self
-            .to
-            .write_file(path, Some(info.modified), reader, info.size)
-            .await?;
+        let ret = match transfer {
+            Transfer::Update(path) => {
+                let info = self.to.update_file(path, reader, info.size).await?;
 
-        Ok(info)
+                self.to.set_modified_time(path, info.modified).await?;
+
+                info
+            }
+            Transfer::Create(path) => {
+                let info = self.to.create_file(path, reader, info.size).await?;
+
+                self.to.set_modified_time(path, info.modified).await?;
+
+                info
+            }
+        };
+
+        Ok(ret)
     }
 
     /// Look and from and to, and determine which files need to be transferred.
@@ -178,7 +214,7 @@ where
     ///
     /// That is, to the best of our knowledge, the files we return can actually be transferred without
     /// any further conflicts.
-    async fn prepare_transfer(&self) -> anyhow::Result<Vec<RPathBuf>> {
+    async fn prepare_transfer(&self) -> anyhow::Result<Vec<Transfer>> {
         writeln!(self.env.err(), "Reading 'from' files...").unwrap();
         let from_files = file_tree_of_repository(&self.from, &self.path).await?;
 
@@ -245,13 +281,13 @@ where
                 }
                 !unchanged
             })
-            .collect::<Vec<_>>();
+            .map(|path| Transfer::Update(path.to_owned()));
 
-        let ret: Vec<_> = to_be_updated
+        let to_be_created = to_be_created
             .into_iter()
-            .chain(to_be_created.into_iter())
-            .map(|f| f.to_owned())
-            .collect();
+            .map(|path| Transfer::Create(path.to_owned()));
+
+        let ret = to_be_created.chain(to_be_updated).collect();
 
         Ok(ret)
     }
