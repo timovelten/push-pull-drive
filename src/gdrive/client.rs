@@ -7,273 +7,42 @@ use futures::{stream::FuturesUnordered, AsyncRead, StreamExt as _, TryFutureExt}
 use tokio::task::JoinSet;
 
 use crate::{
-    file_repository::{self, Error, Result}, filetree::FileTree, paths::{RPath, RPathBuf}, FileInfo, PathInfo
+    file_repository::{self, Error},
+    filetree::FileTree,
+    paths::{RPath, RPathBuf},
+    FileInfo, PathInfo,
 };
 use cached::Cached;
 use std::fmt::Write;
 
-fn to_pathinfo(file: drive_api::File, path: RPathBuf) -> (Option<PathInfo>, String) {
-    let info = match file.more {
-        Some(MoreFileFields::BinaryFile {
-            sha1_checksum,
-            size,
-            ..
-        }) => PathInfo::File(FileInfo {
-            path,
-            size,
-            modified: file.modified_time
-        }),
-        _ if file.is_folder() => PathInfo::Dir(path),
-        _ => return (None, file.id),
-    };
-
-    (Some(info), file.id)
-}
-
-/// This is a somewhat opinated function that turns a google drive file into a FileInfo. Notably, it returns `Error::IsADirectory`
-/// if the file is a directory, and `Error::NotAllowed`, if it is neither a binary file nor a directory (i.e. google docs document or something
-/// like that)
-fn to_fileinfo(file: drive_api::File, path: RPathBuf) -> Result<FileInfo> {
-    let err = match to_pathinfo(file, path.clone()).0 {
-        Some(PathInfo::File(info)) => return Ok(info),
-        Some(PathInfo::Dir(_)) => anyhow!(Error::IsADirectory),
-        None => anyhow!(Error::NotAllowed),
-    };
-
-    Err(err.context(path))
-}
+use super::service::{DriveService, DriveServiceImpl};
 
 #[derive(Debug)]
 /// Conceptually this is a singleton. There should be just one instance of this, wrapped in an Arc.
-pub(super) struct GDriveClient {
-    /// Calling mkdir_all concurrently really does not work, so we need to prevent it.
-    mkdir_lock: tokio::sync::Mutex<()>,
-    api_client: DriveApi,
-
-    /// Google drive does not use paths. Instead, it identifies files using ids.
-    /// For example, there is no specific API to list all of the files in a directory (by path).
-    /// If we know the id of a certain path, we therefore cache it here.
-    /// For this, we assume that this object is generally short lived and pretend
-    /// like concurrent modification is not an issue (someone could move the folder,
-    /// for example. Then the cached ID would point to another path now.).
-    file_cache: Mutex<TimedCache<RPathBuf, Arc<drive_api::File>>>,
+pub(super) struct GDriveClient<S: DriveService = DriveServiceImpl> {
+    service: S,
 }
 
-impl GDriveClient {
-    /// Google does not really like too many concurrent connections. In my personal testing, the limit seemed to be somewhere below 10.
-    pub const CONCURRENCY_LIMIT: usize = 8;
+/// Google does not really like too many concurrent connections. In my personal testing, the limit seemed to be somewhere below 10.
+pub const CONCURRENCY_LIMIT: usize = 8;
 
+impl<Service: DriveService> GDriveClient<Service> {
     pub fn new(credential: GoogleCredential) -> Self {
-        let api_client = DriveApi::new(Default::default(), credential);
-
-        Self {
-            mkdir_lock: tokio::sync::Mutex::new(()),
-            api_client,
-            file_cache: Mutex::new(TimedCache::with_lifespan(15)),
-        }
+        todo!()
     }
 
-    fn cache_file(&self, path: &RPath, file: drive_api::File) -> Arc<drive_api::File> {
-        log::trace!("Caching drive file: {} => {path}", file.id);
-        let val = Arc::new(file);
-        let ret = val.clone();
-        self.file_cache
-            .lock()
-            .unwrap()
-            .cache_set(path.to_owned(), val);
-
-        ret
+    async fn resolve(&self, path: &RPath) -> anyhow::Result<String> {
+        todo!()
     }
 
-    fn get_cached_file(&self, path: &RPath) -> Option<Arc<drive_api::File>> {
-        self.file_cache.lock().unwrap().cache_get(path).cloned()
+    pub async fn mkdir(&self, path: &RPath) -> anyhow::Result<()> {
+        todo!()
     }
 
-    fn delete_from_cache(&self, path: &RPath) {
-        self.file_cache.lock().unwrap().cache_remove(path);
-    }
+    pub async fn metadata(&self, path: &RPath) -> anyhow::Result<PathInfo> {
+        let file_id = self.resolve(path).await?;
+        let file = self.service.get_file(&file_id).await?;
 
-    pub async fn drive_file_by_rpath_cached(&self, path: &RPath) -> Result<Arc<drive_api::File>> {
-        if let Some(ret) = self.get_cached_file(path) {
-            Ok(ret)
-        } else {
-            let ret = self.drive_file_by_rpath(path).await?;
-            Ok(Arc::new(ret))
-        }
-    }
-
-    async fn root_file(&self) -> Result<drive_api::File> {
-        let root_file = self
-            .api_client
-            .files_get("root")
-            .await?;
-
-        Ok(root_file)
-    }
-
-    /// Try and find a drive_file by rpath. The return value of this function is always computed "from scratch",
-    /// i.e. we do not use the cache to compute anything here. However, running this function will update the cache
-    /// with all the files and folders it discovers along the way.
-    ///
-    /// # Errors
-    /// - If a subpath of of rpath could not be found, this will return `Error::NotFound { rpath: subpath }`
-    /// - If a subpath of rpath is not a directory, this will return `Error::NotADirectory { rpath: subpath }`
-    pub async fn drive_file_by_rpath(&self, path: &RPath) -> Result<drive_api::File> {
-        // In Google Drive, the root folder has an actual id (e.g. '0AGqh_9UFaLFoUk9PVA') and the "virtual" id
-        // 'root' by which it can be accessed almost anywhere. Unfortunately, we need the actual id,
-        // since the 'parents' field of a file contains the actual id (and not 'root'). We use this
-        // behavior in the read_dir function, that concurrently fetches multiple directory contents
-        // in a single request.
-        // See also: https://developers.google.com/drive/api/guides/folder
-        let root_file = self.root_file().await?;
-
-        debug_assert_eq!(root_file.parents, None);
-        self.cache_file(RPath::empty(), root_file.clone());
-
-        if path.is_empty() {
-            return Ok(root_file);
-        }
-
-        let mut current_path = RPathBuf::empty();
-        let mut current_file = root_file;
-
-        for subrpath in path.subpaths().skip(1) {
-            let next_file_name = subrpath.filename().unwrap();
-
-            // At this point, "{current_rpath}/next_file_name" is the file were looking for.
-            if !current_file.is_folder() {
-                return Err(anyhow!(Error::NotADirectory).context(current_path));
-            }
-
-            let files = self.read_dirs([current_file.id]).await?;
-            let mut next_file = None;
-
-            for file in files {
-                // Note that we know at this point that the rpath of file is current_rpath/{file.name}
-                let file_rpath = current_path.join_single(&file.name);
-                self.cache_file(&file_rpath, file.clone());
-
-                if file.name == next_file_name {
-                    if next_file.is_some() {
-                        log::warn!(
-                            "There are multiple items with name {} in {}",
-                            file.name,
-                            current_path
-                        );
-                    } else {
-                        next_file = Some(file);
-                    }
-                }
-            }
-
-            let mut next_rpath = current_path;
-            next_rpath.push(next_file_name);
-
-            if let Some(next_file) = next_file {
-                current_path = next_rpath;
-                current_file = next_file;
-            } else {
-                return Err(anyhow!(Error::NotFound).context(next_rpath));
-            }
-        }
-
-        Ok(current_file)
-    }
-
-    /// Creates the given relative name and returns its id. If this path
-    /// already exists and is the path of a file (and not a folder) this returns
-    /// `Error::NotAFolder`.
-    ///
-    /// It is important that mkdir_all is NOT called concurrently with itself. For this reason,
-    /// the caller should aquire all permits (`self.api_exclusive()`) to call this function.
-    pub async fn mkdir(&self, path: &RPath) -> Result<()> {
-        let Some((parent, name)) = path.split_right() else {
-            bail!(Error::Exists)
-        };
-
-        log::debug!("mkdir {:?}", path);
-
-        let parent = self.drive_file_by_rpath_cached(parent).await?;
-        let req = FilesReq::new_create_folder(name.to_owned(), parent.id.to_owned());
-
-        let created_file = self.api_client
-            .files_create(req)
-            .await?;
-
-        self.cache_file(path, created_file.clone());
-
-        Ok(())
-    }
-
-    /// This is a helper method. It takes a list of targets, which are google drive ids of folders (or not,
-    /// this will not error if they are not). It then returns a list of google drive files. Note that these have a parent id
-    /// which can subsequently be used to determine to which of the targets the file belongs.
-    /// Also note that "file" in this context can also be a folder.
-    pub async fn read_dirs<S: AsRef<str>>(
-        &self,
-        targets: impl IntoIterator<Item = S>,
-    ) -> Result<Vec<drive_api::File>> {
-        let mut ret = Vec::new();
-
-        // Build the google drive query string that looks for children of those ids.
-        let query = {
-            // Query string is of the form
-            // trashed = false and ('abc' in parents or 'cdf' in parents)
-            let mut q = String::from("trashed = false and (");
-            for (i, id) in targets.into_iter().enumerate() {
-                if i > 0 {
-                    write!(q, " or ").unwrap();
-                }
-                write!(q, "'{}' in parents", id.as_ref()).unwrap();
-            }
-            // Don't forget the closing brace
-            write!(q, ")").unwrap();
-
-            q
-        };
-
-        log::debug!("Requesting files with query {query}");
-
-        let files = self
-            .api_client
-            .file_list_all(&query)
-            .await?;
-
-        return Ok(files);
-
-        Ok(ret)
-    }
-
-    pub async fn metadata(&self, path: &RPath) -> Result<PathInfo> {
-        let drive_id = &self.drive_file_by_rpath_cached(path).await?.id;
-        let info = match self.api_client.files_get(drive_id).await {
-            Ok(file) => match file.more {
-                Some(MoreFileFields::BinaryFile {
-                    sha1_checksum,
-                    size,
-                    ..
-                }) => PathInfo::File(FileInfo {
-                    size,
-                    path: path.to_owned(),
-                    modified: file.modified_time
-                }),
-                None if file.is_folder() => PathInfo::Dir(path.to_owned()),
-                _ => {
-                    bail!(Error::NotAllowed);
-                }
-            },
-            Err(err) => bail!(err),
-        };
-
-        Ok(info)
-    }
-
-    pub async fn read_file(&self, path: &RPath) -> Result<(FileInfo, Box<dyn AsyncRead + Send>)> {
-        let cpath = path.to_owned();
-        log::info!("Reading file at {cpath}");
-        let cache_size = self.file_cache.lock().unwrap().cache_size();
-        log::info!("Cache size: {}", cache_size);
-        let file = self.drive_file_by_rpath(&cpath).await?;
         match file.more {
             Some(MoreFileFields::BinaryFile {
                 head_revision_id,
@@ -281,14 +50,40 @@ impl GDriveClient {
                 size,
             }) => {
                 let info = FileInfo {
-                    path: cpath,
+                    path: path.to_owned(),
                     size,
-                    modified: file.modified_time
+                    modified: file.modified_time,
+                };
+
+                Ok(PathInfo::File(info))
+            }
+            None if file.is_folder() => Ok(PathInfo::Dir(path.to_owned())),
+            _ => Err(anyhow!(Error::NotAllowed)),
+        }
+    }
+
+    pub async fn read_file(
+        &self,
+        path: &RPath,
+    ) -> anyhow::Result<(FileInfo, Box<dyn AsyncRead + Send>)> {
+        let file_id = self.resolve(path).await?;
+        let file = self.service.get_file(&file_id).await?;
+
+        match file.more {
+            Some(MoreFileFields::BinaryFile {
+                head_revision_id,
+                sha1_checksum,
+                size,
+            }) => {
+                let info = FileInfo {
+                    path: path.to_owned(),
+                    size,
+                    modified: file.modified_time,
                 };
 
                 let body = self
-                    .api_client
-                    .files_get_alt_media(&file.id, Some(&head_revision_id))
+                    .service
+                    .get_body(&file.id, Some(&head_revision_id))
                     .await?;
 
                 Ok((info, body))
@@ -303,30 +98,8 @@ impl GDriveClient {
         path: &RPath,
         src: R,
         len: u64,
-    ) -> Result<drive_api::File> {
-        // We need to create the file. For that, we need to place it in the right path
-        let (parent, filename) = path.split_right().ok_or(Error::IsADirectory)?;
-
-        let parent = self.drive_file_by_rpath_cached(parent).await?;
-        if !parent.is_folder() {
-            bail!(Error::NotADirectory);
-        }
-        
-        let file = self
-            .api_client
-            .files_create_upload(
-                FilesReq {
-                    name: Some(filename.to_string()),
-                    parents: Some(vec![parent.id.clone()]),
-                    ..Default::default()
-                },
-                src
-            )
-            .await?;
-
-        self.cache_file(path, file.clone());
-
-        Ok(file)
+    ) -> anyhow::Result<drive_api::File> {
+        todo!()
     }
 
     pub async fn write_file<R: crate::file_repository::AsyncReader>(
@@ -335,64 +108,19 @@ impl GDriveClient {
         modified_time: Option<time::OffsetDateTime>,
         src: R,
         len: u64,
-    ) -> Result<FileInfo> {
-        let path = path.to_owned();
-        let res = self.drive_file_by_rpath(&path).await.map_err(|err| err.downcast::<file_repository::Error>());
-
-        let file = match res {
-            Ok(file) => {
-                log::debug!("Updating file at {}", path);
-
-                self.api_client
-                    .files_update_upload(&file.id, src)
-                    .await?
-            }
-            Err(Ok(err)) => {
-                // We were able to determine that this is a not found, so create the file
-                log::debug!("Creating file at {}", path);
-
-                self.create_file(&path, src, len).await?
-            }
-            Err(Err(err)) => return Err(err)
-        };
-
-        to_fileinfo(file, path)
+    ) -> anyhow::Result<FileInfo> {
+        todo!()
     }
 
-    pub async fn delete(&self, path: &RPath) -> Result<()> {
-        let id = &self.drive_file_by_rpath_cached(path).await?.id;
-
-        // Delete from cache early (what if the deletion happens, but still returns an error for whatever reason. Deleting from
-        // cache does not break anything in any case...)
-        self.delete_from_cache(path);
-        self.api_client
-            .files_delete(id)
-            .await?;
-
-        Ok(())
+    pub async fn delete(&self, path: &RPath) -> anyhow::Result<()> {
+        todo!()
     }
 
-    pub async fn set_modified_time(
-        &self,
-        path: &RPath,
-        modtime: time::OffsetDateTime,
-    ) -> Result<()> {
-        let id = &self.drive_file_by_rpath_cached(path).await?.id;
-
-        self.api_client
-            .files_update(
-                id,
-                FilesReq {
-                    modified_time: Some(modtime),
-                    ..Default::default()
-                },
-            )
-            .await;
-
-        Ok(())
-    }
-
-    pub async fn list_files(self: &Arc<Self>, filter: &RPath, max_depth: usize) -> Result<Vec<PathInfo>> {
+    pub async fn list_files(
+        self: &Arc<Self>,
+        filter: &RPath,
+        max_depth: usize,
+    ) -> anyhow::Result<Vec<PathInfo>> {
         todo!()
     }
 }

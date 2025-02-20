@@ -33,6 +33,8 @@ pub struct FileTree<T> {
 
     /// How many nodes do we need to skip to get to the next sibling of this node?
     /// 0 indicates that this node has no siblings.
+    /// 
+    /// This is useful when we want to iterate over the children of a node.
     sibling_offset: Vec<usize>,
 }
 

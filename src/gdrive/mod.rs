@@ -18,6 +18,7 @@ use tokio::{sync::Semaphore, task::block_in_place};
 
 pub mod config;
 mod client;
+mod service;
 
 pub use config::{load, init};
 
@@ -36,7 +37,7 @@ pub struct GDriveRepo {
 impl FileRepository for GDriveRepo {
     type Reader = Pin<Box<dyn AsyncRead + Send>>;
 
-    const CONCURRENCY_LIMIT: usize = GDriveClient::CONCURRENCY_LIMIT;
+    const CONCURRENCY_LIMIT: usize = client::CONCURRENCY_LIMIT;
 
     delegate! {
         to self.inner {
@@ -48,8 +49,6 @@ impl FileRepository for GDriveRepo {
 
             async fn delete(&self, path: &RPath) -> Result<()>;
 
-            async fn metadata(&self, path: &RPath) -> Result<PathInfo>;
-
             async fn write_file<R: AsyncReader>(
                 &self,
                 path: &RPath,
@@ -59,6 +58,8 @@ impl FileRepository for GDriveRepo {
             ) -> Result<FileInfo>;
 
             async fn mkdir(&self, path: &RPath) -> Result<()>;
+
+            async fn metadata(&self, path: &RPath) -> Result<PathInfo>;
         }
     }
 
