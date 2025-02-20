@@ -139,8 +139,6 @@ impl LocalBackend {
         .await
         .unwrap();
 
-        log::debug!("Writing to temp path {:?}", tmp_file_path);
-
         tokio::io::copy(&mut src, &mut tmp_file).await?;
 
         // Drop the source as early as possible. It is conceivable that our call tracks how long
@@ -191,7 +189,7 @@ fn map_io_error(err: std::io::Error) -> anyhow::Error {
         ErrorKind::NotADirectory => Error::NotADirectory.into(),
         ErrorKind::IsADirectory => Error::IsADirectory.into(),
         ErrorKind::AlreadyExists => Error::Exists.into(),
-        _ => anyhow!(err)
+        _ => anyhow!(err),
     }
 }
 
@@ -340,7 +338,8 @@ mod tests {
     use super::*;
     use assert_matches::assert_matches;
     use futures::io::Cursor;
-    use std::{any::Any, fs::OpenOptions, io::Write, path::Path, usize};
+    use time::OffsetDateTime;
+    use std::{any::Any, fs::OpenOptions, io::Write, path::Path, time::Duration, usize};
     use tempfile::TempDir;
 
     fn setup(ignore_prefixes: Vec<RPathBuf>) -> (LocalBackend, TempDir) {
@@ -491,8 +490,7 @@ mod tests {
     #[tokio::test]
     async fn create_file_fails_when_file_exists() {
         let (b, _tmp) = setup(vec![]);
-        b
-            .create_file("file".into(), futures::io::empty(), 0)
+        b.create_file("file".into(), futures::io::empty(), 0)
             .await
             .unwrap();
 
@@ -510,13 +508,9 @@ mod tests {
         let test_bytes = (0..1_000_000u64).map(|x| x as u8).collect::<Vec<_>>();
         let path = "somefile".into();
 
-        b.create_file(
-            path,
-            Cursor::new(&test_bytes),
-            test_bytes.len() as u64,
-        )
-        .await
-        .unwrap();
+        b.create_file(path, Cursor::new(&test_bytes), test_bytes.len() as u64)
+            .await
+            .unwrap();
 
         let (info, mut body) = b.read_file(path).await.unwrap();
 
@@ -548,13 +542,12 @@ mod tests {
     async fn metadata_ignores_ignored() {
         let (b, tmp) = setup(vec!["dir/subdir".into()]);
 
-        tokio::fs::create_dir_all(tmp.path().join("dir/subdir")).await.unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("dir/subdir"))
+            .await
+            .unwrap();
 
         let res = b.metadata("dir/subdir".into()).await.unwrap_err();
-        assert!(matches!(
-            res.downcast().unwrap(),
-            Error::NotAllowed
-        ));
+        assert!(matches!(res.downcast().unwrap(), Error::NotAllowed));
     }
 
     #[tokio::test]
@@ -574,11 +567,7 @@ mod tests {
         b.mkdir("testdir".into()).await.unwrap();
 
         let res = b
-            .update_file(
-                "testdir".into(),
-                futures::io::empty(),
-                0,
-            )
+            .update_file("testdir".into(), futures::io::empty(), 0)
             .await
             .unwrap_err();
 
@@ -590,12 +579,7 @@ mod tests {
         let (b, _tmp) = setup(vec![]);
         b.mkdir("testdir".into()).await.unwrap();
 
-        let res = b
-            .read_file(
-                "testdir".into()
-            )
-            .await
-            .unwrap_err();
+        let res = b.read_file("testdir".into()).await.unwrap_err();
 
         assert_matches!(res.downcast().unwrap(), Error::IsADirectory);
     }
@@ -607,10 +591,27 @@ mod tests {
 
         let path = "testdir".into();
         b.mkdir(path).await.unwrap();
-        b.delete(path)
+        b.delete(path).await.unwrap();
+
+        assert_matches!(b.maybe_metadata(path).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn write_and_set_modified_time() {
+        let (b, _tmp) = setup(vec![]);
+
+        let now = OffsetDateTime::now_utc();
+        
+        b.create_file("somefile".into(), Cursor::new([1, 2, 3]), 3)
             .await
             .unwrap();
 
-        assert_matches!(b.maybe_metadata(path).await.unwrap(), None);
+        b.set_modified_time("somefile".into(), now - Duration::from_secs(300)).await.unwrap();
+        
+        let PathInfo::File(info) = b.metadata("somefile".into()).await.unwrap() else {
+            panic!()
+        };
+        
+        assert!(info.modified + Duration::from_secs(295) < now);
     }
 }

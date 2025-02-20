@@ -56,6 +56,7 @@ enum Commands {
     Status(StatusArgs),
     RemoteStatus(StatusArgs),
     Pull(PushPullArgs),
+    Push(PushPullArgs)
 }
 
 trait CommandHandler {
@@ -135,6 +136,7 @@ impl<C: Context> CommandHandler for C {
             Commands::Status(args) => status::local_status(self.get(), args),
             Commands::RemoteStatus(args) => status::remote_status(self.get(), args),
             Commands::Pull(args) => push_pull::pull(self.get(), args),
+            Commands::Push(args) => push_pull::push(self.get(), args)
         }
     }
 }

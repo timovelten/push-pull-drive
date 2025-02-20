@@ -187,18 +187,14 @@ where
 
         let ret = match transfer {
             Transfer::Update(path) => {
-                let info = self.to.update_file(path, reader, info.size).await?;
-
+                let new_info = self.to.update_file(path, reader, info.size).await?;
                 self.to.set_modified_time(path, info.modified).await?;
-
-                info
+                new_info
             }
             Transfer::Create(path) => {
-                let info = self.to.create_file(path, reader, info.size).await?;
-
+                let new_info = self.to.create_file(path, reader, info.size).await?;
                 self.to.set_modified_time(path, info.modified).await?;
-
-                info
+                new_info
             }
         };
 
@@ -278,7 +274,10 @@ where
 
                 if unchanged {
                     log::debug!("{:?} is unchanged", path);
+                } else {
+                    log::debug!("{:?} is changed: {} {}", path, from_info.modified, to_info.modified);
                 }
+
                 !unchanged
             })
             .map(|path| Transfer::Update(path.to_owned()));
