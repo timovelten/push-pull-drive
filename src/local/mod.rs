@@ -119,7 +119,7 @@ impl LocalBackend {
         path: &RPath,
         src: R,
         _len: u64,
-        create: bool
+        create: bool,
     ) -> Result<FileInfo> {
         let mut src = pin!(src.compat());
         if self.config.is_ignored(path) {
@@ -155,11 +155,10 @@ impl LocalBackend {
         let file = tmp_file.into_std().await;
         let me = self.clone();
         let cp = path.to_owned();
-        let (PathInfo::File(info), _) = spawn_blocking(move || {
-            me.read_file_impl_for_open_file(cp, file)
-        })
-        .await
-        .unwrap()?
+        let (PathInfo::File(info), _) =
+            spawn_blocking(move || me.read_file_impl_for_open_file(cp, file))
+                .await
+                .unwrap()?
         else {
             unreachable!()
         };
@@ -189,17 +188,10 @@ fn map_io_error(err: std::io::Error) -> anyhow::Error {
     match err.kind() {
         ErrorKind::NotFound => Error::NotFound.into(),
         ErrorKind::PermissionDenied => Error::NotAllowed.into(),
-        _ => {
-            // It is actually extremely unfortunate that more error kinds are still not
-            // stabilized. In the meantime, we really want the IsADirectory and IsNotADirectory
-            // so we do them ourselves here...
-            // TODO: Change this when Rust 1.83 lands
-            match err.raw_os_error() {
-                Some(libc::ENOTDIR) => Error::NotADirectory.into(),
-                Some(libc::EISDIR) => Error::IsADirectory.into(),
-                _ => anyhow!(err),
-            }
-        }
+        ErrorKind::NotADirectory => Error::NotADirectory.into(),
+        ErrorKind::IsADirectory => Error::IsADirectory.into(),
+        ErrorKind::AlreadyExists => Error::Exists.into(),
+        _ => anyhow!(err)
     }
 }
 
@@ -223,7 +215,9 @@ impl FileRepository for LocalBackend {
     async fn metadata(&self, path: &RPath) -> Result<PathInfo> {
         let this = self.clone();
         let rp = path.to_owned();
-        let (info, _file) = spawn_blocking(move || this.read_file_impl(rp)).await.unwrap()?;
+        let (info, _file) = spawn_blocking(move || this.read_file_impl(rp))
+            .await
+            .unwrap()?;
 
         Ok(info)
     }
@@ -238,20 +232,20 @@ impl FileRepository for LocalBackend {
     }
 
     async fn create_file<R: crate::file_repository::AsyncReader>(
-            &self,
-            path: &RPath,
-            src: R,
-            len: u64,
-        ) -> Result<FileInfo> {
+        &self,
+        path: &RPath,
+        src: R,
+        len: u64,
+    ) -> Result<FileInfo> {
         self.write_file_impl(path, src, len, true).await
     }
 
     async fn update_file<R: crate::file_repository::AsyncReader>(
-            &self,
-            path: &RPath,
-            src: R,
-            len: u64,
-        ) -> Result<FileInfo> {
+        &self,
+        path: &RPath,
+        src: R,
+        len: u64,
+    ) -> Result<FileInfo> {
         self.write_file_impl(path, src, len, false).await
     }
 
@@ -276,9 +270,7 @@ impl FileRepository for LocalBackend {
         let mut ret = Vec::new();
         let local_path = &self.config.get_local_path(path);
 
-        let walker = WalkDir::new(local_path)
-            .max_depth(up_to_depth)
-            .into_iter();
+        let walker = WalkDir::new(local_path).max_depth(up_to_depth).into_iter();
 
         for entry in walker {
             let entry = match entry {
@@ -324,11 +316,7 @@ impl FileRepository for LocalBackend {
         Ok(ret)
     }
 
-    async fn set_modified_time(
-            &self,
-            path: &RPath,
-            time: time::OffsetDateTime,
-        ) -> Result<()> {
+    async fn set_modified_time(&self, path: &RPath, time: time::OffsetDateTime) -> Result<()> {
         let local_path = self.config.get_local_path(path);
 
         spawn_blocking(move || {
@@ -341,7 +329,9 @@ impl FileRepository for LocalBackend {
             f.set_modified(time.into())?;
 
             Ok::<_, anyhow::Error>(())
-        }).await.unwrap()
+        })
+        .await
+        .unwrap()
     }
 }
 
@@ -351,23 +341,20 @@ mod tests {
     use assert_matches::assert_matches;
     use futures::io::Cursor;
     use std::{any::Any, fs::OpenOptions, io::Write, path::Path, usize};
-    use time::OffsetDateTime;
+    use tempfile::TempDir;
 
-    fn default_config(root_path: PathBuf) -> Config {
-        Config {
-            root_path,
-            ignore_prefixes: vec![],
-        }
+    fn setup(ignore_prefixes: Vec<RPathBuf>) -> (LocalBackend, TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = LocalBackend::from_config(Config {
+            root_path: tmp.path().to_owned(),
+            ignore_prefixes,
+        });
+
+        (b, tmp)
     }
 
     fn setup_read_dir_test() -> (LocalBackend, Vec<&'static str>, Vec<&'static str>, impl Any) {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = Config {
-            ignore_prefixes: vec![["ignored"].into()],
-            ..default_config(tmp.path().to_owned())
-        };
-
-        let b = LocalBackend::from_config(config);
+        let (b, tmp) = setup(vec![["ignored"].into()]);
 
         let mut files = vec![
             "file-1.txt",
@@ -420,17 +407,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_files_checks_for_existence() {
-        let (b, _, _, _drop_later) = setup_read_dir_test();
-        let err = b
-            .list_files("anothersubdir/d1/d2/does-not-exist".into(), usize::MAX)
-            .await
-            .unwrap_err();
-
-        assert_matches!(err.downcast().unwrap(), Error::NotFound);
-    }
-
-    #[tokio::test]
     async fn read_dir_depth_1() {
         let (b, files_should_be, dirs_should_be, _drop_later) = setup_read_dir_test();
 
@@ -477,9 +453,7 @@ mod tests {
         let mut retrieved_dirs = vec![];
         for info in retrieved {
             match info {
-                PathInfo::Dir(path) => {
-                    retrieved_dirs.push(path.with_separator('/').unwrap())
-                }
+                PathInfo::Dir(path) => retrieved_dirs.push(path.with_separator('/').unwrap()),
                 PathInfo::File(FileInfo { path, .. }) => {
                     retrieved_files.push(path.with_separator('/').unwrap())
                 }
@@ -493,48 +467,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = Config {
-            ..default_config(tmp.path().to_owned())
-        };
-        let b = LocalBackend::from_config(config);
-
-        let test_bytes = (0..1_000_000u64).map(|x| x as u8).collect::<Vec<_>>();
-
-        let the_path: RPathBuf = RPathBuf::from_components(["dir", "subdir", "a", "b", "somefile"]);
-        let fpath = tmp.path().join("dir/subdir/a/b/somefile");
-        let fdir = tmp.path().join("dir/subdir/a/b");
-
-        std::fs::create_dir_all(fdir).unwrap();
-
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(fpath)
-            .unwrap();
-
-        f.write_all(&test_bytes).unwrap();
-        drop(f);
-
-        let (info, mut reader) = b.read_file(&the_path).await.unwrap();
-        assert_eq!(test_bytes.len() as u64, info.size);
-
-        let mut file_bytes = Vec::new();
-        futures::io::copy(&mut reader, &mut file_bytes)
-            .await
-            .unwrap();
-        assert_eq!(file_bytes, test_bytes);
-    }
-
-    #[tokio::test]
     async fn file_ignores_ignored() {
-        let tmp = tempfile::tempdir().unwrap();
-        let b = LocalBackend::from_config(Config {
-            ignore_prefixes: vec![RPathBuf::from_components(["dir", "subdir"])],
-            ..default_config(tmp.path().to_owned())
-        });
+        let (b, _tmp) = setup(vec!["dir/subdir".into()]);
+
         let path: RPathBuf = RPathBuf::from_sep("dir/subdir/a/b/somefile", '/');
         let res = b.read_file(&path).await;
 
@@ -543,54 +478,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let b: LocalBackend = LocalBackend::from_config(Config {
-            ignore_prefixes: vec![RPathBuf::from_components(["dir", "we", "ignore"])],
-            ..default_config(tmp.path().to_owned())
-        });
+    async fn create_file_ignores_ignored_locations() {
+        let (b, _tmp) = setup(vec!["dir/we/ignore".into()]);
+        let res = b
+            .create_file("dir/we/ignore/subdir/test".into(), futures::io::empty(), 0)
+            .await
+            .unwrap_err();
+
+        assert_matches!(res.downcast().unwrap(), Error::NotAllowed);
+    }
+
+    #[tokio::test]
+    async fn create_file_fails_when_file_exists() {
+        let (b, _tmp) = setup(vec![]);
+        b
+            .create_file("file".into(), futures::io::empty(), 0)
+            .await
+            .unwrap();
+
+        let res = b
+            .create_file("file".into(), futures::io::empty(), 0)
+            .await
+            .unwrap_err();
+
+        assert_matches!(res.downcast().unwrap(), Error::Exists);
+    }
+
+    #[tokio::test]
+    async fn create_and_read_file() {
+        let (b, _tmp) = setup(vec![]);
         let test_bytes = (0..1_000_000u64).map(|x| x as u8).collect::<Vec<_>>();
+        let path = "somefile".into();
 
-        // Test if we can write to ignored locations
-        let x = b
-            .create_file(
-                &RPathBuf::from(["dir", "we", "ignore", "subdir", "test"]),
-                futures::io::empty(),
-                0,
-            )
-            .await;
-        let error = x.unwrap_err();
-        assert_matches!(error.downcast().unwrap(), Error::NotAllowed);
-
-        // Now write an actual file
-        let fpath = tmp.path().join("a-directory/somefile");
-
-        b.mkdir(&RPathBuf::from(["a-directory"])).await.unwrap();
         b.create_file(
-            &RPathBuf::from(["a-directory", "somefile"]),
+            path,
             Cursor::new(&test_bytes),
             test_bytes.len() as u64,
         )
         .await
         .unwrap();
 
-        let mut f = File::open(fpath).unwrap();
+        let (info, mut body) = b.read_file(path).await.unwrap();
 
         let mut file_bytes: Vec<u8> = Vec::new();
-        std::io::copy(&mut f, &mut file_bytes).unwrap();
+        futures::io::copy(&mut body, &mut file_bytes).await.unwrap();
 
+        assert_eq!(info.size, test_bytes.len() as u64);
         assert_eq!(file_bytes.len(), test_bytes.len());
         assert_eq!(file_bytes, test_bytes);
     }
 
     #[tokio::test]
-    async fn write_file_ignores_ignored() {
-        let tmp = tempfile::tempdir().unwrap();
-        let b: LocalBackend = LocalBackend::from_config(Config {
-            root_path: tmp.path().to_owned(),
-            ignore_prefixes: vec![RPathBuf::from_components(["dir", "subdir"])],
-            ..default_config(tmp.path().to_owned())
-        });
+    async fn update_file_ignores_ignored_locations() {
+        let (b, _tmp) = setup(vec!["dir/subdir".into()]);
 
         let res = b
             .update_file(
@@ -598,127 +538,79 @@ mod tests {
                 futures::io::empty(),
                 0,
             )
-            .await;
-        let error = res.unwrap_err();
-        assert_matches!(error.downcast().unwrap(), Error::NotAllowed);
+            .await
+            .unwrap_err();
+
+        assert_matches!(res.downcast().unwrap(), Error::NotAllowed);
     }
 
     #[tokio::test]
-    async fn info_ignores_ignored() {
-        let tmp = tempfile::tempdir().unwrap();
-        let b = LocalBackend::from_config(Config {
-            root_path: tmp.path().to_owned(),
-            ignore_prefixes: vec![RPathBuf::from_components(["dir", "subdir"])],
-            ..default_config(tmp.path().to_owned())
-        });
+    async fn metadata_ignores_ignored() {
+        let (b, tmp) = setup(vec!["dir/subdir".into()]);
 
-        // Create the file manually to really test it..
-        let ignored_dir = tmp.path().join("dir/subdir");
-        let ignored_file_path = ignored_dir.join("test");
+        tokio::fs::create_dir_all(tmp.path().join("dir/subdir")).await.unwrap();
 
-        std::fs::create_dir_all(&ignored_dir).unwrap();
-        let mut f = File::options()
-            .write(true)
-            .create(true)
-            .open(ignored_file_path)
-            .unwrap();
-        write!(f, "test").unwrap();
-        drop(f);
-
-        let res = b
-            .read_file(&RPathBuf::from(["dir", "subdir", "test"]))
-            .await;
-
-        assert_matches!(
-            res.unwrap_err().downcast().unwrap(),
-            Error::NotAllowed { .. }
-        );
-    }
-
-    #[tokio::test]
-    async fn info_ignores_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let b = LocalBackend::from_config(Config {
-            root_path: tmp.path().to_owned(),
-            ignore_prefixes: vec![RPathBuf::from_components(["dir", "subdir"])],
-            ..default_config(tmp.path().to_owned())
-        });
-        let ignored_dir = tmp.path().join("dir/subdir");
-        std::fs::create_dir_all(&ignored_dir).unwrap();
-
-        let res = b.read_file(&RPathBuf::from(["dir", "subdir"])).await;
+        let res = b.metadata("dir/subdir".into()).await.unwrap_err();
         assert!(matches!(
-            res.unwrap_err().downcast().unwrap(),
+            res.downcast().unwrap(),
             Error::NotAllowed
         ));
     }
 
     #[tokio::test]
     async fn list_files_errors_on_not_exist() {
-        let tmp = tempfile::tempdir().unwrap();
-        let b = LocalBackend::from_config(default_config(tmp.path().to_owned()));
+        let (b, _tmp) = setup(vec![]);
         let res = b
             .list_files("should-not-exist".into(), 0)
             .await
             .unwrap_err();
 
-        println!("{res:?}");
         assert_matches!(res.downcast().unwrap(), Error::NotFound);
     }
 
     #[tokio::test]
     async fn write_file_on_directory() {
-        // Check that if write_file is called on a path that exists but is a directory
-        // returns Error::IsADirectory.
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join("testdir").join("nested")).unwrap();
-        let b = LocalBackend::from_config(Config {
-            ..default_config(tmp.path().to_owned())
-        });
+        let (b, _tmp) = setup(vec![]);
+        b.mkdir("testdir".into()).await.unwrap();
 
-        let result = b
+        let res = b
             .update_file(
-                &RPathBuf::from(["testdir", "nested"]),
+                "testdir".into(),
                 futures::io::empty(),
                 0,
             )
             .await
             .unwrap_err();
 
-        assert_matches!(result.downcast().unwrap(), Error::IsADirectory);
+        assert_matches!(res.downcast().unwrap(), Error::IsADirectory);
     }
 
     #[tokio::test]
     async fn read_file_on_directory() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join("testdir").join("nested")).unwrap();
-        let b = LocalBackend::from_config(Config {
-            ..default_config(tmp.path().to_owned())
-        });
+        let (b, _tmp) = setup(vec![]);
+        b.mkdir("testdir".into()).await.unwrap();
 
-        let result = b
-            .read_file(&RPathBuf::from(["testdir", "nested"]))
+        let res = b
+            .read_file(
+                "testdir".into()
+            )
             .await
             .unwrap_err();
 
-        assert_matches!(result.downcast().unwrap(), Error::IsADirectory);
+        assert_matches!(res.downcast().unwrap(), Error::IsADirectory);
     }
 
     #[tokio::test]
     async fn deleting_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let test_path = tmp.path().join("testdir");
-        std::fs::create_dir(&test_path).unwrap();
-        assert!(test_path.exists());
+        // Make sure we can delete directories
+        let (b, _tmp) = setup(vec![]);
 
-        let b = LocalBackend::from_config(Config {
-            ..default_config(tmp.path().to_owned())
-        });
-
-        b.delete(&RPathBuf::from_components(["testdir"]))
+        let path = "testdir".into();
+        b.mkdir(path).await.unwrap();
+        b.delete(path)
             .await
             .unwrap();
 
-        assert!(!test_path.exists());
+        assert_matches!(b.maybe_metadata(path).await.unwrap(), None);
     }
 }
