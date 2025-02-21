@@ -52,8 +52,8 @@ pub trait FileRepository: Debug + Send + Sync + Clone + 'static {
             match self.metadata(path).await {
                 Ok(info) => Ok(Some(info)),
                 Err(err) => match err.downcast_ref::<Error>() {
-                    Some(Error::NotFound | Error::NotAllowed) => return Ok(None),
-                    _ => return Err(err),
+                    Some(Error::NotFound | Error::NotAllowed) => Ok(None),
+                    _ => Err(err),
                 },
             }
         }

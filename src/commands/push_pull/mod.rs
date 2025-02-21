@@ -3,11 +3,11 @@ use crate::{
     file_repository::FileRepository,
     filetree::{self, file_tree_of_repository, Node as _, Patch, PatchKind},
     paths::{RPath, RPathBuf},
-    FileInfo, InspectAsyncReader,
+    InspectAsyncReader,
 };
 use anyhow::Error;
 use progress::{ProgressId, ProgressSender};
-use std::{collections::VecDeque, fmt::Display, io::Write as _, sync::Arc, time::Duration, usize};
+use std::{collections::VecDeque, fmt::Display, io::Write as _, sync::Arc, time::Duration};
 use tokio::{sync::Semaphore, task::JoinSet};
 
 mod progress;
@@ -178,30 +178,28 @@ where
         Ok(())
     }
 
-    async fn transfer_file<F>(&self, transfer: &Transfer, progress: F) -> anyhow::Result<FileInfo>
+    async fn transfer_file<F>(&self, transfer: &Transfer, progress: F) -> anyhow::Result<()>
     where
         F: Fn(usize) + Sync,
     {
         let (info, reader) = self.from.read_file(transfer.path()).await?;
         let reader = InspectAsyncReader::new(reader, |buf| progress(buf.len()));
 
-        let ret = match transfer {
+        match transfer {
             Transfer::Update(path) => {
-                let new_info = self.to.update_file(path, reader, info.size).await?;
+                self.to.update_file(path, reader, info.size).await?;
                 self.to.set_modified_time(path, info.modified).await?;
-                new_info
             }
             Transfer::Create(path) => {
-                let new_info = self.to.create_file(path, reader, info.size).await?;
+                self.to.create_file(path, reader, info.size).await?;
                 self.to.set_modified_time(path, info.modified).await?;
-                new_info
             }
         };
 
-        Ok(ret)
+        Ok(())
     }
 
-    /// Look and from and to, and determine which files need to be transferred.
+    /// Look at from and to, and determine which files need to be transferred.
     /// This also performs deletions and creates directories that are necessary for these file transfers
     /// to succeed.
     ///
@@ -275,7 +273,12 @@ where
                 if unchanged {
                     log::debug!("{:?} is unchanged", path);
                 } else {
-                    log::debug!("{:?} is changed: {} {}", path, from_info.modified, to_info.modified);
+                    log::debug!(
+                        "{:?} is changed: {} {}",
+                        path,
+                        from_info.modified,
+                        to_info.modified
+                    );
                 }
 
                 !unchanged

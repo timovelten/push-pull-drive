@@ -29,6 +29,13 @@ impl PathInfo {
         }
     }
 
+    pub fn into_fileinfo(self) -> Option<FileInfo> {
+        match self {
+            Self::File(info) => Some(info),
+            Self::Dir(_) => None
+        }
+    }
+
     pub fn root_dir() -> Self {
         Self::Dir(RPathBuf::empty())
     }

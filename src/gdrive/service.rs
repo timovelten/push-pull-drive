@@ -5,6 +5,8 @@ use std::fmt::Write;
 use std::future::Future;
 use thiserror::Error;
 
+use crate::paths::RPath;
+
 #[derive(Debug)]
 pub enum DriveErrorKind {
     NotFound,
@@ -27,6 +29,7 @@ type Result<T> = core::result::Result<T, DriveError>;
 /// a parser and an interpreter. So we reduce the API surface considerably here.
 pub trait DriveService: Send + Sync + 'static {
     async fn mkdir(&self, folder_id: &str, name: &str) -> Result<()>;
+
     fn delete(&self, id: &str) -> impl Future<Output = Result<()>> + Send;
 
     fn read_dirs(
@@ -58,6 +61,19 @@ pub trait DriveService: Send + Sync + 'static {
         &self,
         id: &str,
         src: R,
+    ) -> impl Future<Output = Result<drive_api::File>> + Send;
+
+    fn create_file<R: AsyncRead + Send>(
+        &self,
+        folder_id: &str,
+        name: &str,
+        src: R,
+    ) -> impl Future<Output = Result<drive_api::File>> + Send;
+
+    fn set_modified_time(
+        &self,
+        id: &str,
+        time: time::OffsetDateTime,
     ) -> impl Future<Output = Result<()>> + Send;
 }
 
@@ -91,7 +107,7 @@ impl DriveService for DriveServiceImpl {
             // Query string is of the form
             // trashed = false and ('abc' in parents or 'cdf' in parents)
             let mut q = String::from("trashed = false and (");
-            for (i, id) in folder_ids.into_iter().enumerate() {
+            for (i, id) in folder_ids.iter().enumerate() {
                 if i > 0 {
                     write!(q, " or ").unwrap();
                 }
@@ -127,10 +143,9 @@ impl DriveService for DriveServiceImpl {
         Ok(self.api_client.files_get_alt_media(id, rev_id).await?)
     }
 
-    async fn update_body<R: AsyncRead + Send>(&self, id: &str, src: R) -> Result<()> {
-        self.api_client.files_update_upload(id, src).await?;
-
-        Ok(())
+    async fn update_body<R: AsyncRead + Send>(&self, id: &str, src: R) -> Result<drive_api::File> {
+        let info = self.api_client.files_update_upload(id, src).await?;
+        Ok(info)
     }
 
     async fn delete(&self, id: &str) -> Result<()> {
@@ -143,6 +158,46 @@ impl DriveService for DriveServiceImpl {
         let _created_file = self.api_client.files_create(req).await?;
 
         Ok(())
+    }
+
+    async fn create_file<R: AsyncRead + Send>(
+        &self,
+        folder_id: &str,
+        filename: &str,
+        src: R,
+    ) -> Result<drive_api::File> {
+        let file = self
+            .api_client
+            .files_create_upload(
+                FilesReq {
+                    name: Some(filename.to_string()),
+                    parents: Some(vec![folder_id.to_owned()]),
+                    ..Default::default()
+                },
+                src,
+            )
+            .await?;
+
+        Ok(file)
+    }
+
+    async fn set_modified_time(
+        &self,
+        id: &str,
+        time: time::OffsetDateTime,
+    ) -> Result<()> {
+        self.api_client
+            .files_update(
+                id,
+                FilesReq {
+                    modified_time: Some(time),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        Ok(())
+
     }
 }
 

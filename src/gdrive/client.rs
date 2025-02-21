@@ -51,26 +51,58 @@ fn to_pathinfo(file: &drive_api::File, path: RPathBuf) -> Option<PathInfo> {
     }
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+enum Resolve {
+    Directory,
+    File,
+    Any,
+}
+
 impl<Service: DriveService> GDriveClient<Service> {
+    async fn resolve(&self, path: &RPath, resolve: Resolve) -> anyhow::Result<String> {
+        let id = self
+            .maybe_resolve(path, resolve)
+            .await?
+            .ok_or(Error::NotFound)?;
+        Ok(id)
+    }
+
     #[async_recursion]
-    async fn resolve(&self, path: &RPath) -> anyhow::Result<String> {
+    async fn maybe_resolve(
+        &self,
+        path: &RPath,
+        resolve: Resolve,
+    ) -> anyhow::Result<Option<String>> {
+        // TODO: This will need caching to be even close to fast enough
+
         // We could probaly rewrite this iteratively and avoid async_recursion...
 
         let Some((base, name)) = path.split_right() else {
-            return Ok(self.root_id().await?);
+            return Ok(Some(self.root_id().await?));
         };
 
-        let parent_id = self.resolve(base).await?;
+        let parent_id = match self.maybe_resolve(base, resolve).await? {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+
         let contents = self.service.read_dir(&parent_id).await?;
         let canon_contents = canonicalize(contents);
 
         for file in canon_contents {
             if file.name == name {
-                return Ok(file.file.id);
+                // We will only ever enter this if once (canonical contents do not contain duplicate names)
+                return match (resolve, file.file.is_folder()) {
+                    (Resolve::Directory, true) | (Resolve::File, false) | (Resolve::Any, _) => {
+                        Ok(Some(file.file.id))
+                    }
+                    (Resolve::Directory, false) => bail!(Error::NotADirectory),
+                    (Resolve::File, true) => bail!(Error::IsADirectory),
+                };
             }
         }
 
-        bail!(Error::NotFound)
+        Ok(None)
     }
 
     async fn root_id(&self) -> anyhow::Result<String> {
@@ -78,11 +110,19 @@ impl<Service: DriveService> GDriveClient<Service> {
     }
 
     pub async fn mkdir(&self, path: &RPath) -> anyhow::Result<()> {
-        todo!()
+        let Some((parent, name)) = path.split_right() else {
+            bail!(Error::Exists)
+        };
+
+        let folder_id = self.resolve(path, Resolve::Directory).await?;
+
+        self.service.mkdir(&folder_id, name).await?;
+
+        Ok(())
     }
 
     pub async fn metadata(&self, path: &RPath) -> anyhow::Result<PathInfo> {
-        let file_id = self.resolve(path).await?;
+        let file_id = self.resolve(path, Resolve::Any).await?;
         let file = self.service.get_file(&file_id).await?;
         let ret = to_pathinfo(&file, path.to_owned()).ok_or(Error::NotAllowed)?;
 
@@ -93,7 +133,8 @@ impl<Service: DriveService> GDriveClient<Service> {
         &self,
         path: &RPath,
     ) -> anyhow::Result<(FileInfo, Box<dyn AsyncRead + Send>)> {
-        let file_id = self.resolve(path).await?;
+        let file_id = self.resolve(path, Resolve::File).await?;
+
         let file = self.service.get_file(&file_id).await?;
         let info = to_pathinfo(&file, path.to_owned()).ok_or(Error::NotAllowed)?;
         match info {
@@ -120,18 +161,37 @@ impl<Service: DriveService> GDriveClient<Service> {
         &self,
         path: &RPath,
         src: R,
-        len: u64,
+        _len: u64,
     ) -> anyhow::Result<FileInfo> {
-        todo!()
+        if self.maybe_resolve(path, Resolve::Any).await?.is_some() {
+            bail!(Error::Exists);
+        }
+
+        let (parent, filename) = path.split_right().ok_or(Error::IsADirectory)?;
+        let parent_id = self.resolve(parent, Resolve::Directory).await?;
+
+        let info = self.service.create_file(&parent_id, filename, src).await?;
+        let file_info = to_pathinfo(&info, path.to_owned())
+            .and_then(|f| f.into_fileinfo())
+            .ok_or_else(|| anyhow!("Expected a valid file response"))?;
+
+        Ok(file_info)
     }
 
     pub async fn update_file<R: crate::file_repository::AsyncReader>(
         &self,
         path: &RPath,
         src: R,
-        len: u64,
+        _len: u64,
     ) -> anyhow::Result<FileInfo> {
-        todo!()
+        let id = self.resolve(path, Resolve::File).await?;
+
+        let info = self.service.update_body(&id, src).await?;
+        let file_info = to_pathinfo(&info, path.to_owned())
+            .and_then(|f| f.into_fileinfo())
+            .ok_or_else(|| anyhow!("Expected a valid file response"))?;
+
+        Ok(file_info)
     }
 
     pub async fn set_modified_time(
@@ -139,11 +199,13 @@ impl<Service: DriveService> GDriveClient<Service> {
         path: &RPath,
         time: time::OffsetDateTime,
     ) -> anyhow::Result<()> {
-        todo!()
+        let id = self.resolve(path, Resolve::File).await?;
+        self.service.set_modified_time(&id, time).await?;
+        Ok(())
     }
 
     pub async fn delete(&self, path: &RPath) -> anyhow::Result<()> {
-        let id = self.resolve(path).await?;
+        let id = self.resolve(path, Resolve::Any).await?;
         self.service.delete(&id).await?;
         Ok(())
     }
@@ -153,7 +215,7 @@ impl<Service: DriveService> GDriveClient<Service> {
         path: &RPath,
         max_depth: usize,
     ) -> anyhow::Result<Vec<PathInfo>> {
-        let id = self.resolve(path).await?;
+        let id = self.resolve(path, Resolve::Directory).await?;
 
         // All directories of a certain depth. We want to deepen the search tree by expanding these
         let mut queue = vec![(path.to_owned(), id)];
