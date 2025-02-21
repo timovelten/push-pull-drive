@@ -22,7 +22,7 @@ pub struct DriveError {
     pub src: anyhow::Error,
 }
 
-type Result<T> = core::result::Result<T, DriveError>;
+pub type Result<T> = core::result::Result<T, DriveError>;
 
 /// For testing, I do not want to build out the entirety of the Google Drive API. In particular,
 /// the querying and searching for files would be fairly complicated to build and require what is essentially

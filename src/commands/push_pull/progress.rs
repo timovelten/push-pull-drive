@@ -71,8 +71,6 @@ struct Item<T> {
 pub(super) struct ProgressReceiver<T> {
     items: SlotMap<ProgressId, Item<T>>,
     total_bytes_read: Arc<AtomicU64>,
-    /// List of changes so that we can determine their names and stuff. If we have ever lifetime troubles,
-    /// this can be changed to Arc<[FileChange]>.
     receiver: mpsc::UnboundedReceiver<ProgressUpdate>,
     /// How many changes already finished.
     done: usize,
@@ -89,10 +87,10 @@ impl<T: Display> ProgressReceiver<T> {
         let bytes_read = self.total_bytes_read.load(Ordering::Acquire);
         let throughput = self.throughput.update_and_get(bytes_read) as u64;
 
-        let percentage = (self.done * 100) / self.items.len();
         let (thru, thru_unit) = human_readable_bytes(throughput);
+        let (tx, tx_unit) = human_readable_bytes(bytes_read);
         let status_line =
-            format!("{percentage}% {thru:.2} {thru_unit}/s");
+            format!("Transferred: {tx:.2} {tx_unit}. Throughput: {thru:.2} {thru_unit}/s");
         shell.print_transient(&status_line)?;
 
         Ok(())

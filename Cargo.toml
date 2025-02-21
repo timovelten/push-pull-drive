@@ -11,7 +11,7 @@ serde_json = "1.0"
 http = "1.1.0"
 thiserror = "2.0"
 futures = "0.3.25"
-rand = { version = "0.8.5", features = ["small_rng"] }
+rand = { version = "0.9.0", features = ["small_rng"] }
 log = { version = "0.4.21", features = ["std"] }
 oauth2 = { version = "4.3.0" }
 slotmap = "1.0.7"
@@ -65,6 +65,7 @@ toml = "0.8.19"
 test-log = "0.2.15"
 rand.workspace = true
 assert_matches.workspace = true
+base64 = "0.22.1"
 
 # Always compile dependencies with some level of optimization. Especially the hashing
 # is painfully slow otherwise.

@@ -435,7 +435,7 @@ impl<const N: usize, T: Into<String>> From<[T; N]> for RPathBuf {
 
 #[cfg(test)]
 mod test {
-    use rand::{distributions::Uniform, prelude::*, Rng};
+    use rand::{distr::Uniform, prelude::*, Rng};
 
     use super::*;
 
@@ -528,7 +528,7 @@ mod test {
 
     fn random_path(alphabet: &[char], rng: &mut impl Rng) -> RPathBuf {
         let mut ret = RPathBuf::empty();
-        let uniform = Uniform::new(0, alphabet.len());
+        let uniform = Uniform::new(0, alphabet.len()).unwrap();
 
         for _ in 0..8 {
             let word = uniform

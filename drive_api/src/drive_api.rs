@@ -285,7 +285,7 @@ impl DriveApi {
                 return Err(err);
             }
 
-            let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..=1000));
+            let jitter = Duration::from_millis(rand::rng().random_range(0..=1000));
 
             let delay = Duration::from_secs(2u64.pow(retries + 1));
             tokio::time::sleep(delay + jitter).await;
@@ -412,6 +412,8 @@ impl DriveApi {
         Ok(Box::new(ret))
     }
 
+    /// Note:
+    /// - This will error "notFound" when the id does not exist
     pub async fn files_delete(&self, id: &str) -> Result<(), ApiError> {
         let url = Url::parse(&format!("https://www.googleapis.com/drive/v3/files/{id}")).unwrap();
 

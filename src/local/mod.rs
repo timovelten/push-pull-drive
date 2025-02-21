@@ -164,7 +164,7 @@ impl LocalBackend {
         // Make sure the directories exist..
         let local_path = self.config.get_local_path(path);
 
-        // Make sure the file exists..
+        // Create file if we need to
         let _ = tokio::fs::OpenOptions::new()
             .write(true)
             .read(true)

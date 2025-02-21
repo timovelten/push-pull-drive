@@ -81,7 +81,8 @@ impl<Service: DriveService> GDriveClient<Service> {
             return Ok(Some(self.root_id().await?));
         };
 
-        let parent_id = match self.maybe_resolve(base, resolve).await? {
+        // For the parent of anything, we only care about directories..
+        let parent_id = match self.maybe_resolve(base, Resolve::Directory).await? {
             Some(id) => id,
             None => return Ok(None),
         };
@@ -215,6 +216,10 @@ impl<Service: DriveService> GDriveClient<Service> {
         path: &RPath,
         max_depth: usize,
     ) -> anyhow::Result<Vec<PathInfo>> {
+        // This is actually by far the most ux critical function. Listing the files is what takes the longest on
+        // google drive due to the sheer amount of rest requests it uses. Paralellizing these
+        // and minimizing the number of calls is very important.
+
         let id = self.resolve(path, Resolve::Directory).await?;
 
         // All directories of a certain depth. We want to deepen the search tree by expanding these
@@ -259,8 +264,10 @@ impl<Service: DriveService> GDriveClient<Service> {
             while let Some(next) = fts.join_next().await {
                 let (paths, contents) = next.unwrap()?;
                 for (folder_path, files) in paths.into_iter().zip(contents) {
-                    for file in files {
-                        let file_path = folder_path.join_single(&file.name);
+                    let files = canonicalize(files);
+
+                    for CanonicalFile { file, name } in files {
+                        let file_path = folder_path.join_single(&name);
 
                         if file.is_folder() {
                             queue.push((file_path.clone(), file.id.clone()))

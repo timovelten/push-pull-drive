@@ -121,6 +121,7 @@ where
                 let progress_callback = |bytes: usize| sender.notify_bytes_read(id, bytes as u64);
                 if let Err(err) = this.transfer_file(&transfer, progress_callback).await {
                     sender.notify_failed(id);
+                    log::error!("File transfer failed: {:?}", err);
                     Err((transfer, err))
                 } else {
                     sender.notify_done(id);

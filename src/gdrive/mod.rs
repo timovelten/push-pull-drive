@@ -19,6 +19,7 @@ use tokio::{sync::Semaphore, task::block_in_place};
 pub mod config;
 mod client;
 mod service;
+mod test;
 
 pub use config::{load, init};
 

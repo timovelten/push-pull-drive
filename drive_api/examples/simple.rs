@@ -41,6 +41,10 @@ async fn main() -> anyhow::Result<()> {
     api_client.files_delete(&test_file_id).await?;
     println!("Deleted the file");
 
+    // What happens if we delete it twice?
+    api_client.files_delete(&test_file_id).await?;
+    println!("Deleted the file");
+
     assert!(!files_in_root(&api_client, &root_file.id).await?.iter().any(|file| file.id == test_file_id));
 
     Ok(())
