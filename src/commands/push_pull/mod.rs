@@ -7,7 +7,7 @@ use crate::{
 };
 use anyhow::Error;
 use progress::{ProgressId, ProgressSender};
-use std::{collections::VecDeque, fmt::Display, io::Write as _, sync::Arc, time::Duration};
+use std::{cmp::Reverse, collections::VecDeque, fmt::Display, io::Write as _, sync::Arc, time::Duration, usize};
 use tokio::{sync::Semaphore, task::JoinSet};
 
 mod progress;
@@ -15,6 +15,8 @@ mod progress;
 #[derive(clap::Args, Clone)]
 pub struct PushPullArgs {
     path: Option<String>,
+    #[arg(short, long, default_value = "8")]
+    limit_concurrent_transfers: usize,
 }
 
 fn get_path(path: Option<String>, wd: &RPath) -> RPathBuf {
@@ -34,6 +36,7 @@ pub fn push(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> {
         from: local.clone(),
         to: remote.clone(),
         path: get_path(args.path, &env.wd),
+        max_concurrent_transfers: args.limit_concurrent_transfers,
     }
     .execute()?;
 
@@ -47,6 +50,7 @@ pub fn pull(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> {
         from: remote.clone(),
         to: local.clone(),
         path: get_path(args.path, &env.wd),
+        max_concurrent_transfers: args.limit_concurrent_transfers,
     }
     .execute()?;
 
@@ -54,23 +58,23 @@ pub fn pull(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> {
 }
 
 #[derive(Debug, Clone)]
-enum Transfer {
-    Update(RPathBuf),
-    Create(RPathBuf),
+struct Transfer {
+    kind: TransferKind,
+    path: RPathBuf,
+    size: u64,
 }
 
-impl Transfer {
-    pub fn path(&self) -> &RPath {
-        let (Self::Update(path) | Self::Create(path)) = self;
-        path
-    }
+#[derive(Debug, Clone)]
+enum TransferKind {
+    Update,
+    Create,
 }
 
 impl Display for Transfer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Update(path) => write!(f, "{}", path)?,
-            Self::Create(path) => write!(f, "Create: {}", path)?,
+        match self.kind {
+            TransferKind::Update => write!(f, "{}", self.path)?,
+            TransferKind::Create => write!(f, "Create: {}", self.path)?,
         }
 
         Ok(())
@@ -83,6 +87,7 @@ pub(super) struct PushPull<A, B> {
     from: A,
     to: B,
     path: RPathBuf,
+    max_concurrent_transfers: usize,
 }
 
 impl<A, B> PushPull<A, B>
@@ -96,15 +101,24 @@ where
     }
 
     fn concurrency_limit(&self) -> usize {
-        std::cmp::min(A::CONCURRENCY_LIMIT, B::CONCURRENCY_LIMIT)
+        A::CONCURRENCY_LIMIT
+            .min(B::CONCURRENCY_LIMIT)
+            .min(self.max_concurrent_transfers)
     }
 
     async fn transfer_files(
         self: Arc<Self>,
         sender: ProgressSender,
-        files: Vec<(Transfer, ProgressId)>,
+        mut files: Vec<(Transfer, ProgressId)>,
     ) -> Vec<(Transfer, Error)> {
-        let sem = Arc::new(Semaphore::new(self.concurrency_limit()));
+        const LARGE_FILE_SIZE: u64 = 128 * 1024 * 1024;
+
+        // Sort by size, larger sizes first. In principle, they should be transferred first
+        // (but the order is not strictly deterministic further down, so maybe they wont be)
+        files.sort_by_key(|(a, _)| Reverse(a.size));
+
+        let num_permits = self.concurrency_limit();
+        let sem = Arc::new(Semaphore::new(num_permits));
 
         let mut fts = JoinSet::new();
 
@@ -114,7 +128,20 @@ where
             let sem = sem.clone();
 
             fts.spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
+                // We only really want concurrent file transfers for "small" files that cannot make rasonable
+                // use of all the bandwidth without any concurrency. If a file is at least kind of large
+                // it can max out the connection by itself, and we should let it do that.
+                // It is actually really annoying to wait for 8 large files (say 2 gb) to be transferred
+                // concurrently without any observable progress.
+                let permits_needed = if transfer.size >= LARGE_FILE_SIZE {
+                    num_permits as u32
+                } else {
+                    1
+                };
+
+                let _permit = sem.acquire_many(permits_needed).await.unwrap();
+
+                log::info!("Transferring file {}", transfer.path);
 
                 sender.notify_start(id);
 
@@ -183,17 +210,17 @@ where
     where
         F: Fn(usize) + Sync,
     {
-        let (info, reader) = self.from.read_file(transfer.path()).await?;
+        let (info, reader) = self.from.read_file(&transfer.path).await?;
         let reader = InspectAsyncReader::new(reader, |buf| progress(buf.len()));
 
-        match transfer {
-            Transfer::Update(path) => {
-                self.to.update_file(path, reader, info.size).await?;
-                self.to.set_modified_time(path, info.modified).await?;
+        match transfer.kind {
+            TransferKind::Update => {
+                self.to.update_file(&info.path, reader, info.size).await?;
+                self.to.set_modified_time(&info.path, info.modified).await?;
             }
-            Transfer::Create(path) => {
-                self.to.create_file(path, reader, info.size).await?;
-                self.to.set_modified_time(path, info.modified).await?;
+            TransferKind::Create => {
+                self.to.create_file(&info.path, reader, info.size).await?;
+                self.to.set_modified_time(&info.path, info.modified).await?;
             }
         };
 
@@ -262,33 +289,40 @@ where
         }
 
         // Prune the files that need to be updated, leaving out the ones that are up to date
-        let to_be_updated = to_be_updated
-            .into_iter()
-            .filter(|path| {
-                let from_info = from_files.get(path).unwrap().unwrap_fileinfo();
-                let to_info = to_files.get(path).unwrap().unwrap_fileinfo();
+        let to_be_updated = to_be_updated.into_iter().filter_map(|path| {
+            let from_info = from_files.get(path).unwrap().unwrap_fileinfo();
+            let to_info = to_files.get(path).unwrap().unwrap_fileinfo();
 
-                let unchanged = from_info.size == to_info.size
-                    && (from_info.modified - to_info.modified) < Duration::from_secs(1);
+            let unchanged = from_info.size == to_info.size
+                && (from_info.modified - to_info.modified) < Duration::from_secs(1);
 
-                if unchanged {
-                    log::debug!("{:?} is unchanged", path);
-                } else {
-                    log::debug!(
-                        "{:?} is changed: {} {}",
-                        path,
-                        from_info.modified,
-                        to_info.modified
-                    );
-                }
+            if unchanged {
+                log::debug!("{:?} is unchanged", path);
+                return None;
+            }
 
-                !unchanged
+            log::debug!(
+                "{:?} is changed: {} {}",
+                path,
+                from_info.modified,
+                to_info.modified
+            );
+
+            Some(Transfer {
+                kind: TransferKind::Update,
+                path: path.to_owned(),
+                size: from_info.size,
             })
-            .map(|path| Transfer::Update(path.to_owned()));
+        });
 
-        let to_be_created = to_be_created
-            .into_iter()
-            .map(|path| Transfer::Create(path.to_owned()));
+        let to_be_created = to_be_created.into_iter().map(|path| {
+            let from_info = from_files.get(path).unwrap().unwrap_fileinfo();
+            Transfer {
+                kind: TransferKind::Create,
+                path: path.to_owned(),
+                size: from_info.size,
+            }
+        });
 
         let ret = to_be_created.chain(to_be_updated).collect();
 
