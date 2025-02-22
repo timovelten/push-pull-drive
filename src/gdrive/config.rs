@@ -47,7 +47,7 @@ pub fn init(
 
     ctx.db.put_value("gdrive_config", config)?;
 
-    writeln!(ctx.shell.err(), "Success!")?;
+    writeln!(ctx.err(), "Success!")?;
 
     Ok(())
 }

@@ -18,7 +18,7 @@ use tokio::{sync::mpsc, time::timeout};
 enum ProgressUpdate {
     Start { slot: ProgressId },
     Done { slot: ProgressId },
-    Failed { slot: ProgressId },
+    Failed { slot: ProgressId, msg: String },
 }
 
 #[derive(Clone)]
@@ -49,9 +49,9 @@ impl ProgressSender {
             .unwrap();
     }
 
-    pub fn notify_failed(&self, id: ProgressId) {
+    pub fn notify_failed(&self, id: ProgressId, msg: String) {
         self.sender
-            .send(ProgressUpdate::Failed { slot: id })
+            .send(ProgressUpdate::Failed { slot: id, msg })
             .unwrap();
     }
 }
@@ -132,15 +132,26 @@ impl<T: Display> ProgressReceiver<T> {
 
                     self.items[slot].state = ItemState::Started;
                 }
-                ProgressUpdate::Failed { slot } => {
+                ProgressUpdate::Failed { slot, msg } => {
                     self.done += 1;
-                    writeln!(
-                        shell.err(),
-                        "({} / {}) Failed: {}",
-                        self.done,
-                        self.items.len(),
-                        &self.items[slot].item,
-                    )?;
+                    if msg.is_empty() {
+                        writeln!(
+                            shell.err(),
+                            "({} / {}) Failed: {}",
+                            self.done,
+                            self.items.len(),
+                            &self.items[slot].item,
+                        )?;
+                    } else {
+                        writeln!(
+                            shell.err(),
+                            "({} / {}) Failed: {}. {msg}.",
+                            self.done,
+                            self.items.len(),
+                            &self.items[slot].item,
+                        )?;
+                    }
+
                     self.print_progress_line(shell)?;
 
                     self.items[slot].state = ItemState::Failed;

@@ -4,7 +4,7 @@ use crate::{
 use anyhow::bail;
 use delegate::delegate;
 use std::{
-    io::{self},
+    io::{self, Write as _},
     path::{Path as StdPath, PathBuf as StdPathBuf},
     sync::Arc,
 };
@@ -39,6 +39,19 @@ impl ExecutionEnvironment {
             pub fn print_transient(&self, s: impl std::fmt::Display) -> io::Result<()>;
         }
     }
+
+    pub fn prompt_continue(&self, msg: &str) -> bool {
+        write!(self.err(), "{msg} [Y(es) / N(o)] ").unwrap();
+
+        let mut buffer = String::new();
+        io::stdin().read_line(&mut buffer).unwrap();
+
+        if buffer.starts_with(['Y', 'y']) {
+            true
+        } else {
+            false
+        }
+    } 
 }
 
 /// Full context needed for most operations

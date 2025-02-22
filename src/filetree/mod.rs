@@ -75,6 +75,13 @@ impl Iterator for SiblingIndicesIterator<'_> {
 }
 
 impl<T: Node> FileTree<T> {
+    pub fn empty() -> Self {
+        FileTree {
+            nodes: Default::default(),
+            sibling_offset: Default::default(),
+        }
+    }
+
     fn get_index(&self, path: &RPath) -> Result<usize, usize> {
         self.nodes.binary_search_by_key(&path, |node| node.path())
     }
@@ -170,10 +177,7 @@ impl<T: Node> TryFrom<Vec<T>> for FileTree<T> {
         nodes.sort_by(|a, b| a.path().cmp(b.path()));
 
         if nodes.is_empty() {
-            return Ok(FileTree {
-                nodes,
-                sibling_offset: Default::default(),
-            });
+            return Ok(Self::empty());
         }
 
         // Ensure the paths of the nodes are unique. Also make sure that all files are leafs (and have no children)
