@@ -19,6 +19,9 @@ use std::fmt::Write;
 use super::service::{DriveService, DriveServiceImpl};
 
 #[derive(Debug)]
+/// The clients primary job is to map between the path-based model of a filesystem we work with
+/// to the id-based system that Google Drive uses.
+/// 
 /// Conceptually this is a singleton. There should be just one instance of this, wrapped in an Arc.
 pub(super) struct GDriveClient<S: DriveService = DriveServiceImpl> {
     service: S,
@@ -30,7 +33,7 @@ pub const CONCURRENCY_LIMIT: usize = 8;
 impl GDriveClient {
     pub fn new(cred: GoogleCredential) -> Self {
         Self {
-            service: DriveServiceImpl::new(cred),
+            service: DriveServiceImpl::new(cred)
         }
     }
 }
@@ -328,4 +331,37 @@ fn canonicalize(mut files: Vec<drive_api::File>) -> Vec<CanonicalFile> {
     }
 
     ret
+}
+
+#[cfg(test)]
+mod test {
+    use std::usize;
+
+    use futures::io::Cursor;
+
+    use crate::gdrive::service::fake::FakeDriveService;
+    use super::*;
+
+    fn setup() -> Arc<GDriveClient<FakeDriveService>> {
+        let service = FakeDriveService::default();
+        Arc::new(GDriveClient { service })
+    }
+
+    #[tokio::test]
+    async fn filenames_are_unique_in_a_folder() {
+        let client = setup();
+        let id = client.service.mkdir("root", "Ordner").await.unwrap().id;
+        let id = client.service.mkdir(&id, "Noch ein ordner").await.unwrap().id;
+        
+        for i in 0..4 {
+            dbg!(i);
+            client.service.create_file(&id, "test_file", futures::io::empty()).await.unwrap();
+        }
+        
+        let retrieved = client.list_files("Ordner".into(), usize::MAX).await.unwrap();
+        
+        // Should contain two folders, and one file
+        dbg!(&retrieved);
+        assert_eq!(retrieved.len(), 3);
+    }
 }

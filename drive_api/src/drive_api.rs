@@ -160,6 +160,13 @@ impl File {
     pub fn is_folder(&self) -> bool {
         self.mime_type == FOLDER_MIME_TYPE
     }
+
+    pub fn parent(&self) -> Option<&str> {
+        match &self.parents {
+            Some([p]) => Some(p.as_str()),
+            None => None
+        }
+    }
 }
 
 #[derive(Deserialize, Debug)]
