@@ -361,7 +361,7 @@ where
             }
         }
 
-        // Execute file transfers in parallel, skipping over those where expect errors ("poisened paths")
+        // Execute file transfers in parallel, skipping over those where we expect errors ("poisened paths")
         // Actually transfer files. Note that the sender is moved below, so the sender will be
         // dropped when transfer_files finishes
         let this = Arc::new(self.clone());

@@ -1,11 +1,11 @@
-use std::sync::{Arc, Mutex};
+use std::{sync::{Arc, Mutex}, time::Duration};
 
 use anyhow::{anyhow, bail, Context};
 use async_recursion::async_recursion;
 use cached::TimedCache;
 use drive_api::{DriveApi, File, FilesReq, GoogleCredential, MoreFileFields};
 use futures::{stream::FuturesUnordered, AsyncRead, StreamExt as _, TryFutureExt};
-use tokio::task::JoinSet;
+use tokio::{task::JoinSet};
 
 use crate::{
     file_repository::{self, Error},
@@ -25,6 +25,7 @@ use super::service::{DriveService, DriveServiceImpl};
 /// Conceptually this is a singleton. There should be just one instance of this, wrapped in an Arc.
 pub(super) struct GDriveClient<S: DriveService = DriveServiceImpl> {
     service: S,
+    path_cache: Mutex<TimedCache<RPathBuf, String>>
 }
 
 /// Google does not really like too many concurrent connections. In my personal testing, the limit seemed to be somewhere below 10.
@@ -32,9 +33,7 @@ pub const CONCURRENCY_LIMIT: usize = 8;
 
 impl GDriveClient {
     pub fn new(cred: GoogleCredential) -> Self {
-        Self {
-            service: DriveServiceImpl::new(cred)
-        }
+        Self::with_service(DriveServiceImpl::new(cred), 45)
     }
 }
 
@@ -62,6 +61,13 @@ enum Resolve {
 }
 
 impl<Service: DriveService> GDriveClient<Service> {
+    pub fn with_service(service: Service, cache_time_secs: u64) -> Self {
+        Self {
+            service,
+            path_cache: Mutex::new(TimedCache::with_lifespan(cache_time_secs))
+        }
+    }
+
     async fn resolve(&self, path: &RPath, resolve: Resolve) -> anyhow::Result<String> {
         let id = self
             .maybe_resolve(path, resolve)
@@ -70,22 +76,29 @@ impl<Service: DriveService> GDriveClient<Service> {
         Ok(id)
     }
 
+    async fn maybe_resolve(&self, path: &RPath, resolve: Resolve) -> anyhow::Result<Option<String>> {
+        self.raw_resolve(path, resolve).await
+    }
+
     #[async_recursion]
-    async fn maybe_resolve(
+    async fn raw_resolve(
         &self,
         path: &RPath,
-        resolve: Resolve,
+        resolve: Resolve
     ) -> anyhow::Result<Option<String>> {
-        // TODO: This will need caching to be even close to fast enough
-
-        // We could probaly rewrite this iteratively and avoid async_recursion...
+        // We could probaly rewrite this iteratively and avoid async_recursion..
+        if resolve == Resolve::Directory {
+            if let Some(id) = self.path_cache.lock().unwrap().cache_get(path) {
+                return Ok(Some(id.to_owned()))
+            }
+        }
 
         let Some((base, name)) = path.split_right() else {
             return Ok(Some(self.root_id().await?));
         };
 
         // For the parent of anything, we only care about directories..
-        let parent_id = match self.maybe_resolve(base, Resolve::Directory).await? {
+        let parent_id = match self.raw_resolve(base, Resolve::Directory).await? {
             Some(id) => id,
             None => return Ok(None),
         };
@@ -93,20 +106,32 @@ impl<Service: DriveService> GDriveClient<Service> {
         let contents = self.service.read_dir(&parent_id).await?;
         let canon_contents = canonicalize(contents);
 
+        let mut paths = self.path_cache.lock().unwrap();
+
+        let mut ret = Ok(None);
         for file in canon_contents {
+            let file_path = base.join_single(&file.name);
+            let file_id = file.file.id.to_owned();
+            
+            if file.file.is_folder() {
+                paths.cache_set(file_path, file_id);
+            }
+
             if file.name == name {
                 // We will only ever enter this if once (canonical contents do not contain duplicate names)
-                return match (resolve, file.file.is_folder()) {
+                ret = match (resolve, file.file.is_folder()) {
                     (Resolve::Directory, true) | (Resolve::File, false) | (Resolve::Any, _) => {
                         Ok(Some(file.file.id))
                     }
                     (Resolve::Directory, false) => bail!(Error::NotADirectory),
                     (Resolve::File, true) => bail!(Error::IsADirectory),
                 };
+
+                // Don't return early here so that we can remember all those paths we see here
             }
         }
 
-        Ok(None)
+        ret
     }
 
     async fn root_id(&self) -> anyhow::Result<String> {
@@ -211,6 +236,11 @@ impl<Service: DriveService> GDriveClient<Service> {
     pub async fn delete(&self, path: &RPath) -> anyhow::Result<()> {
         let id = self.resolve(path, Resolve::Any).await?;
         self.service.delete(&id).await?;
+
+        // There is simply no way to cleanly track deletions. Just invalidate the whole cache.
+        // Delete should happen at the start anyway.
+        self.path_cache.lock().unwrap().cache_clear();
+
         Ok(())
     }
 
@@ -290,6 +320,7 @@ impl<Service: DriveService> GDriveClient<Service> {
     }
 }
 
+#[derive(Debug, Clone)]
 struct CanonicalFile {
     name: String,
     file: drive_api::File,
@@ -344,7 +375,7 @@ mod test {
 
     fn setup() -> Arc<GDriveClient<FakeDriveService>> {
         let service = FakeDriveService::default();
-        Arc::new(GDriveClient { service })
+        Arc::new(GDriveClient::with_service(service, 0))
     }
 
     #[tokio::test]
