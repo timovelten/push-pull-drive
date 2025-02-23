@@ -87,12 +87,10 @@ impl<Service: DriveService> GDriveClient<Service> {
         resolve: Resolve
     ) -> anyhow::Result<Option<String>> {
         // We could probaly rewrite this iteratively and avoid async_recursion..
-        if resolve == Resolve::Directory {
-            if let Some(id) = self.path_cache.lock().unwrap().cache_get(path) {
-                return Ok(Some(id.to_owned()))
-            }
+        if let Some(id) = self.path_cache.lock().unwrap().cache_get(path) {
+            return Ok(Some(id.to_owned()))
         }
-
+        
         let Some((base, name)) = path.split_right() else {
             return Ok(Some(self.root_id().await?));
         };
@@ -113,9 +111,7 @@ impl<Service: DriveService> GDriveClient<Service> {
             let file_path = base.join_single(&file.name);
             let file_id = file.file.id.to_owned();
             
-            if file.file.is_folder() {
-                paths.cache_set(file_path, file_id);
-            }
+            paths.cache_set(file_path, file_id);
 
             if file.name == name {
                 // We will only ever enter this if once (canonical contents do not contain duplicate names)
