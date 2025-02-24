@@ -559,4 +559,16 @@ mod test {
             RPathBuf::from_sep("abc/def/fgh", '/')
         )
     }
+
+    #[test]
+    pub fn starts_with_checks_components() {
+        let base = RPathBuf::from_components(["abc", "def"]);
+        let a = RPathBuf::from_components(["abc", "def", "ghj"]);
+        let b = RPathBuf::from_components(["abc", "def", "ghjk"]);
+
+        assert!(a.starts_with(&base));
+        assert!(b.starts_with(&base));
+
+        assert!(!b.starts_with(&a));
+    }
 }
