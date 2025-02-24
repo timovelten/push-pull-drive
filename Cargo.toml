@@ -60,6 +60,7 @@ delegate = "0.13.1"
 static_assertions = "1.1.0"
 strum = { version = "0.26.3", features = ["derive"] }
 toml = "0.8.19"
+bstr = "1.11.3"
 
 [dev-dependencies]
 test-log = "0.2.15"

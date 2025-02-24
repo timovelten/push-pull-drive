@@ -233,11 +233,12 @@ pub mod fake {
     use rand::{rng, RngCore as _};
     use time::OffsetDateTime;
 
-    #[derive(Default)]
+    #[derive(Default, Debug)]
     pub struct FakeDriveService {
         state: Arc<Mutex<InnerFakeDriveService>>,
     }
 
+    #[derive(Debug)]
     struct InnerFakeDriveService {
         files: HashMap<String, drive_api::File>,
         blobs: HashMap<String, Vec<u8>>,

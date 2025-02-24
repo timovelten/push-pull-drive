@@ -248,7 +248,6 @@ impl<Service: DriveService> GDriveClient<Service> {
         // This is actually by far the most ux critical function. Listing the files is what takes the longest on
         // google drive due to the sheer amount of rest requests it uses. Paralellizing these
         // and minimizing the number of calls is very important.
-
         let id = self.resolve(path, Resolve::Directory).await?;
 
         // All directories of a certain depth. We want to deepen the search tree by expanding these
@@ -294,7 +293,7 @@ impl<Service: DriveService> GDriveClient<Service> {
                 let (paths, contents) = next.unwrap()?;
                 for (folder_path, files) in paths.into_iter().zip(contents) {
                     let files = canonicalize(files);
-
+                
                     for CanonicalFile { file, name } in files {
                         let file_path = folder_path.join_single(&name);
 
@@ -381,14 +380,14 @@ mod test {
         let id = client.service.mkdir(&id, "Noch ein ordner").await.unwrap().id;
         
         for i in 0..4 {
-            dbg!(i);
             client.service.create_file(&id, "test_file", futures::io::empty()).await.unwrap();
         }
-        
-        let retrieved = client.list_files("Ordner".into(), usize::MAX).await.unwrap();
+
+        let path = "Ordner".into();
+
+        let retrieved = client.list_files(path, usize::MAX).await.unwrap();
         
         // Should contain two folders, and one file
-        dbg!(&retrieved);
         assert_eq!(retrieved.len(), 3);
     }
 }

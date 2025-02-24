@@ -710,7 +710,6 @@ mod test {
 
         let output = file_tree_of_repository(&repo, RPath::empty()).await.unwrap();
 
-        dbg!(&output);
         assert_eq!(output.len(), tree.len());
     }
 
