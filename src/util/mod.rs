@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 
 mod async_read;
 mod shell;
@@ -14,6 +14,27 @@ impl Display for WithoutNewlines<'_> {
             write!(f, "{}", line)?;
         }
         Ok(())
+    }
+}
+
+pub struct DebugBytes<'a>(pub &'a [u8]);
+
+impl<'a> Debug for DebugBytes<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let chars = self
+            .0
+            .iter()
+            .copied()
+            .map(|c| core::ascii::escape_default(c))
+            .flatten();
+
+        write!(f, "\"")?;
+
+        for c in chars {
+            write!(f, "{}", c as char)?;
+        }
+
+        write!(f, "\"")
     }
 }
 
@@ -34,19 +55,12 @@ pub fn hex_must_decode(s: impl AsRef<[u8]>) -> Vec<u8> {
 }
 
 #[track_caller]
-pub fn assert_equal_when_sorted<T: Ord + core::fmt::Debug + Clone>(
-    left: &[T],
-    right: &[T]
-) {
+pub fn assert_equal_when_sorted<T: Ord + core::fmt::Debug + Clone>(left: &[T], right: &[T]) {
     let mut a = Vec::from(left);
     a.sort();
 
     let mut b = Vec::from(right);
     b.sort();
-
-    println!("{a:#?}");
-
-    println!("{b:#?}");
 
     assert_eq!(a, b)
 }

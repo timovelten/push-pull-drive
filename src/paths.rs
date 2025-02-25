@@ -1,18 +1,16 @@
 use anyhow::bail;
 use core::str;
-use std::iter::Peekable;
-use rusqlite::types::{FromSql, ToSqlOutput};
-use rusqlite::ToSql;
-use serde::Deserialize;
+use serde::de::Visitor;
 use std::borrow::Borrow;
 use std::fmt::{Debug, Display};
+use std::iter::Peekable;
 use std::ops::Deref;
 use std::path::Path as StdPath;
 
 /// 0xff does not appear in any valid utf-8 string
 const SEP: u8 = 0xff;
 
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct RPathBuf {
     inner: Vec<u8>,
 }
@@ -31,13 +29,16 @@ impl RPathBuf {
     }
 
     /// This will panic when called with an empty string
-    pub fn push(&mut self, s: &str) {
-        // This does not introduce a trailing separator as s is non-empty
+    pub fn push(&mut self, segment: &str) {
+        assert!(!segment.is_empty(), "segment must not be empty");
+
+        // If self is empty, no separators are needed. If self is not empty,
+        // we need to separate the new segment from it
         if !self.is_empty() {
             self.inner.push(SEP);
         }
 
-        self.inner.extend_from_slice(s.as_bytes())
+        self.inner.extend_from_slice(segment.as_bytes())
     }
 
     pub fn extend(&mut self, other: &RPath) {
@@ -47,9 +48,11 @@ impl RPathBuf {
     }
 
     /// Note: All empty components will be ignored (silently)
-    pub fn from_components<'a, I: IntoIterator<Item = &'a str>>(components: I) -> Self {
+    pub fn from_components<'a, S: AsRef<str>, I: IntoIterator<Item = S>>(components: I) -> Self {
         let mut ret = Self::empty();
         for component in components {
+            let component = component.as_ref();
+
             if !component.is_empty() {
                 ret.push(component);
             }
@@ -105,21 +108,27 @@ impl RPathBuf {
     }
 
     pub fn deserialize_sloppy(s: &str) -> Self {
-        if !s.ends_with('/') {
-            Self::deserialize(&format!("{s}/"))
-        } else {
-            Self::deserialize(s)
-        }
+        let segments = s.split('/').filter(|s| !s.is_empty());
+
+        Self::from_components(segments)
     }
 
-    pub fn deserialize(s: &str) -> Self {
+    pub fn deserialize(s: &str) -> anyhow::Result<Self> {
+        if s.starts_with('/') || s.ends_with('/') {
+            bail!("Malformed: Leading or trailing slash");
+        }
+
         let mut ret = Self::empty();
         for segment in s.split('/') {
+            if segment.is_empty() {
+                bail!("Malformed: Consecutive slashes")
+            }
+
             let decoded = decode(segment);
             ret.push(&decoded);
         }
 
-        ret
+        Ok(ret)
     }
 }
 
@@ -149,7 +158,7 @@ impl ToOwned for RPath {
 }
 
 #[repr(transparent)]
-#[derive(Hash, PartialEq, Eq, Ord, PartialOrd)]
+#[derive(Hash, PartialEq, Eq)]
 pub struct RPath {
     /// We consider it a logic error for any one String to be empty
     inner: [u8],
@@ -197,37 +206,53 @@ impl RPath {
     /// This returns `None` if and only if self is empty. If this is called on a path
     /// with only one segment, that is segment is returned as a str, and the first
     /// return value is empty
-    pub fn split_right(&self) -> Option<(&RPath, &str)> {
+    pub fn split_right(&self) -> Option<(&str, &RPath)> {
         if self.is_empty() {
             return None;
         }
 
         // Index of the right most separator
-        let idx = (0..self.inner.len())
-            .rev()
-            .position(|i| self.inner[i] == SEP)
-            .unwrap_or(0);
+        let idx = memchr::memrchr(SEP, &self.inner);
+        let (rem, segment) = match idx {
+            Some(idx) => (&self.inner[0..idx], &self.inner[idx + 1..]),
+            None => (&[] as &[u8], &self.inner),
+        };
 
-        let base = Self::from_parts(&self.inner[0..idx]);
-        let last = core::str::from_utf8(&self.inner[idx..]).unwrap();
-
-        Some((base, last))
+        Some((
+            core::str::from_utf8(segment).unwrap(),
+            Self::from_parts(rem),
+        ))
     }
 
-    pub fn components(&self) -> impl DoubleEndedIterator<Item = &str> {
-        // We could use unsafe here, because we do enforce that the components are valid utf 8
-        self.inner
-            .split(|x| *x == SEP)
-            .map(|s| core::str::from_utf8(s).unwrap())
+    pub fn split_left(&self) -> Option<(&str, &RPath)> {
+        if self.is_empty() {
+            return None;
+        }
+
+        // Index of the left most separator
+        let idx = memchr::memchr(SEP, &self.inner);
+        let (segment, rem) = match idx {
+            Some(idx) => (&self.inner[0..idx], &self.inner[idx + 1..]),
+            None => (&self.inner, &[] as &[u8]),
+        };
+
+        Some((
+            core::str::from_utf8(segment).unwrap(),
+            Self::from_parts(rem),
+        ))
+    }
+
+    pub fn components(&self) -> impl Iterator<Item = &str> {
+        Segments { remaining: self }
     }
 
     pub fn filename(&self) -> Option<&str> {
-        let (_, filename) = self.split_right()?;
+        let (filename, _) = self.split_right()?;
         Some(filename)
     }
 
     pub fn parent(&self) -> Option<&RPath> {
-        let (parent, _) = self.split_right()?;
+        let (_, parent) = self.split_right()?;
         Some(parent)
     }
 
@@ -241,8 +266,6 @@ impl RPath {
     pub fn join_single(&self, other: &str) -> RPathBuf {
         let mut buf = self.to_owned();
         buf.push(other);
-
-        println!("Join single {self:?} + {other} --> {buf:?}");
 
         buf
     }
@@ -287,20 +310,43 @@ impl RPath {
         let this = &self.inner;
         let other = &other.inner;
 
-        this.starts_with(&other)
-            && (this.len() == other.len() || this[other.len()] == SEP)
+        this.starts_with(&other) && (this.len() == other.len() || this[other.len()] == SEP)
     }
 
     /// Emit a slash separated string, where each component is encoded such that it contains
-    /// no slashes. Note that we do emit a leading slash.
+    /// no slashes. No trailing or leading slashes are emitted.
     pub fn serialize(&self) -> String {
         let mut ret = String::new();
+        let mut first = true;
         for comp in self.components() {
-            ret.push('/');
+            if first {
+                first = false;
+            } else {
+                ret.push('/');
+            }
+
             ret.push_str(&encode(comp));
         }
 
         ret
+    }
+}
+
+struct Segments<'a> {
+    remaining: &'a RPath,
+}
+
+impl<'a> Iterator for Segments<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.remaining.split_left() {
+            Some((segment, rem)) => {
+                self.remaining = rem;
+                Some(segment)
+            }
+            None => None,
+        }
     }
 }
 
@@ -315,7 +361,7 @@ fn encode(s: &str) -> String {
         match b {
             b'/' => ret.extend_from_slice(&[b'\\', b'x', b'2', b'f']),
             b'\\' => ret.extend_from_slice(&[b'\\', b'\\']),
-            b => ret.push(b)
+            b => ret.push(b),
         }
     }
 
@@ -323,7 +369,10 @@ fn encode(s: &str) -> String {
 }
 
 fn decode(s: &str) -> String {
-    fn try_eat<const N: usize, I: Iterator<Item=u8>>(src: &mut Peekable<I>, bs: [u8; N]) -> Result<(), ()> {
+    fn try_eat<const N: usize, I: Iterator<Item = u8>>(
+        src: &mut Peekable<I>,
+        bs: [u8; N],
+    ) -> Result<(), ()> {
         for b in bs {
             if src.next_if_eq(&b).is_none() {
                 return Err(());
@@ -339,7 +388,7 @@ fn decode(s: &str) -> String {
     while let Some(c) = chars.next() {
         if c != b'\\' {
             ret.push(c);
-            continue
+            continue;
         }
 
         // We have encountered the escape character. Expand it.
@@ -355,13 +404,56 @@ fn decode(s: &str) -> String {
     String::from_utf8(ret).expect("valid utf8 in valid utf8 out")
 }
 
+impl PartialOrd for RPathBuf {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(&other))
+    }
+}
+
+impl Ord for RPathBuf {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_rpath().cmp(&other)
+    }
+}
+
+impl PartialOrd for RPath {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RPath {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.components().cmp(other.components())
+    }
+}
+
 impl<'de> serde::Deserialize<'de> for RPathBuf {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let serialized: String = Deserialize::deserialize(deserializer)?;
-        Ok(Self::deserialize(&serialized))
+        struct RPathVisitor;
+
+        impl<'de> Visitor<'de> for RPathVisitor {
+            type Value = RPathBuf;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a valid serialized path")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match RPathBuf::deserialize(v) {
+                    Ok(ret) => Ok(ret),
+                    Err(err) => Err(E::custom(format!("{err}"))),
+                }
+            }
+        }
+
+        deserializer.deserialize_str(RPathVisitor)
     }
 }
 
@@ -416,25 +508,6 @@ impl Display for RPathBuf {
 impl Display for RPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.serialize())
-    }
-}
-
-impl FromSql for RPathBuf {
-    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
-        Ok(RPathBuf::deserialize(value.as_str()?))
-    }
-}
-
-impl ToSql for RPath {
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        let serialized = self.serialize();
-        Ok(ToSqlOutput::Owned(rusqlite::types::Value::Text(serialized)))
-    }
-}
-
-impl ToSql for RPathBuf {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-        self.as_rpath().to_sql()
     }
 }
 
@@ -502,7 +575,7 @@ mod test {
         let rpath = RPathBuf::from_components(["test", "path", "without", "anything", "weird"]);
         let serialized = rpath.serialize();
 
-        assert_eq!(RPathBuf::deserialize(&serialized), rpath);
+        assert_eq!(RPathBuf::deserialize(&serialized).unwrap(), rpath);
     }
 
     #[test]
@@ -522,7 +595,7 @@ mod test {
 
         let deserialized = serialized
             .into_iter()
-            .map(|s| RPathBuf::deserialize(&s))
+            .map(|s| RPathBuf::deserialize(&s).unwrap())
             .collect::<Vec<_>>();
 
         let mut should_be = vec![rpath1, rpath2, rpath3];
@@ -532,15 +605,41 @@ mod test {
     }
 
     #[test]
+    pub fn ord_is_lexiographic() {
+        // We need the order to work on a component level, so that paths with the same
+        // components end up being adjacent when sorted
+        let mut vecs: Vec<_> = vec![
+            vec!["a"],
+            vec!["a", "b"],
+            vec!["a", "b", "c"],
+            vec!["a2"],
+            vec!["a2", "b"],
+            vec!["a2", "b", "c"],
+            vec!["a2", "c"],
+        ];
+        vecs.sort();
+
+        let paths = vecs
+            .iter()
+            .map(|segments| RPathBuf::from_components(segments.iter().copied()))
+            .collect::<Vec<_>>();
+
+        let mut sorted = paths.clone();
+        sorted.sort();
+
+        assert_eq!(paths, sorted)
+    }
+
+    #[test]
     #[should_panic]
     pub fn illegally_escaped_char() {
-        RPathBuf::deserialize("escpaing_the_wrong_character_\\a");
+        RPathBuf::deserialize("escpaing_the_wrong_character_\\a").unwrap();
     }
 
     #[test]
     #[should_panic]
     pub fn ends_unexpected() {
-        RPathBuf::deserialize("there_should_be_at_least_one_more_char_\\");
+        RPathBuf::deserialize("there_should_be_at_least_one_more_char_\\").unwrap();
     }
 
     fn random_path(alphabet: &[char], rng: &mut impl Rng) -> RPathBuf {
@@ -565,7 +664,7 @@ mod test {
         let mut rng = SmallRng::seed_from_u64(123456);
         for _ in 0..1000 {
             let path = random_path(&alphabet, &mut rng);
-            assert_eq!(path, RPathBuf::deserialize(&path.serialize()));
+            assert_eq!(path, RPathBuf::deserialize(&path.serialize()).unwrap());
         }
     }
 
@@ -600,6 +699,57 @@ mod test {
     #[test]
     pub fn split_right_one_component() {
         let a = RPathBuf::from_components(["abc"]);
-        assert_matches!(a.split_right(), Some((path, "abc")) if path.is_empty());
+        assert_matches!(a.split_right(), Some(("abc", path)) if path.is_empty());
+    }
+
+    #[test]
+    pub fn split_right_works() {
+        let a = RPathBuf::from_components(["abc", "def", "ghj"]);
+        assert_matches!(a.split_right(), Some(("ghj", path)) if path.len() == 2);
+    }
+
+    #[test]
+    pub fn serde_works() {
+        let path = RPathBuf::from_components([
+            "a",
+            "complicated/",
+            "path/a",
+            "that_contains",
+            "weird # $ $ @ ä ü",
+            "characters",
+        ]);
+        let json = serde_json::to_string(&path).unwrap();
+        let deserialized: RPathBuf = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(path, deserialized);
+    }
+
+    #[test]
+    pub fn empty_path_has_no_segments() {
+        let segments = RPathBuf::empty().components().count();
+        assert_eq!(segments, 0)
+    }
+
+    #[test]
+    pub fn segments_works() {
+        let components = [
+            "a",
+            "complicated/",
+            "path/a",
+            "that_contains",
+            "weird # $ $ @ ä ü",
+            "characters",
+        ];
+        let path = RPathBuf::from_components(components.iter().copied());
+
+        let res: [&str; 6] = path.components().collect::<Vec<_>>().try_into().unwrap();
+        assert_eq!(components, res)
+    }
+
+    #[test]
+    pub fn len_works() {
+        assert_eq!(RPathBuf::empty().len(), 0);
+        assert_eq!(RPathBuf::from_components(["abc"]).len(), 1);
+        assert_eq!(RPathBuf::from_components(["abc", "def", "hjk"]).len(), 3);
     }
 }

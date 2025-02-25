@@ -59,6 +59,8 @@ tempfile = "3.10.1"
 delegate = "0.13.1"
 static_assertions = "1.1.0"
 strum = { version = "0.26.3", features = ["derive"] }
+bstr = "1.11.3"
+memchr = "2.7.4"
 
 [dev-dependencies]
 test-log = "0.2.15"

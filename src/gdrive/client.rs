@@ -91,7 +91,7 @@ impl<Service: DriveService> GDriveClient<Service> {
             return Ok(Some(id.to_owned()))
         }
         
-        let Some((base, name)) = path.split_right() else {
+        let Some((name, base)) = path.split_right() else {
             return Ok(Some(self.root_id().await?));
         };
 
@@ -135,7 +135,7 @@ impl<Service: DriveService> GDriveClient<Service> {
     }
 
     pub async fn mkdir(&self, path: &RPath) -> anyhow::Result<()> {
-        let Some((parent, name)) = path.split_right() else {
+        let Some((name, parent)) = path.split_right() else {
             bail!(Error::Exists)
         };
 
@@ -192,7 +192,7 @@ impl<Service: DriveService> GDriveClient<Service> {
             bail!(Error::Exists);
         }
 
-        let (parent, filename) = path.split_right().ok_or(Error::IsADirectory)?;
+        let (filename, parent) = path.split_right().ok_or(Error::IsADirectory)?;
         let parent_id = self.resolve(parent, Resolve::Directory).await?;
 
         let info = self.service.create_file(&parent_id, filename, src).await?;
