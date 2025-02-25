@@ -61,7 +61,7 @@ impl Config {
     }
 
     fn get_path(&self, local_path: impl AsRef<StdPath>) -> anyhow::Result<RPathBuf> {
-        RPathBuf::try_from_path(&self.root_path, local_path.as_ref())
+        RPathBuf::try_from_std_path(&self.root_path, local_path.as_ref())
     }
 }
 impl LocalBackend {

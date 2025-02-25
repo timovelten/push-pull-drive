@@ -69,7 +69,7 @@ impl RPathBuf {
         }
     }
 
-    pub fn try_from_path<P: AsRef<StdPath>, Q: AsRef<StdPath>>(
+    pub fn try_from_std_path<P: AsRef<StdPath>, Q: AsRef<StdPath>>(
         base_path: P,
         path: Q,
     ) -> anyhow::Result<Self> {
@@ -160,7 +160,6 @@ impl ToOwned for RPath {
 #[repr(transparent)]
 #[derive(Hash, PartialEq, Eq)]
 pub struct RPath {
-    /// We consider it a logic error for any one String to be empty
     inner: [u8],
 }
 
@@ -532,11 +531,11 @@ mod test {
     #[test]
     pub fn to_relative_name_test() {
         assert_eq!(
-            RPathBuf::try_from_path("/tmp/test", "/tmp/test/hallo/123").unwrap(),
+            RPathBuf::try_from_std_path("/tmp/test", "/tmp/test/hallo/123").unwrap(),
             RPathBuf::from_components(["hallo", "123"])
         );
         assert_eq!(
-            RPathBuf::try_from_path("/tmp//test", "/tmp/test/hallo/123").unwrap(),
+            RPathBuf::try_from_std_path("/tmp//test", "/tmp/test/hallo/123").unwrap(),
             RPathBuf::from_components(["hallo", "123"])
         );
     }
@@ -545,7 +544,7 @@ mod test {
     pub fn identity() {
         // Make sure that passing in the same path twice works.
         // We unwrap that at some points.
-        let res = RPathBuf::try_from_path("/tmp/test", "/tmp/test").unwrap();
+        let res = RPathBuf::try_from_std_path("/tmp/test", "/tmp/test").unwrap();
         assert_eq!(&*res, RPath::empty());
     }
 

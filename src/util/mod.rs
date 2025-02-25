@@ -10,9 +10,17 @@ pub struct WithoutNewlines<'a>(pub &'a str);
 
 impl Display for WithoutNewlines<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut first = true;
         for line in self.0.lines() {
+            if first {
+                first = false;
+            } else {
+                write!(f, "⏎")?;
+            }
+
             write!(f, "{}", line)?;
         }
+        
         Ok(())
     }
 }

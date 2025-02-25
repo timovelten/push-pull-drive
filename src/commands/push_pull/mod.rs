@@ -3,7 +3,7 @@ use crate::{
     file_repository::FileRepository,
     filetree::{self, file_tree_of_repository, FileTree, Node as _, Patch, PatchKind},
     paths::{RPath, RPathBuf},
-    InspectAsyncReader, PathInfo,
+    InspectAsyncReader, PathInfo, WithoutNewlines,
 };
 use anyhow::{bail, Error};
 use progress::{ProgressId, ProgressSender};
@@ -96,8 +96,14 @@ enum Operation {
 impl Display for Operation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::CreateDirectory(path) => write!(f, "Create directory {path}"),
-            Self::Delete(path) => write!(f, "Delete {path}"),
+            Self::CreateDirectory(path) => {
+                write!(
+                    f,
+                    "Create directory {}",
+                    WithoutNewlines(&format!("{path}"))
+                )
+            }
+            Self::Delete(path) => write!(f, "Delete {}", WithoutNewlines(&format!("{path}"))),
             Self::Transfer(transfer) => write!(f, "{transfer}"),
         }
     }
@@ -105,9 +111,11 @@ impl Display for Operation {
 
 impl Display for Transfer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let serialized = format!("{}", self.path);
+
         match self.kind {
-            TransferKind::Update => write!(f, "{}", self.path)?,
-            TransferKind::Create => write!(f, "Create: {}", self.path)?,
+            TransferKind::Update => write!(f, "{}", WithoutNewlines(&serialized))?,
+            TransferKind::Create => write!(f, "Create: {}", WithoutNewlines(&serialized))?,
         }
 
         Ok(())
@@ -394,9 +402,9 @@ where
                 writeln!(self.env.err(), "{op}").unwrap();
             }
 
-            let cont = self
-                .env
-                .prompt_continue("These operations will be performed in the 'to' repository. Continue?");
+            let cont = self.env.prompt_continue(
+                "These operations will be performed in the 'to' repository. Continue?",
+            );
             if !cont {
                 bail!("Aborted");
             }

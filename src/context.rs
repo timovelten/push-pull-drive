@@ -102,7 +102,7 @@ pub fn find_context<P: AsRef<StdPath>>(
 
         log::debug!("Using config dir {:?}", config_dir);
 
-        let wd = RPathBuf::try_from_path(root_dir, &wd)?;
+        let wd = RPathBuf::try_from_std_path(root_dir, &wd)?;
         log::info!("Root directory is {root_dir:?}, relative working directory is {wd:?}");
 
         return Ok(ExecutionEnvironment {
