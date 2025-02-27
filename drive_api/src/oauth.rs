@@ -16,12 +16,12 @@ use url::Url;
 use super::FatAccessToken;
 
 #[derive(Clone, Deserialize, Serialize, Debug)]
-pub struct ClientConfig {
+pub struct OAuthClientConfig {
     pub client_secret: ClientSecret,
     pub client_id: ClientId,
 }
 
-impl ClientConfig {
+impl OAuthClientConfig {
     /// bytes must be a utf8 encoded json file with fields `installed/client_secret` and `installed/client_id`
     /// that contain the OAuth client secret and OAuth client id. This file can be crated by hand or downloaded
     /// from the google cloud console afrer creating a new Desktop OAuth Client at
@@ -46,7 +46,7 @@ impl ClientConfig {
 }
 
 /// oauth2 BasicClient with Google's AuthUrl, TokenUrl and RevocationUrl set.
-pub fn new_google_oauth_client(config: ClientConfig) -> BasicClient {
+pub fn new_google_oauth_client(config: OAuthClientConfig) -> BasicClient {
     let client = BasicClient::new(
         config.client_id,
         Some(config.client_secret),

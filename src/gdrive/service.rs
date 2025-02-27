@@ -30,7 +30,7 @@ pub type Result<T> = core::result::Result<T, DriveError>;
 pub trait DriveService: Send + Sync + 'static {
     async fn mkdir(&self, folder_id: &str, name: &str) -> Result<drive_api::File>;
 
-    fn delete(&self, id: &str) -> impl Future<Output = Result<()>> + Send;
+    fn delete(&self, id: &str, use_trash: bool) -> impl Future<Output = Result<()>> + Send;
 
     fn read_dirs(
         &self,
@@ -148,8 +148,13 @@ impl DriveService for DriveServiceImpl {
         Ok(info)
     }
 
-    async fn delete(&self, id: &str) -> Result<()> {
-        self.api_client.files_delete(id).await?;
+    async fn delete(&self, id: &str, use_trash: bool) -> Result<()> {
+        if use_trash {
+            self.api_client.files_trash(id).await?;
+        } else {
+            self.api_client.files_delete(id).await?;
+        }
+        
         Ok(())
     }
 
@@ -190,7 +195,7 @@ impl DriveService for DriveServiceImpl {
                     ..Default::default()
                 },
             )
-            .await;
+            .await?;
 
         Ok(())
     }
@@ -344,7 +349,7 @@ pub mod fake {
             Ok(folder)
         }
 
-        async fn delete(&self, id: &str) -> Result<()> {
+        async fn delete(&self, id: &str, _use_trash: bool) -> Result<()> {
             let mut state = self.state.lock().unwrap();
             let removed = state.files.remove(id);
             if removed.is_none() {

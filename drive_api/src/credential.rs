@@ -7,7 +7,7 @@ use time::ext::NumericalDuration;
 use time::OffsetDateTime;
 use tokio::sync::Mutex as TokioMutex;
 
-use crate::oauth::{new_google_oauth_client, ClientConfig};
+use crate::oauth::{new_google_oauth_client, OAuthClientConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FatAccessToken {
@@ -68,7 +68,7 @@ pub struct GoogleCredential {
 
 impl GoogleCredential {
     pub fn new<F: Fn(FatAccessToken) + 'static + Send>(
-        client_config: ClientConfig,
+        client_config: OAuthClientConfig,
         refresh_token: RefreshToken,
         last_token: Option<FatAccessToken>,
         new_token_callback: F,

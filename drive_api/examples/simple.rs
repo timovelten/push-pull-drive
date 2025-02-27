@@ -7,7 +7,7 @@ async fn main() -> anyhow::Result<()> {
     // dotenv run cargo run --example simple
     env_logger::Builder::from_default_env().init();
 
-    let client_config = drive_api::oauth::ClientConfig {
+    let client_config = drive_api::oauth::OAuthClientConfig {
         client_id: ClientId::new(std::env::var("GOOGLE_CID").unwrap()),
         client_secret: ClientSecret::new(std::env::var("GOOGLE_SECRET").unwrap())
     };

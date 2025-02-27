@@ -1,3 +1,4 @@
+use http::Method;
 use oauth2::AccessToken;
 use serde::Serialize;
 use url::Url;
@@ -23,6 +24,8 @@ pub trait RequestBuilderExt {
     fn bearer_auth(self, token: &AccessToken) -> Self;
 
     fn json_body<T: ?Sized + Serialize>(self, value: &T) -> anyhow::Result<http::Request<Vec<u8>>>;
+
+    fn empty_body(self) -> anyhow::Result<http::Request<&'static [u8]>>;
 }
 
 impl RequestBuilderExt for http::request::Builder {
@@ -39,5 +42,18 @@ impl RequestBuilderExt for http::request::Builder {
     ) -> anyhow::Result<http::Request<Vec<u8>>> {
         self = self.header(http::header::CONTENT_TYPE, "application/json");
         Ok(self.body(serde_json::to_vec(value)?)?)
+    }
+
+    fn empty_body(
+        mut self
+    ) -> anyhow::Result<http::Request<&'static [u8]>> {
+        if self.method_ref() == Some(&Method::POST) {
+            // See https://github.com/seanmonstar/reqwest/issues/2240
+            // Google requires empty body post requests to have a content length header
+            // but neither reqwest nor hyper set that automatically
+            self = self.header(http::header::CONTENT_LENGTH, 0);
+        }
+
+        Ok(self.body(&[] as &[u8])?)
     }
 }

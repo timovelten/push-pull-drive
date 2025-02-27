@@ -24,7 +24,6 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use url::Url;
 
-const EMPTY_BODY: &[u8] = &[];
 const REQUEST_IS_VALID: &str = "request is valid";
 
 pub const FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
@@ -97,8 +96,6 @@ impl GoogleError {
     }
 }
 
-
-
 const FILE_FIELDS: [&str; 8] = [
     "id",
     "name",
@@ -164,7 +161,7 @@ impl File {
     pub fn parent(&self) -> Option<&str> {
         match &self.parents {
             Some([p]) => Some(p.as_str()),
-            None => None
+            None => None,
         }
     }
 }
@@ -346,8 +343,8 @@ impl DriveApi {
 
         let req = Request::get(url.to_string())
             .bearer_auth(&self.token().await?)
-            .body(EMPTY_BODY)
-            .expect("request is valid");
+            .empty_body()
+            .expect(REQUEST_IS_VALID);
 
         let ret = self.send_retry_json::<FilesListResp, _>(req).await?;
         Ok(ret)
@@ -378,7 +375,7 @@ impl DriveApi {
 
         let req = Request::get(url.to_string())
             .bearer_auth(&self.token().await?)
-            .body(EMPTY_BODY)
+            .empty_body()
             .expect(REQUEST_IS_VALID);
 
         self.send_retry_json(req).await
@@ -406,7 +403,7 @@ impl DriveApi {
         // bytes=0- results in 416 Content Range Not Satisfiable (which we had to work around...)
         let req = Request::get(url.to_string())
             .bearer_auth(&self.token().await?)
-            .body(EMPTY_BODY)
+            .empty_body()
             .expect(REQUEST_IS_VALID);
 
         let resp = self.send_retry(req).await?;
@@ -426,7 +423,7 @@ impl DriveApi {
 
         let req = Request::delete(url.to_string())
             .bearer_auth(&self.token().await?)
-            .body(EMPTY_BODY)
+            .empty_body()
             .expect(REQUEST_IS_VALID);
 
         self.send_retry(req).await?;
@@ -498,7 +495,7 @@ impl DriveApi {
         serde_json::from_value(value).map_err(|err| ApiError::Other(err.into()))
     }
 
-    pub async fn files_update(&self, id: &str, update_req: FilesReq) -> anyhow::Result<()> {
+    pub async fn files_update(&self, id: &str, update_req: FilesReq) -> Result<(), ApiError> {
         let url = Url::parse(&format!("https://www.googleapis.com/drive/v3/files/{id}"))
             .unwrap()
             .with_query_pairs(&*FILE_FIELDS_QUERY);
@@ -507,9 +504,35 @@ impl DriveApi {
             .bearer_auth(&self.token().await?)
             .json_body(&update_req)?;
 
-        let file_id: FileId = self.send_retry(req).await?.json().await?;
+        let file_id: FileId = self
+            .send_retry(req)
+            .await?
+            .json()
+            .await
+            .map_err(|err| ApiError::Other(err.into()))?;
 
         debug_assert_eq!(&file_id.id, id);
+
+        Ok(())
+    }
+
+    pub async fn files_trash(&self, id: &str) -> Result<(), ApiError> {
+        let url = Url::parse(&format!(
+            "https://www.googleapis.com/drive/v2/files/{id}/trash"
+        ))
+        .unwrap();
+
+        let req = Request::post(url.to_string())
+            .bearer_auth(&self.token().await?)
+            .empty_body()   
+            .expect(REQUEST_IS_VALID);
+
+        let _id: FileId = self
+            .send_retry(req)
+            .await?
+            .json()
+            .await
+            .map_err(|err| ApiError::Other(err.into()))?;
 
         Ok(())
     }
@@ -545,7 +568,7 @@ impl DriveApi {
             let (send_buf, last) = match upload_buffer.buffer() {
                 Ok(send_buf) => (send_buf, false),
                 Err([]) => return self.upload_empty_file(resumable_session_url).await,
-                Err(send_buf) => (send_buf, true)
+                Err(send_buf) => (send_buf, true),
             };
 
             let pos = upload_buffer.global_pos();
@@ -610,13 +633,13 @@ impl DriveApi {
 
     async fn upload_empty_file(
         &self,
-        resumable_session_url: &str
+        resumable_session_url: &str,
     ) -> Result<serde_json::Value, ApiError> {
         // https://developers.google.com/drive/api/guides/manage-uploads#http---single-request
         let req = Request::put(resumable_session_url)
             .header(http::header::CONTENT_LENGTH, 0)
-            .body(&[] as &'static [u8])
-            .unwrap();
+            .empty_body()
+            .expect(REQUEST_IS_VALID);
 
         self.client
             .execute(req.try_into().unwrap())
@@ -648,14 +671,13 @@ struct UploadBuffer {
     end: usize,
     /// Number of bytes that have been consumed so far.
     global_pos: usize,
-    
+
     /// The preferred chunksize. Every single chunk that is emitted by this (via
     /// a call to [Self::buffer]) should ideally be a multiple of this value.
     unit: usize,
     /// Indicates whether the reader is exhausted.
     exhausted: bool,
 }
-
 
 impl UploadBuffer {
     fn new(unit: usize, capacity: usize) -> Self {
@@ -672,12 +694,12 @@ impl UploadBuffer {
             pos: 0,
             global_pos: 0,
             unit,
-            exhausted: false
+            exhausted: false,
         }
     }
 
     async fn fill<R: AsyncRead>(&mut self, reader: &mut Pin<&mut R>) -> Result<(), std::io::Error> {
-        // This function tries to ensure that after it finishes, the buffers length is not a multiple of 
+        // This function tries to ensure that after it finishes, the buffers length is not a multiple of
         // of unit. So that buffer can give out some multiple of unit without giving away the whole buffer.
         let remaining_buf_len = self.end - self.pos;
         if remaining_buf_len >= self.unit {
@@ -709,7 +731,7 @@ impl UploadBuffer {
 
     /// Ok(buf) is guaranteed to not be the last buffer, and also
     /// to be a multiple of `min_size`.
-    /// 
+    ///
     /// Err(buf) is guranteed to be the last buffer (i.e. the inner reader has reached EOF).
     /// It may or may not be a multiple of `min_size`.
     fn buffer(&self) -> Result<&[u8], &[u8]> {
@@ -869,7 +891,7 @@ mod test {
 
         let mut reader = pin!(&vec![0; n][..]);
         let mut buffer = pin!(UploadBuffer::new(n, 10 * n));
-        
+
         buffer.fill(&mut reader).await.unwrap();
         assert_eq!(buffer.buffer().unwrap_err().len(), n);
     }
@@ -878,7 +900,7 @@ mod test {
     async fn large() {
         let n = 256 * 1024;
         let src = vec![0; MIB * 500];
-        
+
         let mut reader = pin!(&src[..]);
         let mut buffer = UploadBuffer::new(n, 20 * MIB);
 
@@ -886,18 +908,14 @@ mod test {
         loop {
             buffer.fill(&mut reader).await.unwrap();
             let (end, buf_len) = match buffer.buffer() {
-                Ok(buf) => {
-                    (false, buf.len())
-                }
-                Err(buf) => {
-                    (true, buf.len())
-                }
+                Ok(buf) => (false, buf.len()),
+                Err(buf) => (true, buf.len()),
             };
             len += buf_len;
             println!("{len}");
 
             if end {
-                break
+                break;
             }
 
             buffer.consume(buf_len);
@@ -908,7 +926,6 @@ mod test {
 
     #[tokio::test]
     async fn not_as_large() {
-
         let n = 256 * 1024;
         let mut reader = pin!(&vec![0; n + 1][..]);
         let mut buffer = pin!(UploadBuffer::new(n, 20 * MIB));

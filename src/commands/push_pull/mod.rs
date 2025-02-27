@@ -358,7 +358,7 @@ where
                     let res = self.to.delete(&path).await;
                     if let Some(err) = res.err() {
                         writeln!(self.env.err(), "Failed to delete {path}").unwrap();
-                        log::error!("Preliminary operation: Deleeting {path} failed: {err}");
+                        log::error!("Preliminary operation: Deleting {path} failed: {err}");
                         poisened_paths.push(path);
                     }
                 }

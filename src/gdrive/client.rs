@@ -1,11 +1,16 @@
-use std::{sync::{Arc, Mutex}, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{anyhow, bail, Context};
 use async_recursion::async_recursion;
 use cached::TimedCache;
 use drive_api::{DriveApi, File, FilesReq, GoogleCredential, MoreFileFields};
 use futures::{stream::FuturesUnordered, AsyncRead, StreamExt as _, TryFutureExt};
-use tokio::{task::JoinSet};
+use serde::{Deserialize, Serialize};
+use time::format_description::well_known::iso8601::Config;
+use tokio::task::JoinSet;
 
 use crate::{
     file_repository::{self, Error},
@@ -18,22 +23,38 @@ use std::fmt::Write;
 
 use super::service::{DriveService, DriveServiceImpl};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientConfig {
+    pub use_trash: bool,
+    pub cache_time: Duration,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            use_trash: true,
+            cache_time: Duration::from_secs(45),
+        }
+    }
+}
+
 #[derive(Debug)]
 /// The clients primary job is to map between the path-based model of a filesystem we work with
 /// to the id-based system that Google Drive uses.
-/// 
+///
 /// Conceptually this is a singleton. There should be just one instance of this, wrapped in an Arc.
 pub(super) struct GDriveClient<S: DriveService = DriveServiceImpl> {
     service: S,
-    path_cache: Mutex<TimedCache<RPathBuf, String>>
+    path_cache: Mutex<TimedCache<RPathBuf, String>>,
+    config: ClientConfig,
 }
 
 /// Google does not really like too many concurrent connections. In my personal testing, the limit seemed to be somewhere below 10.
 pub const CONCURRENCY_LIMIT: usize = 8;
 
 impl GDriveClient {
-    pub fn new(cred: GoogleCredential) -> Self {
-        Self::with_service(DriveServiceImpl::new(cred), 45)
+    pub fn with_default_service_from_config(cred: GoogleCredential, config: ClientConfig) -> Self {
+        Self::from_config(DriveServiceImpl::new(cred), config)
     }
 }
 
@@ -61,10 +82,11 @@ enum Resolve {
 }
 
 impl<Service: DriveService> GDriveClient<Service> {
-    pub fn with_service(service: Service, cache_time_secs: u64) -> Self {
+    pub fn from_config(service: Service, config: ClientConfig) -> Self {
         Self {
             service,
-            path_cache: Mutex::new(TimedCache::with_lifespan(cache_time_secs))
+            path_cache: Mutex::new(TimedCache::with_lifespan(config.cache_time.as_secs())),
+            config,
         }
     }
 
@@ -76,21 +98,21 @@ impl<Service: DriveService> GDriveClient<Service> {
         Ok(id)
     }
 
-    async fn maybe_resolve(&self, path: &RPath, resolve: Resolve) -> anyhow::Result<Option<String>> {
+    async fn maybe_resolve(
+        &self,
+        path: &RPath,
+        resolve: Resolve,
+    ) -> anyhow::Result<Option<String>> {
         self.raw_resolve(path, resolve).await
     }
 
     #[async_recursion]
-    async fn raw_resolve(
-        &self,
-        path: &RPath,
-        resolve: Resolve
-    ) -> anyhow::Result<Option<String>> {
+    async fn raw_resolve(&self, path: &RPath, resolve: Resolve) -> anyhow::Result<Option<String>> {
         // We could probaly rewrite this iteratively and avoid async_recursion..
         if let Some(id) = self.path_cache.lock().unwrap().cache_get(path) {
-            return Ok(Some(id.to_owned()))
+            return Ok(Some(id.to_owned()));
         }
-        
+
         let Some((name, base)) = path.split_right() else {
             return Ok(Some(self.root_id().await?));
         };
@@ -110,7 +132,7 @@ impl<Service: DriveService> GDriveClient<Service> {
         for file in canon_contents {
             let file_path = base.join_single(&file.name);
             let file_id = file.file.id.to_owned();
-            
+
             paths.cache_set(file_path, file_id);
 
             if file.name == name {
@@ -231,7 +253,7 @@ impl<Service: DriveService> GDriveClient<Service> {
 
     pub async fn delete(&self, path: &RPath) -> anyhow::Result<()> {
         let id = self.resolve(path, Resolve::Any).await?;
-        self.service.delete(&id).await?;
+        self.service.delete(&id, self.config.use_trash).await?;
 
         // There is simply no way to cleanly track deletions. Just invalidate the whole cache.
         // Delete should happen at the start anyway.
@@ -293,7 +315,7 @@ impl<Service: DriveService> GDriveClient<Service> {
                 let (paths, contents) = next.unwrap()?;
                 for (folder_path, files) in paths.into_iter().zip(contents) {
                     let files = canonicalize(files);
-                
+
                     for CanonicalFile { file, name } in files {
                         let file_path = folder_path.join_single(&name);
 
@@ -365,28 +387,43 @@ mod test {
 
     use futures::io::Cursor;
 
-    use crate::gdrive::service::fake::FakeDriveService;
     use super::*;
+    use crate::gdrive::service::fake::FakeDriveService;
 
     fn setup() -> Arc<GDriveClient<FakeDriveService>> {
         let service = FakeDriveService::default();
-        Arc::new(GDriveClient::with_service(service, 0))
+        Arc::new(GDriveClient::from_config(
+            service,
+            ClientConfig {
+                cache_time: Duration::ZERO,
+                ..Default::default()
+            },
+        ))
     }
 
     #[tokio::test]
     async fn filenames_are_unique_in_a_folder() {
         let client = setup();
         let id = client.service.mkdir("root", "Ordner").await.unwrap().id;
-        let id = client.service.mkdir(&id, "Noch ein ordner").await.unwrap().id;
-        
+        let id = client
+            .service
+            .mkdir(&id, "Noch ein ordner")
+            .await
+            .unwrap()
+            .id;
+
         for i in 0..4 {
-            client.service.create_file(&id, "test_file", futures::io::empty()).await.unwrap();
+            client
+                .service
+                .create_file(&id, "test_file", futures::io::empty())
+                .await
+                .unwrap();
         }
 
         let path = "Ordner".into();
 
         let retrieved = client.list_files(path, usize::MAX).await.unwrap();
-        
+
         // Should contain two folders, and one file
         assert_eq!(retrieved.len(), 3);
     }

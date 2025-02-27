@@ -1,5 +1,5 @@
 use clap::{command, Parser, Subcommand};
-use drive_api::{oauth::{new_google_oauth_client, sign_in, ClientConfig}, FatAccessToken};
+use drive_api::{oauth::{new_google_oauth_client, sign_in, OAuthClientConfig}, FatAccessToken};
 use oauth2::RefreshToken;
 
 #[derive(Parser, Debug)]
@@ -24,7 +24,7 @@ enum Commands {
 pub fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let secrets_bytes = std::fs::read(args.secrets_path)?;
-    let client_config = ClientConfig::try_from_json(&secrets_bytes)?;
+    let client_config = OAuthClientConfig::try_from_json(&secrets_bytes)?;
     let client = new_google_oauth_client(client_config);
 
     match args.cmd {
