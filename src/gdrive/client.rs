@@ -94,7 +94,9 @@ impl<Service: DriveService> GDriveClient<Service> {
         let id = self
             .maybe_resolve(path, resolve)
             .await?
-            .ok_or(Error::NotFound)?;
+            .ok_or(Error::NotFound)
+            .with_context(|| format!("Failed to resolve path {path:?} to google drive id"))?;
+
         Ok(id)
     }
 
@@ -161,7 +163,7 @@ impl<Service: DriveService> GDriveClient<Service> {
             bail!(Error::Exists)
         };
 
-        let folder_id = self.resolve(path, Resolve::Directory).await?;
+        let folder_id = self.resolve(parent, Resolve::Directory).await?;
 
         self.service.mkdir(&folder_id, name).await?;
 

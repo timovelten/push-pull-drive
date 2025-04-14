@@ -82,8 +82,8 @@ struct Transfer {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum TransferKind {
-    Update,
     Create,
+    Update,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -96,20 +96,27 @@ enum Operation {
 
 impl Display for Operation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const CREATE_STYLE: Style =
+            Style::new().fg_color(Some(anstyle::Color::Ansi(AnsiColor::Green)));
+        const DELETE_STYLE: Style =
+            Style::new().fg_color(Some(anstyle::Color::Ansi(AnsiColor::Red)));
+        const END: Reset = Reset;
+
         match self {
             Self::CreateDirectory(path) => {
                 let path = WithoutNewlines(format!("{path}"));
-                let style = Style::new().fg_color(Some(anstyle::Color::Ansi(AnsiColor::Green)));
 
-                write!(f, "{style}Create directory {} {}", path, Reset)
+                write!(f, "{CREATE_STYLE}Create directory {path} {END}")
             }
-            Self::Transfer(transfer) => {
-                write!(f, "{transfer}")
-            }
+            Self::Transfer(transfer) => match transfer.kind {
+                TransferKind::Create => {
+                    write!(f, "{CREATE_STYLE}{transfer}{END}")
+                }
+                TransferKind::Update => write!(f, "{transfer}"),
+            },
             Self::Delete(path) => {
                 let path = WithoutNewlines(format!("{path}"));
-                let style = Style::new().fg_color(Some(anstyle::Color::Ansi(AnsiColor::Red)));
-                write!(f, "{style}Delete: {} {}", path, Reset)
+                write!(f, "{DELETE_STYLE}Delete: {path}{END}")
             }
         }
     }
@@ -188,6 +195,10 @@ where
                 let poisened = poisened_paths.iter().any(|f| transfer.path.starts_with(&f));
                 if poisened {
                     sender.notify_failed(id, "Skipped due to previous error".to_owned());
+
+                    // Do not return an error here. That would only make the output harder to read.
+                    // We already notified the user that this was skipped.
+                    return Ok(());
                 }
 
                 // We only really want concurrent file transfers for "small" files that cannot make reasonable

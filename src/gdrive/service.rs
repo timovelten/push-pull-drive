@@ -28,7 +28,7 @@ pub type Result<T> = core::result::Result<T, DriveError>;
 /// the querying and searching for files would be fairly complicated to build and require what is essentially
 /// a parser and an interpreter. So we reduce the API surface considerably here.
 pub trait DriveService: Send + Sync + 'static {
-    async fn mkdir(&self, folder_id: &str, name: &str) -> Result<drive_api::File>;
+    fn mkdir(&self, folder_id: &str, name: &str) -> impl Future<Output = Result<drive_api::File>>;
 
     fn delete(&self, id: &str, use_trash: bool) -> impl Future<Output = Result<()>> + Send;
 
