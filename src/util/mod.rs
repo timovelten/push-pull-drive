@@ -6,12 +6,12 @@ mod shell;
 pub use async_read::InspectAsyncReader;
 pub use shell::*;
 
-pub struct WithoutNewlines<'a>(pub &'a str);
+pub struct WithoutNewlines<S: AsRef<str>>(pub S);
 
-impl Display for WithoutNewlines<'_> {
+impl<S: AsRef<str>> Display for WithoutNewlines<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut first = true;
-        for line in self.0.lines() {
+        for line in self.0.as_ref().lines() {
             if first {
                 first = false;
             } else {

@@ -5,6 +5,7 @@ use crate::{
     paths::{RPath, RPathBuf},
     InspectAsyncReader, PathInfo, WithoutNewlines,
 };
+use anstyle::{AnsiColor, Reset, Style};
 use anyhow::{bail, Error};
 use progress::{ProgressId, ProgressSender};
 use std::{
@@ -97,14 +98,19 @@ impl Display for Operation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::CreateDirectory(path) => {
-                write!(
-                    f,
-                    "Create directory {}",
-                    WithoutNewlines(&format!("{path}"))
-                )
+                let path = WithoutNewlines(format!("{path}"));
+                let style = Style::new().fg_color(Some(anstyle::Color::Ansi(AnsiColor::Green)));
+
+                write!(f, "{style}Create directory {} {}", path, Reset)
             }
-            Self::Delete(path) => write!(f, "Delete {}", WithoutNewlines(&format!("{path}"))),
-            Self::Transfer(transfer) => write!(f, "{transfer}"),
+            Self::Transfer(transfer) => {
+                write!(f, "{transfer}")
+            }
+            Self::Delete(path) => {
+                let path = WithoutNewlines(format!("{path}"));
+                let style = Style::new().fg_color(Some(anstyle::Color::Ansi(AnsiColor::Red)));
+                write!(f, "{style}Delete: {} {}", path, Reset)
+            }
         }
     }
 }
@@ -114,7 +120,7 @@ impl Display for Transfer {
         let serialized = format!("{}", self.path);
 
         match self.kind {
-            TransferKind::Update => write!(f, "{}", WithoutNewlines(&serialized))?,
+            TransferKind::Update => write!(f, "Update: {}", WithoutNewlines(&serialized))?,
             TransferKind::Create => write!(f, "Create: {}", WithoutNewlines(&serialized))?,
         }
 

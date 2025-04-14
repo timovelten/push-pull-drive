@@ -1416,6 +1416,8 @@ name = "push-pull-drive"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "anstream",
+ "anstyle",
  "anyhow",
  "assert_matches",
  "async-recursion",

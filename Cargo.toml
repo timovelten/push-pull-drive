@@ -60,6 +60,8 @@ delegate = "0.13.1"
 static_assertions = "1.1.0"
 strum = { version = "0.26.3", features = ["derive"] }
 memchr = "2.7.4"
+anstream = "0.6.18"
+anstyle = "1.0.10"
 
 [dev-dependencies]
 test-log = "0.2.15"

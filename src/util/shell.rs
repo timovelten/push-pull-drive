@@ -68,8 +68,8 @@ struct ShellImpl {
 impl ShellImpl {
     pub fn new() -> Self {
         Self {
-            stdout: Box::new(std::io::stdout()),
-            stderr: Box::new(std::io::stderr()),
+            stdout: Box::new(anstream::stdout()),
+            stderr: Box::new(anstream::stderr()),
             line_needs_clearing: false,
         }
     }
