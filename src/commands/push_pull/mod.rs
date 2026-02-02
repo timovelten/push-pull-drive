@@ -25,6 +25,10 @@ pub struct PushPullArgs {
     /// Answer all prompts with yes
     #[arg(long, default_value = "false")]
     yes: bool,
+    /// If constructive, we try to avoid deletions on the target side. Note that we still delete
+    /// directories if they need to be replaced by a file.
+    #[arg(long, default_value = "false")]
+    constructive: bool,
 }
 
 fn get_path(path: Option<String>, wd: &RPath) -> RPathBuf {
@@ -46,6 +50,7 @@ pub fn push(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> {
         path: get_path(args.path, &env.wd),
         max_concurrent_transfers: args.limit_concurrent_transfers,
 
+        constructive: args.constructive,
         yes: args.yes,
         from_files: FileTree::empty(),
         to_files: FileTree::empty(),
@@ -64,6 +69,7 @@ pub fn pull(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> {
         path: get_path(args.path, &env.wd),
         max_concurrent_transfers: args.limit_concurrent_transfers,
 
+        constructive: args.constructive,
         yes: args.yes,
         from_files: FileTree::empty(),
         to_files: FileTree::empty(),
@@ -144,6 +150,7 @@ pub(super) struct PushPull<A, B> {
     max_concurrent_transfers: usize,
 
     yes: bool,
+    constructive: bool,
     from_files: FileTree<PathInfo>,
     to_files: FileTree<PathInfo>,
 }
@@ -158,10 +165,122 @@ where
         handle.block_on(self.execute_async())
     }
 
-    fn concurrency_limit(&self) -> usize {
-        A::CONCURRENCY_LIMIT
-            .min(B::CONCURRENCY_LIMIT)
-            .min(self.max_concurrent_transfers)
+    async fn execute_async(mut self) -> anyhow::Result<()> {
+        let mut operations = self.prepare().await?;
+        operations.sort();
+
+        if !self.yes {
+            for op in &operations {
+                writeln!(self.env.err(), "{op}").unwrap();
+            }
+
+            let cont = self.env.prompt_continue(
+                "These operations will be performed in the 'to' repository. Continue?",
+            );
+            if !cont {
+                bail!("Aborted");
+            }
+        }
+
+        self.execute_operations(operations).await?;
+
+        Ok(())
+    }
+
+    async fn prepare(&mut self) -> anyhow::Result<Vec<Operation>> {
+        writeln!(self.env.err(), "Reading 'from' files...").unwrap();
+        self.from_files = file_tree_of_repository(&self.from, &self.path).await?;
+
+        writeln!(self.env.err(), "Reading 'to' files...").unwrap();
+        self.to_files = file_tree_of_repository(&self.to, &self.path).await?;
+
+        let patches = filetree::diff(&self.to_files, &self.from_files);
+
+        // Go through what we have to do in BFS order, skipping over entire branches if a parent operation fails.
+        let _ = self
+            .env
+            .print_transient("Preparing directory structures...");
+
+        // Use file tress to determine what operations we need to do
+        let operations = self.determine_operations(&patches);
+
+        Ok(operations)
+    }
+
+    fn determine_operations<'a>(&'a self, diff: &FileTree<Patch<'a>>) -> Vec<Operation> {
+        let mut ops = Vec::new();
+
+        let mut queue: VecDeque<&RPath> = vec![RPath::empty()].into();
+        while let Some(path) = queue.pop_front() {
+            let patch = diff.get(path).expect("path is a node in the tree");
+            debug_assert_eq!(patch.path, path);
+
+            match patch.kind {
+                PatchKind::CreateFile => {
+                    let from_info = self.from_files.get(&path).unwrap().unwrap_fileinfo();
+
+                    ops.push(Operation::Transfer(Transfer {
+                        kind: TransferKind::Create,
+                        path: path.to_owned(),
+                        size: from_info.size,
+                    }));
+                }
+                PatchKind::CreateDirectory => {
+                    ops.push(Operation::CreateDirectory(path.to_owned()));
+                }
+                PatchKind::DeleteDirectory | PatchKind::DeleteFile => {
+                    if !self.constructive {
+                        ops.push(Operation::Delete(path.to_owned()));
+                    }
+                }
+                PatchKind::PresentFile => {
+                    let from_info = self.from_files.get(&path).unwrap().unwrap_fileinfo();
+                    let to_info = self.to_files.get(&path).unwrap().unwrap_fileinfo();
+
+                    // Update a file (at least if it is changed)
+                    let unchanged = from_info.size == to_info.size
+                        && (from_info.modified - to_info.modified) < Duration::from_secs(1);
+
+                    if !unchanged {
+                        ops.push(Operation::Transfer(Transfer {
+                            path: path.to_owned(),
+                            kind: TransferKind::Update,
+                            size: from_info.size,
+                        }));
+                    } else {
+                        log::debug!("{:?} is unchanged", path);
+                    }
+                }
+                PatchKind::PresentDirectory => {
+                    // We ignore changes to only directories
+                }
+                PatchKind::ReplaceDirectoryByFile => {
+                    // Replace a dir by a file
+                    let from_info = self.from_files.get(&path).unwrap().unwrap_fileinfo();
+
+                    ops.push(Operation::Delete(path.to_owned()));
+                    ops.push(Operation::Transfer(Transfer {
+                        kind: TransferKind::Create,
+                        path: path.to_owned(),
+                        size: from_info.size,
+                    }));
+                }
+                PatchKind::ReplaceFileByDirectory => {
+                    // Replace a file by a directory
+                    ops.push(Operation::Delete(path.to_owned()));
+                    ops.push(Operation::CreateDirectory(path.to_owned()));
+                }
+            }
+
+            let children = diff
+                .children(path)
+                .expect("path is a node in the tree")
+                .map(|x| x.path())
+                .collect::<Vec<_>>();
+            queue.extend(children);
+        }
+
+        ops
     }
 
     async fn transfer_files(
@@ -255,100 +374,6 @@ where
         Ok(())
     }
 
-    async fn prepare(&mut self) -> anyhow::Result<Vec<Operation>> {
-        writeln!(self.env.err(), "Reading 'from' files...").unwrap();
-        self.from_files = file_tree_of_repository(&self.from, &self.path).await?;
-
-        writeln!(self.env.err(), "Reading 'to' files...").unwrap();
-        self.to_files = file_tree_of_repository(&self.to, &self.path).await?;
-
-        let patches = filetree::diff(&self.to_files, &self.from_files);
-
-        // Go through what we have to do in BFS order, skipping over entire branches if a parent operation fails.
-        let _ = self
-            .env
-            .print_transient("Preparing directory structures...");
-
-        // Use file tress to determine what operations we need to do
-        let operations = self.determine_operations(&patches);
-
-        Ok(operations)
-    }
-
-    fn determine_operations<'a>(&'a self, diff: &FileTree<Patch<'a>>) -> Vec<Operation> {
-        let mut ops = Vec::new();
-
-        let mut queue: VecDeque<&RPath> = vec![RPath::empty()].into();
-        while let Some(path) = queue.pop_front() {
-            let patch = diff.get(path).expect("path is a node in the tree");
-            debug_assert_eq!(patch.path, path);
-
-            match patch.kind {
-                PatchKind::CreateFile => {
-                    let from_info = self.from_files.get(&path).unwrap().unwrap_fileinfo();
-
-                    ops.push(Operation::Transfer(Transfer {
-                        kind: TransferKind::Create,
-                        path: path.to_owned(),
-                        size: from_info.size,
-                    }));
-                }
-                PatchKind::CreateDirectory => {
-                    ops.push(Operation::CreateDirectory(path.to_owned()));
-                }
-                PatchKind::DeleteDirectory | PatchKind::DeleteFile => {
-                    ops.push(Operation::Delete(path.to_owned()));
-                }
-                PatchKind::PresentFile => {
-                    let from_info = self.from_files.get(&path).unwrap().unwrap_fileinfo();
-                    let to_info = self.to_files.get(&path).unwrap().unwrap_fileinfo();
-
-                    // Update a file (at least if it is changed)
-                    let unchanged = from_info.size == to_info.size
-                        && (from_info.modified - to_info.modified) < Duration::from_secs(1);
-
-                    if !unchanged {
-                        ops.push(Operation::Transfer(Transfer {
-                            path: path.to_owned(),
-                            kind: TransferKind::Update,
-                            size: from_info.size,
-                        }));
-                    } else {
-                        log::debug!("{:?} is unchanged", path);
-                    }
-                }
-                PatchKind::PresentDirectory => {
-                    // We ignore changes to only directories
-                }
-                PatchKind::ReplaceDirectoryByFile => {
-                    // Replace a dir by a file
-                    let from_info = self.from_files.get(&path).unwrap().unwrap_fileinfo();
-
-                    ops.push(Operation::Delete(path.to_owned()));
-                    ops.push(Operation::Transfer(Transfer {
-                        kind: TransferKind::Create,
-                        path: path.to_owned(),
-                        size: from_info.size,
-                    }));
-                }
-                PatchKind::ReplaceFileByDirectory => {
-                    // Replace a file by a directory
-                    ops.push(Operation::Delete(path.to_owned()));
-                    ops.push(Operation::CreateDirectory(path.to_owned()));
-                }
-            }
-
-            let children = diff
-                .children(path)
-                .expect("path is a node in the tree")
-                .map(|x| x.path())
-                .collect::<Vec<_>>();
-            queue.extend(children);
-        }
-
-        ops
-    }
-
     async fn execute_operations(&mut self, operations: Vec<Operation>) -> anyhow::Result<()> {
         let (sender, mut receiver) = progress::make();
 
@@ -410,25 +435,9 @@ where
         Ok(())
     }
 
-    async fn execute_async(mut self) -> anyhow::Result<()> {
-        let mut operations = self.prepare().await?;
-        operations.sort();
-
-        if !self.yes {
-            for op in &operations {
-                writeln!(self.env.err(), "{op}").unwrap();
-            }
-
-            let cont = self.env.prompt_continue(
-                "These operations will be performed in the 'to' repository. Continue?",
-            );
-            if !cont {
-                bail!("Aborted");
-            }
-        }
-
-        self.execute_operations(operations).await?;
-
-        Ok(())
+    fn concurrency_limit(&self) -> usize {
+        A::CONCURRENCY_LIMIT
+            .min(B::CONCURRENCY_LIMIT)
+            .min(self.max_concurrent_transfers)
     }
 }

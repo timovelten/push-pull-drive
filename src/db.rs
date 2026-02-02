@@ -1,7 +1,4 @@
-use crate::{
-    filetree::{self},
-    paths::{RPath, RPathBuf},
-};
+use crate::paths::RPathBuf;
 use anyhow::{anyhow, bail};
 use rusqlite::{named_params, Connection, OpenFlags, OptionalExtension};
 use std::{path::Path, sync::Mutex};
@@ -17,22 +14,6 @@ pub enum Tracked {
         size: u64,
         modified: time::OffsetDateTime,
     },
-}
-
-impl filetree::Node for Tracked {
-    fn path(&self) -> &RPath {
-        match self {
-            Self::Dir { path } => path,
-            Self::File { path, .. } => path,
-        }
-    }
-
-    fn is_terminal(&self) -> bool {
-        match self {
-            Self::Dir { .. } => false,
-            Self::File { .. } => true,
-        }
-    }
 }
 
 #[derive(Debug)]
