@@ -33,7 +33,7 @@ pub struct FileTree<T> {
 
     /// How many nodes do we need to skip to get to the next sibling of this node?
     /// 0 indicates that this node has no siblings.
-    /// 
+    ///
     /// This is useful when we want to iterate over the children of a node.
     sibling_offset: Vec<usize>,
 }
@@ -265,10 +265,22 @@ pub struct Patch<'a> {
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy)]
 pub enum PatchKind {
-    Unchanged { terminal: bool },
-    Delete,
-    Create { terminal: bool },
-    Replace { terminal: bool },
+    /// A file is present in both trees at the path
+    PresentFile,
+    /// A directory is present in both trees at the path
+    PresentDirectory,
+    /// The left tree had a file, and the path does not exist in the right tree
+    DeleteFile,
+    /// The left tree had a directory (possibly with children), and the path did not exist in the right tree
+    DeleteDirectory,
+    /// The left tree has a directory, and the path does not exist in the right tree
+    CreateDirectory,
+    /// The left tree has a file and the path does not exist in the right tree
+    CreateFile,
+    /// The left tree has a directory and the right tree has a file at that
+    ReplaceDirectoryByFile,
+    /// The left tree has a file and the right tree has a directory there
+    ReplaceFileByDirectory,
 }
 
 impl Node for Patch<'_> {
@@ -276,29 +288,35 @@ impl Node for Patch<'_> {
         self.path
     }
 
+    /// Note that this is not really semantic; this is implemented to satisfy the trait requirements
+    /// for filetree. We could just as well return false here and pretend that every node can have children.
+    /// It is convenient to to make this reflect reality though, because the builer can
+    /// then - at least sometimes - report if we violate our own assumptions.
     fn is_terminal(&self) -> bool {
-        // This is essentially only a debugging aid. We could just return false here.
-        // But returning something accurate makes the builder verify our assumptions
+        // Note that this is not
         match self.kind {
-            PatchKind::Unchanged { terminal } => terminal,
-            PatchKind::Delete => true,
-            PatchKind::Create { terminal } => terminal,
-            PatchKind::Replace { terminal } => terminal,
+            // Note that a directory deletion is not supposed to have children in the patch tree (we explicitly
+            // do not want every single file deletion to be there as a child)
+            PatchKind::DeleteDirectory | PatchKind::ReplaceDirectoryByFile => true,
+            PatchKind::CreateFile | PatchKind::DeleteFile | PatchKind::PresentFile => true,
+            PatchKind::PresentDirectory
+            | PatchKind::CreateDirectory
+            | PatchKind::ReplaceFileByDirectory => false,
         }
     }
 }
 
-/// What operations do we have to do to the old tree so that it equals the new tree?
+/// What operations do we have to do to the left tree so that it equals the right tree?
 ///
 /// Nodes that appear in both trees are output as [`Patch::Update`], regardless of whether
 /// they were actually updated or not (there is no way for this function to determine that).
 pub fn diff<'a, A: Node, B: Node>(
-    old: &'a FileTree<A>,
-    new: &'a FileTree<B>,
+    left: &'a FileTree<A>,
+    right: &'a FileTree<B>,
 ) -> FileTree<Patch<'a>> {
     let mut patches = Vec::new();
 
-    let merged = Merge::new(old.nodes.iter(), new.nodes.iter(), |x, y| {
+    let merged = Merge::new(left.nodes.iter(), right.nodes.iter(), |x, y| {
         x.path().cmp(y.path())
     });
 
@@ -325,46 +343,38 @@ pub fn diff<'a, A: Node, B: Node>(
             None => {}
         }
 
-        match side {
-            Side::Left(_) => {
-                // x is only present in the old tree, so we must delete it in the new one
-                patches.push(Patch {
-                    path,
-                    kind: PatchKind::Delete,
-                });
-
+        let kind = match side {
+            Side::Left(x) => {
                 // Skip over all children of this node (we do not care about the children that
                 // may have also been deleted)
                 skip_over = Some(path);
+
+                if x.is_terminal() {
+                    PatchKind::DeleteFile
+                } else {
+                    PatchKind::DeleteDirectory
+                }
             }
             Side::Right(y) => {
-                // y is only present in the new tree, so it has to be created
-                patches.push(Patch {
-                    path,
-                    kind: PatchKind::Create {
-                        terminal: y.is_terminal(),
-                    },
-                });
+                if y.is_terminal() {
+                    PatchKind::CreateFile
+                } else {
+                    PatchKind::CreateDirectory
+                }
             }
             Side::Both { left, right } => match (left.is_terminal(), right.is_terminal()) {
-                (terminal @ true, true) | (terminal @ false, false) => patches.push(Patch {
-                    path,
-                    kind: PatchKind::Unchanged { terminal },
-                }),
+                (true, true) => PatchKind::PresentFile,
+                (false, false) => PatchKind::PresentDirectory,
                 (false, true) => {
-                    patches.push(Patch {
-                        path,
-                        kind: PatchKind::Replace { terminal: true },
-                    });
+                    skip_over = Some(path);
 
-                    skip_over = Some(path)
+                    PatchKind::ReplaceDirectoryByFile
                 }
-                (true, false) => patches.push(Patch {
-                    path,
-                    kind: PatchKind::Replace { terminal: false },
-                }),
+                (true, false) => PatchKind::ReplaceFileByDirectory,
             },
-        }
+        };
+
+        patches.push(Patch { path, kind });
     }
 
     patches.try_into().unwrap()
@@ -384,7 +394,7 @@ pub async fn file_tree_of_repository<A: FileRepository>(
             Some(info @ PathInfo::File(_)) => {
                 ret.push(info);
                 done = true;
-            },
+            }
             None => {
                 done = true;
             }
@@ -392,7 +402,7 @@ pub async fn file_tree_of_repository<A: FileRepository>(
     }
 
     if done {
-        return Ok(ret.try_into().unwrap())
+        return Ok(ret.try_into().unwrap());
     }
 
     // Last element will be added in a second. Remove it here to avoid duplicates.
@@ -407,12 +417,15 @@ pub async fn file_tree_of_repository<A: FileRepository>(
 
 #[cfg(test)]
 mod test {
-    use futures::io::Cursor;
     use anyhow::anyhow;
+    use futures::io::Cursor;
     use time::OffsetDateTime;
 
     use crate::{
-        file_repository::{AsyncReader, Error}, filetree::{diff, Patch}, paths::{RPath, RPathBuf}, FileInfo
+        file_repository::{AsyncReader, Error},
+        filetree::{diff, Patch},
+        paths::{RPath, RPathBuf},
+        FileInfo,
     };
 
     use super::*;
@@ -507,19 +520,79 @@ mod test {
     }
 
     #[test]
-    fn basic_test() {
-        let old = filetree(&["/", "some other document", "a_movie", "old picture"]).unwrap();
-        let new = filetree(&["/", "a_movie", "some document"]).unwrap();
-
-        let patches = diff(&old, &new);
+    fn patch_tree_present_in_both() {
+        let left = filetree(&["/", "some document", "abc/", "abc/x"]).unwrap();
+        let patches = diff(&left, &left);
         let expected = patchtree(&[
-            ("", PatchKind::Unchanged { terminal: false }),
-            ("a_movie", PatchKind::Unchanged { terminal: true }),
-            ("old picture", PatchKind::Delete),
-            ("some other document", PatchKind::Delete),
-            ("some document", PatchKind::Create { terminal: true }),
+            ("", PatchKind::PresentDirectory),
+            ("some document", PatchKind::PresentFile),
+            ("abc", PatchKind::PresentDirectory),
+            ("abc/x", PatchKind::PresentFile),
+        ]);
+        assert_eq!(patches, expected);
+    }
+
+    #[test]
+    fn patch_tree_delete_file() {
+        let left = filetree(&["/", "abc"]).unwrap();
+        let right = filetree(&["/"]).unwrap();
+        let patches = diff(&left, &right);
+        let expected = patchtree(&[
+            ("", PatchKind::PresentDirectory),
+            ("abc", PatchKind::DeleteFile),
+        ]);
+        assert_eq!(patches, expected);
+    }
+
+    #[test]
+    fn patch_tree_delete_directory() {
+        let left = filetree(&["/", "abc/", "abc/f1", "abc/f2"]).unwrap();
+        let right = filetree(&["/"]).unwrap();
+        let patches = diff(&left, &right);
+        let expected = patchtree(&[
+            ("", PatchKind::PresentDirectory),
+            ("abc", PatchKind::DeleteDirectory),
+            // We do not expect the deleted files to appear here (we only record that the parent was deleted!)
+        ]);
+        assert_eq!(patches, expected);
+    }
+
+    #[test]
+    fn patch_tree_create_file() {
+        let left = filetree(&["/"]).unwrap();
+        let right = filetree(&["/", "abc"]).unwrap();
+        let patches = diff(&left, &right);
+        let expected = patchtree(&[
+            ("", PatchKind::PresentDirectory),
+            ("abc", PatchKind::CreateFile),
         ]);
 
+        assert_eq!(patches, expected);
+    }
+
+    #[test]
+    fn patch_tree_create_directory() {
+        let left = filetree(&["/"]).unwrap();
+        let right = filetree(&["/", "abc/"]).unwrap();
+        let patches = diff(&left, &right);
+        let expected = patchtree(&[
+            ("", PatchKind::PresentDirectory),
+            ("abc", PatchKind::CreateDirectory),
+        ]);
+
+        assert_eq!(patches, expected);
+    }
+
+    #[test]
+    fn patch_tree_replace_directory_by_file() {
+        let left = filetree(&["/", "abc/", "abc/f1", "abc/f2"]).unwrap();
+        let right = filetree(&["/", "abc"]).unwrap();
+        let patches = diff(&left, &right);
+        let expected = patchtree(&[
+            ("", PatchKind::PresentDirectory),
+            ("abc", PatchKind::ReplaceDirectoryByFile),
+            // We do not expect the deleted files to appear here (we only record that the parent was deleted!)
+        ]);
         assert_eq!(patches, expected);
     }
 
@@ -651,28 +724,28 @@ mod test {
         }
 
         async fn create_file<R: AsyncReader>(
-                &self,
-                _path: &RPath,
-                _src: R,
-                _len: u64,
-            ) -> crate::file_repository::Result<FileInfo> {
+            &self,
+            _path: &RPath,
+            _src: R,
+            _len: u64,
+        ) -> crate::file_repository::Result<FileInfo> {
             unimplemented!()
         }
 
         async fn update_file<R: AsyncReader>(
-                &self,
-                _path: &RPath,
-                _src: R,
-                _len: u64,
-            ) -> crate::file_repository::Result<FileInfo> {
+            &self,
+            _path: &RPath,
+            _src: R,
+            _len: u64,
+        ) -> crate::file_repository::Result<FileInfo> {
             unimplemented!()
         }
 
         async fn set_modified_time(
-                &self,
-                _path: &RPath,
-                _time: time::OffsetDateTime,
-            ) -> crate::file_repository::Result<()> {
+            &self,
+            _path: &RPath,
+            _time: time::OffsetDateTime,
+        ) -> crate::file_repository::Result<()> {
             unimplemented!()
         }
 
@@ -708,7 +781,9 @@ mod test {
 
         let repo = TreeRepository::new(tree.clone());
 
-        let output = file_tree_of_repository(&repo, RPath::empty()).await.unwrap();
+        let output = file_tree_of_repository(&repo, RPath::empty())
+            .await
+            .unwrap();
 
         assert_eq!(output.len(), tree.len());
     }
@@ -742,8 +817,8 @@ mod test {
             PathInfo::File(FileInfo {
                 path: "some/dir/that".into(),
                 size: 42,
-                modified: OffsetDateTime::now_utc()
-            })
+                modified: OffsetDateTime::now_utc(),
+            }),
         ]
         .try_into()
         .unwrap();

@@ -6,21 +6,37 @@ mod shell;
 pub use async_read::InspectAsyncReader;
 pub use shell::*;
 
-pub struct WithoutNewlines<S: AsRef<str>>(pub S);
+pub struct WithoutNewlines<S: AsRef<str>> {
+    original: S,
+    replace: &'static str,
+}
+
+impl<S: AsRef<str>> WithoutNewlines<S> {
+    pub fn new(s: S) -> Self {
+        Self::new_with_replacement_char(s, "⏎")
+    }
+
+    pub fn new_with_replacement_char(s: S, replace: &'static str) -> Self {
+        Self {
+            original: s,
+            replace,
+        }
+    }
+}
 
 impl<S: AsRef<str>> Display for WithoutNewlines<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut first = true;
-        for line in self.0.as_ref().lines() {
+        for line in self.original.as_ref().lines() {
             if first {
                 first = false;
             } else {
-                write!(f, "⏎")?;
+                write!(f, "{}", self.replace)?;
             }
 
             write!(f, "{}", line)?;
         }
-        
+
         Ok(())
     }
 }
@@ -98,7 +114,7 @@ mod test {
         let x = "A text\n with at least\n three lines";
         let mut out = String::new();
 
-        write!(out, "{}", WithoutNewlines(x)).unwrap();
+        write!(out, "{}", WithoutNewlines::new_with_replacement_char(x, "")).unwrap();
 
         assert_eq!(out, "A text with at least three lines");
     }

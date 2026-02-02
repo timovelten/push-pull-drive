@@ -104,7 +104,7 @@ impl Display for Operation {
 
         match self {
             Self::CreateDirectory(path) => {
-                let path = WithoutNewlines(format!("{path}"));
+                let path = WithoutNewlines::new(format!("{path}"));
 
                 write!(f, "{CREATE_STYLE}Create directory {path} {END}")
             }
@@ -115,7 +115,7 @@ impl Display for Operation {
                 TransferKind::Update => write!(f, "{transfer}"),
             },
             Self::Delete(path) => {
-                let path = WithoutNewlines(format!("{path}"));
+                let path = WithoutNewlines::new(format!("{path}"));
                 write!(f, "{DELETE_STYLE}Delete: {path}{END}")
             }
         }
@@ -127,8 +127,8 @@ impl Display for Transfer {
         let serialized = format!("{}", self.path);
 
         match self.kind {
-            TransferKind::Update => write!(f, "Update: {}", WithoutNewlines(&serialized))?,
-            TransferKind::Create => write!(f, "Create: {}", WithoutNewlines(&serialized))?,
+            TransferKind::Update => write!(f, "Update: {}", WithoutNewlines::new(&serialized))?,
+            TransferKind::Create => write!(f, "Create: {}", WithoutNewlines::new(&serialized))?,
         }
 
         Ok(())
@@ -284,7 +284,7 @@ where
             debug_assert_eq!(patch.path, path);
 
             match patch.kind {
-                PatchKind::Create { terminal: true } => {
+                PatchKind::CreateFile => {
                     let from_info = self.from_files.get(&path).unwrap().unwrap_fileinfo();
 
                     ops.push(Operation::Transfer(Transfer {
@@ -293,13 +293,13 @@ where
                         size: from_info.size,
                     }));
                 }
-                PatchKind::Create { terminal: false } => {
+                PatchKind::CreateDirectory => {
                     ops.push(Operation::CreateDirectory(path.to_owned()));
                 }
-                PatchKind::Delete => {
+                PatchKind::DeleteDirectory | PatchKind::DeleteFile => {
                     ops.push(Operation::Delete(path.to_owned()));
                 }
-                PatchKind::Unchanged { terminal: true } => {
+                PatchKind::PresentFile => {
                     let from_info = self.from_files.get(&path).unwrap().unwrap_fileinfo();
                     let to_info = self.to_files.get(&path).unwrap().unwrap_fileinfo();
 
@@ -317,10 +317,10 @@ where
                         log::debug!("{:?} is unchanged", path);
                     }
                 }
-                PatchKind::Unchanged { terminal: false } => {
-                    // Directory updates are unimportant to us
+                PatchKind::PresentDirectory => {
+                    // We ignore changes to only directories
                 }
-                PatchKind::Replace { terminal: true } => {
+                PatchKind::ReplaceDirectoryByFile => {
                     // Replace a dir by a file
                     let from_info = self.from_files.get(&path).unwrap().unwrap_fileinfo();
 
@@ -331,7 +331,7 @@ where
                         size: from_info.size,
                     }));
                 }
-                PatchKind::Replace { terminal: false } => {
+                PatchKind::ReplaceFileByDirectory => {
                     // Replace a file by a directory
                     ops.push(Operation::Delete(path.to_owned()));
                     ops.push(Operation::CreateDirectory(path.to_owned()));
