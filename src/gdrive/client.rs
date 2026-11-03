@@ -5,7 +5,6 @@ use std::{
 
 use anyhow::{anyhow, bail, Context};
 use async_recursion::async_recursion;
-use cached::TimedCache;
 use drive_api::{DriveApi, File, FilesReq, GoogleCredential, MoreFileFields};
 use futures::{stream::FuturesUnordered, AsyncRead, StreamExt as _, TryFutureExt};
 use serde::{Deserialize, Serialize};
@@ -18,18 +17,18 @@ use crate::{
     paths::{RPath, RPathBuf},
     FileInfo, PathInfo,
 };
-use cached::Cached;
+use cached::{Cached, ConcurrentCacheTtl, ExpiringCache, ShardedTtlCache, TtlCache};
 use std::fmt::Write;
 
 use super::service::{DriveService, DriveServiceImpl};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClientConfig {
+pub struct Preferences {
     pub use_trash: bool,
     pub cache_time: Duration,
 }
 
-impl Default for ClientConfig {
+impl Default for Preferences {
     fn default() -> Self {
         Self {
             use_trash: true,
@@ -45,16 +44,16 @@ impl Default for ClientConfig {
 /// Conceptually this is a singleton. There should be just one instance of this, wrapped in an Arc.
 pub(super) struct GDriveClient<S: DriveService = DriveServiceImpl> {
     service: S,
-    path_cache: Mutex<TimedCache<RPathBuf, String>>,
-    config: ClientConfig,
+    path_cache: Mutex<TtlCache<RPathBuf, String>>,
+    preferences: Preferences,
 }
 
 /// Google does not really like too many concurrent connections. In my personal testing, the limit seemed to be somewhere below 10.
 pub const CONCURRENCY_LIMIT: usize = 8;
 
 impl GDriveClient {
-    pub fn with_default_service_from_config(cred: GoogleCredential, config: ClientConfig) -> Self {
-        Self::from_config(DriveServiceImpl::new(cred), config)
+    pub fn with_default_service_from_config(cred: GoogleCredential, preferences: Preferences) -> Self {
+        Self::from_config(DriveServiceImpl::new(cred), preferences)
     }
 }
 
@@ -82,11 +81,13 @@ enum Resolve {
 }
 
 impl<Service: DriveService> GDriveClient<Service> {
-    pub fn from_config(service: Service, config: ClientConfig) -> Self {
+    pub fn from_config(service: Service, preferences: Preferences) -> Self {
+        let path_cache = TtlCache::new(preferences.cache_time);
+        
         Self {
             service,
-            path_cache: Mutex::new(TimedCache::with_lifespan(config.cache_time.as_secs())),
-            config,
+            path_cache: Mutex::new(path_cache),
+            preferences,
         }
     }
 
@@ -255,7 +256,7 @@ impl<Service: DriveService> GDriveClient<Service> {
 
     pub async fn delete(&self, path: &RPath) -> anyhow::Result<()> {
         let id = self.resolve(path, Resolve::Any).await?;
-        self.service.delete(&id, self.config.use_trash).await?;
+        self.service.delete(&id, self.preferences.use_trash).await?;
 
         // There is simply no way to cleanly track deletions. Just invalidate the whole cache.
         // Delete should happen at the start anyway.
@@ -385,8 +386,6 @@ fn canonicalize(mut files: Vec<drive_api::File>) -> Vec<CanonicalFile> {
 
 #[cfg(test)]
 mod test {
-    use std::usize;
-
     use futures::io::Cursor;
 
     use super::*;
@@ -396,8 +395,8 @@ mod test {
         let service = FakeDriveService::default();
         Arc::new(GDriveClient::from_config(
             service,
-            ClientConfig {
-                cache_time: Duration::ZERO,
+            Preferences {
+                cache_time: Duration::from_nanos(1),
                 ..Default::default()
             },
         ))

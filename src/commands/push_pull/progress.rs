@@ -140,7 +140,7 @@ impl<T: Display> ProgressReceiver<T> {
                             "({} / {}) Failed: {}",
                             self.done,
                             self.items.len(),
-                            &self.items[slot].item,
+                            self.items[slot].item,
                         )?;
                     } else {
                         writeln!(
@@ -148,7 +148,7 @@ impl<T: Display> ProgressReceiver<T> {
                             "({} / {}) Failed: {}. {msg}.",
                             self.done,
                             self.items.len(),
-                            &self.items[slot].item,
+                            self.items[slot].item,
                         )?;
                     }
 
@@ -163,7 +163,7 @@ impl<T: Display> ProgressReceiver<T> {
                         "({} / {}) Done: {}",
                         self.done,
                         self.items.len(),
-                        &self.items[slot].item,
+                        self.items[slot].item,
                     )?;
                     self.print_progress_line(shell)?;
                     self.items[slot].state = ItemState::Done;

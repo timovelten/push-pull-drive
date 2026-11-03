@@ -1,4 +1,4 @@
-use drive_api::{DriveApi, FilesReq, GoogleCredential, MoreFileFields};
+use drive_api::{DriveApi, FilesReq, GoogleCredential, MoreFileFields, oauth::GoogleOAuthClient};
 use oauth2::{ClientId, ClientSecret, RefreshToken};
 
 #[tokio::main]
@@ -7,15 +7,11 @@ async fn main() -> anyhow::Result<()> {
     // dotenv run cargo run --example simple
     env_logger::Builder::from_default_env().init();
 
-    let client_config = drive_api::oauth::OAuthClientConfig {
-        client_id: ClientId::new(std::env::var("GOOGLE_CID").unwrap()),
-        client_secret: ClientSecret::new(std::env::var("GOOGLE_SECRET").unwrap())
-    };
+    let client_id = ClientId::new(std::env::var("GOOGLE_CID").unwrap());
+    let client_secret = ClientSecret::new(std::env::var("GOOGLE_SECRET").unwrap());
     let refresh_token = RefreshToken::new(std::env::var("GOOGLE_RT").unwrap());
-
-    let credential: GoogleCredential = GoogleCredential::new(client_config, refresh_token, None, |_| {
-        println!("Recevied new token");
-    });
+    let client = GoogleOAuthClient::new(client_id, client_secret);
+    let credential = GoogleCredential::new(client, refresh_token, None);
 
     let api_client = DriveApi::new(Default::default(), credential);
     let root_file = api_client

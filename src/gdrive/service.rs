@@ -232,10 +232,9 @@ pub mod fake {
     };
 
     use super::*;
-    use base64::{prelude::BASE64_URL_SAFE, Engine};
     use drive_api::MoreFileFields;
     use futures::{io::Cursor, AsyncReadExt as _};
-    use rand::{rng, RngCore as _};
+    use rand::{Rng as _, distr::{Alphanumeric, SampleString}, rng};
     use time::OffsetDateTime;
 
     #[derive(Default, Debug)]
@@ -314,10 +313,7 @@ pub mod fake {
     }
 
     fn generate_id() -> String {
-        let mut rand = [0; 32];
-        rng().fill_bytes(&mut rand);
-
-        BASE64_URL_SAFE.encode(rand)
+        Alphanumeric.sample_string(&mut rng(), 24)
     }
 
     async fn read_body<R: AsyncRead + Send>(src: R) -> (Vec<u8>, u64, String) {

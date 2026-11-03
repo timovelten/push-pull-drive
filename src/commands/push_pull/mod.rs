@@ -1,16 +1,15 @@
 use crate::{
+    InspectAsyncReader, PathInfo, WithoutNewlines,
     context::{Context, Ctx, ExecutionEnvironment},
     file_repository::FileRepository,
-    filetree::{self, file_tree_of_repository, FileTree, Node as _, Patch, PatchKind},
+    filetree::{self, FileTree, Node as _, Patch, PatchKind, file_tree_of_repository},
     paths::{RPath, RPathBuf},
-    InspectAsyncReader, PathInfo, WithoutNewlines,
 };
 use anstyle::{AnsiColor, Reset, Style};
-use anyhow::{bail, Error};
+use anyhow::{Error, bail};
 use progress::{ProgressId, ProgressSender};
 use std::{
     cmp::Reverse, collections::VecDeque, fmt::Display, io::Write as _, sync::Arc, time::Duration,
-    usize,
 };
 use tokio::{sync::Semaphore, task::JoinSet};
 
@@ -41,7 +40,7 @@ fn get_path(path: Option<String>, wd: &RPath) -> RPathBuf {
     }
 }
 
-pub fn push(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> {
+pub async fn push(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> {
     let Ctx { env, local, remote } = ctx.get();
     PushPull {
         env: env.clone(),
@@ -55,12 +54,13 @@ pub fn push(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> {
         from_files: FileTree::empty(),
         to_files: FileTree::empty(),
     }
-    .execute()?;
+    .execute_async()
+    .await?;
 
     Ok(())
 }
 
-pub fn pull(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> {
+pub async fn pull(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> {
     let Ctx { env, local, remote } = ctx.get();
     PushPull {
         env: env.clone(),
@@ -74,7 +74,8 @@ pub fn pull(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> {
         from_files: FileTree::empty(),
         to_files: FileTree::empty(),
     }
-    .execute()?;
+    .execute_async()
+    .await?;
 
     Ok(())
 }
@@ -160,14 +161,14 @@ where
     A: FileRepository,
     B: FileRepository,
 {
-    pub(super) fn execute(self) -> anyhow::Result<()> {
-        let handle = self.env.handle.clone();
-        handle.block_on(self.execute_async())
-    }
-
     async fn execute_async(mut self) -> anyhow::Result<()> {
         let mut operations = self.prepare().await?;
         operations.sort();
+
+        if operations.is_empty() {
+            writeln!(self.env.err(), "Nothing to do").unwrap();
+            return Ok(());
+        }
 
         if !self.yes {
             for op in &operations {
@@ -215,9 +216,14 @@ where
             let patch = diff.get(path).expect("path is a node in the tree");
             debug_assert_eq!(patch.path, path);
 
+            // TODO: Skip over the .push_pull_drive directory here, and also introduce a
+            // way for the to repository to say that it wants to ignore that path
+            // so that we do not wait for the operation to fail but explicitly ignore the path
+            // here
+
             match patch.kind {
                 PatchKind::CreateFile => {
-                    let from_info = self.from_files.get(&path).unwrap().unwrap_fileinfo();
+                    let from_info = self.from_files.get(path).unwrap().unwrap_fileinfo();
 
                     ops.push(Operation::Transfer(Transfer {
                         kind: TransferKind::Create,
@@ -234,8 +240,8 @@ where
                     }
                 }
                 PatchKind::PresentFile => {
-                    let from_info = self.from_files.get(&path).unwrap().unwrap_fileinfo();
-                    let to_info = self.to_files.get(&path).unwrap().unwrap_fileinfo();
+                    let from_info = self.from_files.get(path).unwrap().unwrap_fileinfo();
+                    let to_info = self.to_files.get(path).unwrap().unwrap_fileinfo();
 
                     // Update a file (at least if it is changed)
                     let unchanged = from_info.size == to_info.size
@@ -256,7 +262,7 @@ where
                 }
                 PatchKind::ReplaceDirectoryByFile => {
                     // Replace a dir by a file
-                    let from_info = self.from_files.get(&path).unwrap().unwrap_fileinfo();
+                    let from_info = self.from_files.get(path).unwrap().unwrap_fileinfo();
 
                     ops.push(Operation::Delete(path.to_owned()));
                     ops.push(Operation::Transfer(Transfer {
@@ -311,7 +317,7 @@ where
 
             fts.spawn(async move {
                 // This transfer may depend on directory creation or deletions. If these failed, we skip it
-                let poisened = poisened_paths.iter().any(|f| transfer.path.starts_with(&f));
+                let poisened = poisened_paths.iter().any(|f| transfer.path.starts_with(f));
                 if poisened {
                     sender.notify_failed(id, "Skipped due to previous error".to_owned());
 

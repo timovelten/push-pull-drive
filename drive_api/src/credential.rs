@@ -1,13 +1,55 @@
-use std::sync::Arc;
-
-use anyhow::anyhow;
-use oauth2::{basic::BasicClient, AccessToken, RefreshToken, TokenResponse};
+use crate::oauth::GoogleOAuthClient;
+use oauth2::{AccessToken, RefreshToken};
 use serde::{Deserialize, Serialize};
-use time::ext::NumericalDuration;
 use time::OffsetDateTime;
-use tokio::sync::Mutex as TokioMutex;
+use time::ext::NumericalDuration;
 
-use crate::oauth::{new_google_oauth_client, OAuthClientConfig};
+const _: () = {
+    pub const fn assert_send<T: Send>() {}
+    pub const fn assert_sync<T: Sync>() {}
+    assert_send::<GoogleCredential>();
+    assert_sync::<GoogleCredential>();
+};
+
+#[derive(Debug)]
+pub struct GoogleCredential {
+    client: GoogleOAuthClient,
+    refresh_token: RefreshToken,
+    last_access_token: tokio::sync::Mutex<Option<FatAccessToken>>,
+}
+
+impl GoogleCredential {
+    pub fn new(
+        client: GoogleOAuthClient,
+        rt: RefreshToken,
+        last_access_token: Option<FatAccessToken>,
+    ) -> Self {
+        Self {
+            client,
+            refresh_token: rt,
+            last_access_token: last_access_token.into(),
+        }
+    }
+
+    pub async fn get_token(&self, force_refresh: bool) -> anyhow::Result<AccessToken> {
+        let mut state = self.last_access_token.lock().await;
+        if let Some(at) = &*state
+            && !at.needs_to_be_refreshed()
+            && !force_refresh
+        {
+            return Ok(at.access_token.clone());
+        }
+
+        // refresh the token
+        let new_token = self
+            .client
+            .exchange_refresh_token_for_access_token(&self.refresh_token)
+            .await?;
+        *state = Some(new_token.clone());
+
+        Ok(new_token.access_token)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FatAccessToken {
@@ -19,7 +61,7 @@ impl FatAccessToken {
     pub fn from_parts(access_token: String, expires: OffsetDateTime) -> Self {
         Self {
             access_token: AccessToken::new(access_token),
-            expires
+            expires,
         }
     }
 
@@ -39,119 +81,6 @@ impl FatAccessToken {
     pub fn is_expired(&self) -> bool {
         let now = OffsetDateTime::now_utc();
         self.expires <= now
-    }
-
-    pub async fn try_from_refresh_token(client: &BasicClient, rt: &RefreshToken) -> anyhow::Result<Self> {
-        let now = OffsetDateTime::now_utc();
-        let token_response = client
-            .exchange_refresh_token(rt)
-            .request_async(oauth2::reqwest::async_http_client)
-            .await
-            .map_err(|e| anyhow!(e))?;
-
-        Ok(Self {
-            access_token: token_response.access_token().clone(),
-            expires: now
-                + token_response
-                    .expires_in()
-                    .expect("expires_in field exists"),
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct GoogleCredential {
-    // I really don't know how to get rid of this lock. We definitely need to avoid having
-    // two token requests in flight at once.
-    inner: Arc<TokioMutex<GoogleCredentialImpl>>,
-}
-
-impl GoogleCredential {
-    pub fn new<F: Fn(FatAccessToken) + 'static + Send>(
-        client_config: OAuthClientConfig,
-        refresh_token: RefreshToken,
-        last_token: Option<FatAccessToken>,
-        new_token_callback: F,
-    ) -> Self {
-        let client = new_google_oauth_client(client_config);
-
-        let inner = GoogleCredentialImpl {
-            client,
-            refresh_token,
-            token: last_token,
-            callback: Box::new(new_token_callback),
-        };
-
-        GoogleCredential {
-            inner: Arc::new(TokioMutex::new(inner)),
-        }
-    }
-
-    pub async fn get_or_refresh_token(&self) -> anyhow::Result<AccessToken> {
-        self.inner.lock().await.get_or_refresh_token().await
-    }
-}
-
-const _: () = {
-    pub const fn assert_send<T: Send>() {}
-    pub const fn assert_sync<T: Sync>() {}
-    assert_send::<GoogleCredential>();
-    assert_sync::<GoogleCredential>();
-};
-
-struct GoogleCredentialImpl {
-    client: BasicClient,
-    refresh_token: RefreshToken,
-    token: Option<FatAccessToken>,
-    callback: Box<dyn Fn(FatAccessToken) + Send>,
-}
-
-impl std::fmt::Debug for GoogleCredentialImpl {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GoogleCredential")
-            .field("client", &self.client)
-            .field("refresh_token", &self.refresh_token)
-            .field("token", &self.token)
-            .finish()
-    }
-}
-
-impl GoogleCredentialImpl {
-    fn needs_to_be_refreshed(&self) -> bool {
-        self.token
-            .as_ref()
-            .map(|x| x.needs_to_be_refreshed())
-            .unwrap_or(true)
-    }
-
-    pub fn get_token(&self) -> Option<AccessToken> {
-        if let Some(fat_token) = self.token.as_ref() {
-            if fat_token.is_expired() {
-                return None;
-            }
-
-            Some(fat_token.access_token.clone())
-        } else {
-            None
-        }
-    }
-
-    pub async fn get_or_refresh_token(&mut self) -> anyhow::Result<AccessToken> {
-        if self.needs_to_be_refreshed() {
-            self.refresh_token().await?;
-        }
-
-        Ok(self
-            .get_token()
-            .expect("there should be a token after successful refresh"))
-    }
-
-    pub async fn refresh_token(&mut self) -> anyhow::Result<()> {
-        let fat_token = FatAccessToken::try_from_refresh_token(&self.client, &self.refresh_token).await?;
-        self.token = Some(fat_token.clone());
-        (self.callback)(fat_token);
-
-        Ok(())
     }
 }
 

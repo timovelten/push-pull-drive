@@ -1,5 +1,6 @@
 use crate::{
-    db::SqliteDatabase, file_repository::FileRepository, local::LocalBackend, paths::RPathBuf, util::Shell
+    db::SqliteDatabase, file_repository::FileRepository, local::LocalBackend, paths::RPathBuf,
+    util::Shell,
 };
 use anyhow::bail;
 use delegate::delegate;
@@ -8,7 +9,6 @@ use std::{
     path::{Path as StdPath, PathBuf as StdPathBuf},
     sync::Arc,
 };
-use tokio::runtime::Handle as TokioHandle;
 
 pub const CONFIG_DIR: &str = ".push-pull-drive";
 pub const DATABASE_NAME: &str = "database.sqlite3";
@@ -26,7 +26,6 @@ pub struct ExecutionEnvironment {
     /// Root dir. That is, the directory that contains the config directory
     pub root_dir: StdPathBuf,
     pub db: Arc<SqliteDatabase>,
-    pub handle: tokio::runtime::Handle,
 }
 
 impl ExecutionEnvironment {
@@ -46,12 +45,8 @@ impl ExecutionEnvironment {
         let mut buffer = String::new();
         io::stdin().read_line(&mut buffer).unwrap();
 
-        if buffer.starts_with(['Y', 'y']) {
-            true
-        } else {
-            false
-        }
-    } 
+        buffer.starts_with(['Y', 'y'])
+    }
 }
 
 /// Full context needed for most operations
@@ -84,10 +79,9 @@ impl<R: FileRepository> Context for Ctx<R> {
     }
 }
 
-pub fn find_context<P: AsRef<StdPath>>(
+pub fn find_environment<P: AsRef<StdPath>>(
     wd: P,
     shell: Arc<Shell>,
-    handle: TokioHandle,
 ) -> anyhow::Result<ExecutionEnvironment> {
     // Traverse ancestors of the current workign directory to try and find the next valid root...
     for root_dir in wd.as_ref().ancestors() {
@@ -110,7 +104,6 @@ pub fn find_context<P: AsRef<StdPath>>(
             shell,
             wd,
             root_dir: root_dir.to_owned(),
-            handle,
         });
     }
 

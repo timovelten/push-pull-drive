@@ -9,7 +9,7 @@ use crate::file_repository::Error;
 use crate::file_repository::Result;
 use crate::paths::RPath;
 use crate::paths::RPathBuf;
-use crate::{file_repository::FileRepository, FileInfo, PathInfo};
+use crate::{FileInfo, PathInfo, file_repository::FileRepository};
 use futures::AsyncRead;
 use std::path::Path as StdPath;
 use std::{
@@ -71,10 +71,7 @@ impl LocalBackend {
         }
     }
 
-    /// path is still needed because it is returned as part of the metadata. Otherwise, it is ignored.
-    ///
-    /// Note that this function might calculate the hash of the file and is therefore somewhat CPU bound. You should
-    /// take care to not overwhelm the spawn_blocking executor with too many concurrent calls to this function.
+    // path is still needed because it is returned as part of the metadata. Otherwise, it is ignored.
     fn read_file_impl_for_open_file(
         &self,
         path: RPathBuf,
@@ -336,11 +333,10 @@ impl FileRepository for LocalBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use assert_matches::assert_matches;
     use futures::io::Cursor;
-    use time::OffsetDateTime;
-    use std::{any::Any, fs::OpenOptions, io::Write, path::Path, time::Duration, usize};
+    use std::{any::Any, assert_matches, fs::OpenOptions, io::Write, path::Path, time::Duration};
     use tempfile::TempDir;
+    use time::OffsetDateTime;
 
     fn setup(ignore_prefixes: Vec<RPathBuf>) -> (LocalBackend, TempDir) {
         let tmp = tempfile::tempdir().unwrap();
@@ -362,7 +358,7 @@ mod tests {
             "subdir/this-is-a-filename-that-may-or-may-not-be-a-little-longer-than-the-the-other-filenames-because-that-is-really-something-we-should-try-at-some-point.txt",
             "subdir/another-file-but-shorter.bin",
             "anothersubdir/somefile.exe",
-            "anothersubdir/d1/d2/d3/ignored"
+            "anothersubdir/d1/d2/d3/ignored",
         ];
         let mut directories = vec![
             "",
@@ -601,17 +597,19 @@ mod tests {
         let (b, _tmp) = setup(vec![]);
 
         let now = OffsetDateTime::now_utc();
-        
+
         b.create_file("somefile".into(), Cursor::new([1, 2, 3]), 3)
             .await
             .unwrap();
 
-        b.set_modified_time("somefile".into(), now - Duration::from_secs(300)).await.unwrap();
-        
+        b.set_modified_time("somefile".into(), now - Duration::from_secs(300))
+            .await
+            .unwrap();
+
         let PathInfo::File(info) = b.metadata("somefile".into()).await.unwrap() else {
             panic!()
         };
-        
+
         assert!(info.modified + Duration::from_secs(295) < now);
     }
 }

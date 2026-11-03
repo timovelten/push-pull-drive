@@ -2,7 +2,6 @@ use crate::{
     context::{self, ExecutionEnvironment}, db::SqliteDatabase, gdrive::{self, config::GoogleDriveInitArgs}, local::{self, LocalInitArgs}, paths::RPath, util::Shell
 };
 use std::{io::ErrorKind, path::Path, sync::Arc};
-use tokio::runtime::Handle as RuntimeHandle;
 
 #[derive(clap::Subcommand, Clone)]
 pub enum InitBackendCmd {
@@ -10,11 +9,10 @@ pub enum InitBackendCmd {
     GoogleDrive(GoogleDriveInitArgs),
 }
 
-pub fn init(
+pub async fn init(
     b: InitBackendCmd,
     root_dir: &Path,
     shell: Arc<Shell>,
-    handle: RuntimeHandle,
 ) -> anyhow::Result<()> {
     let config_dir = root_dir.join(context::CONFIG_DIR);
 
@@ -35,13 +33,12 @@ pub fn init(
         shell,
         wd: RPath::empty().to_owned(),
         root_dir: root_dir.to_owned(),
-        handle,
     };
 
     log::debug!("Initializing at root directory {:?}", root_dir);
 
     match b {
         InitBackendCmd::Local(args) => local::init(&ctx, args),
-        InitBackendCmd::GoogleDrive(args) => gdrive::init(&ctx, args),
+        InitBackendCmd::GoogleDrive(args) => gdrive::init(&ctx, args).await,
     }
 }

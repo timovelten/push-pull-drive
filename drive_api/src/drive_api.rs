@@ -1,24 +1,24 @@
 //! This module is dedicated to actually making the API calls we need to
-//! Google Drive. It does not much beyond that. In particular, it
+//! Google Drive. It does not do much beyond that. In particular, it
 //! does not handle authentication by itself.
 
 use std::fmt::Write as _;
-use std::io::ErrorKind;
-use std::pin::{pin, Pin};
+use std::pin::{Pin, pin};
 use std::sync::LazyLock;
 use std::time::Duration;
 use std::{fmt::Display, str::FromStr};
 
+use crate::GoogleCredential;
+
 use super::extensions::RequestBuilderExt;
 use super::extensions::UrlExt;
-use super::GoogleCredential;
 use anyhow::anyhow;
 use futures::{AsyncRead, AsyncReadExt, TryStreamExt};
 use http::Request;
 use oauth2::AccessToken;
-use rand::Rng;
+use rand::RngExt as _;
 use serde::de::DeserializeOwned;
-use serde::{de, Deserialize};
+use serde::{Deserialize, de};
 use serde::{Deserializer, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -214,7 +214,7 @@ impl DriveApi {
 
     async fn token(&self) -> Result<AccessToken, ApiError> {
         self.credential
-            .get_or_refresh_token()
+            .get_token(false)
             .await
             .map_err(ApiError::Other)
     }
@@ -410,7 +410,7 @@ impl DriveApi {
 
         let ret = resp
             .bytes_stream()
-            .map_err(|err| std::io::Error::new(ErrorKind::Other, err))
+            .map_err(std::io::Error::other)
             .into_async_read();
 
         Ok(Box::new(ret))
@@ -524,7 +524,7 @@ impl DriveApi {
 
         let req = Request::post(url.to_string())
             .bearer_auth(&self.token().await?)
-            .empty_body()   
+            .empty_body()
             .expect(REQUEST_IS_VALID);
 
         let _id: FileId = self
@@ -681,7 +681,7 @@ struct UploadBuffer {
 
 impl UploadBuffer {
     fn new(unit: usize, capacity: usize) -> Self {
-        let cap = if capacity % unit == 0 {
+        let cap = if capacity.is_multiple_of(unit) {
             capacity + 1
         } else {
             capacity
@@ -713,7 +713,7 @@ impl UploadBuffer {
         self.end = remaining_buf_len;
         self.pos = 0;
 
-        while self.end < self.unit || self.end % self.unit == 0 {
+        while self.end < self.unit || self.end.is_multiple_of(self.unit) {
             let r = reader.read(&mut self.buf[self.end..]).await?;
             self.end += r;
             if r == 0 {

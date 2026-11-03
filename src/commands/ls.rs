@@ -1,5 +1,9 @@
 use crate::{
-    context::{Context, Ctx}, file_repository::FileRepository, human_readable_bytes, paths::{RPath, RPathBuf}, FileInfo, PathInfo
+    FileInfo, PathInfo,
+    context::{Context, Ctx},
+    file_repository::FileRepository,
+    human_readable_bytes,
+    paths::{RPath, RPathBuf},
 };
 use std::io::Write;
 
@@ -15,7 +19,7 @@ pub struct LsArgs {
     details: bool,
 }
 
-pub fn remote_ls(
+pub async fn remote_ls(
     ctx: &impl Context,
     LsArgs {
         path,
@@ -28,12 +32,11 @@ pub fn remote_ls(
 
     env.print_transient("Reading directory...")?;
 
-    let path = path.map(|path| RPathBuf::deserialize_sloppy(&path))
+    let path = path
+        .map(|path| RPathBuf::deserialize_sloppy(&path))
         .unwrap_or(RPathBuf::empty());
     let path = env.wd.join(&path);
-    let mut contents = env
-        .handle
-        .block_on(remote.list_files(&path, depth))?;
+    let mut contents = remote.list_files(&path, depth).await?;
 
     // Sort directories first
     fn key(f: &PathInfo) -> (u8, &RPath) {

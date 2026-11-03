@@ -9,18 +9,17 @@ use commands::{
     init::{self, InitBackendCmd},
     ls::{self, LsArgs},
     push_pull::{self, PushPullArgs},
-    status::{self, StatusArgs},
 };
 
 pub mod context;
-use context::{find_context, Context, Ctx, ExecutionEnvironment};
+use context::{Ctx, ExecutionEnvironment, find_environment};
 
 mod fileinfo;
 pub use fileinfo::*;
 use paths::RPathBuf;
 
 pub mod local;
-use crate::local::LocalBackend;
+use crate::{file_repository::FileRepository, local::LocalBackend};
 
 pub mod paths;
 
@@ -53,14 +52,8 @@ enum Commands {
         backend: InitBackendCmd,
     },
     RemoteLs(LsArgs),
-    Status(StatusArgs),
-    RemoteStatus(StatusArgs),
     Pull(PushPullArgs),
-    Push(PushPullArgs)
-}
-
-trait CommandHandler {
-    fn handle(&mut self, cmd: Commands) -> anyhow::Result<()>;
+    Push(PushPullArgs),
 }
 
 fn init_logger(err: impl std::io::Write + Send + 'static, level: Option<LevelFilter>) {
@@ -79,26 +72,45 @@ fn init_logger(err: impl std::io::Write + Send + 'static, level: Option<LevelFil
 //  - if two files have the same name and sha1 hash, just delete one of them
 //  - if one of two folders is empty, delete it.
 //  - otherwise print a link to the web interface of google drive so the user may fix it themselves.
-pub fn main() -> anyhow::Result<()> {
+#[tokio::main]
+pub async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let shell = Arc::new(Shell::new());
-    
+
     init_logger(shell.clone().owned_err(), cli.level);
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
     let wd = std::env::current_dir()?;
+
+    // Handle init separately, because when it is called there is no backend to load
     if let Commands::Init { backend } = &cli.command {
-        // Handle init separately
-        init::init(backend.clone(), &wd, shell, rt.handle().clone())
+        return init::init(backend.clone(), &wd, shell).await;
+    }
+
+    async fn handle<R: FileRepository>(
+        env: ExecutionEnvironment,
+        local: LocalBackend,
+        remote: R,
+        cmd: Commands,
+    ) -> anyhow::Result<()> {
+        let ctx = Ctx::new(env, local, remote);
+
+        match cmd {
+            Commands::Init { .. } => unimplemented!("Init command is handled separately elsewhere"),
+            Commands::RemoteLs(args) => ls::remote_ls(&ctx, args).await,
+            Commands::Pull(args) => push_pull::pull(&ctx, args).await,
+            Commands::Push(args) => push_pull::push(&ctx, args).await,
+        }
+    }
+
+    let env = find_environment(&wd, shell).unwrap();
+    let local = LocalBackend::from_config(get_local_backend_config(&env.root_dir));
+
+    // Now load a remote backend and monomorphize
+    if let Some(remote) = local::load(&env)? {
+        handle(env, local, remote, cli.command).await
+    } else if let Some(remote) = gdrive::load(&env)? {
+        handle(env, local, remote, cli.command).await
     } else {
-        // Handle every other command
-        let ctx = find_context(&wd, shell, rt.handle().clone()).unwrap();
-        let mut full_context = get_full_context(ctx).unwrap();
-        full_context.handle(cli.command)
+        Err(anyhow!("Config invalid. All backends failed to load."))
     }
 }
 
@@ -106,37 +118,5 @@ fn get_local_backend_config(root_dir: impl AsRef<Path>) -> local::Config {
     local::Config {
         root_path: root_dir.as_ref().to_owned(),
         ignore_prefixes: vec![RPathBuf::from_components([crate::context::CONFIG_DIR])],
-    }
-}
-
-// This awkward construction enables us to have type parameters inside of the context, whose
-// value is only determined at runtime.
-fn get_full_context(ctx: ExecutionEnvironment) -> anyhow::Result<Box<dyn CommandHandler>> {
-    let local = LocalBackend::from_config(get_local_backend_config(&ctx.root_dir));
-
-    // Try to load an appropriate functions. It is the responsibility of the 'load' function
-    // to return None if it is not applicable to the current config. In that case we
-    // continue to the next candidate.
-    let ret: Box<dyn CommandHandler> = if let Some(remote) = local::load(&ctx)? {
-        Box::new(Ctx::new(ctx, local, remote))
-    } else if let Some(remote) = gdrive::load(&ctx)? {
-        Box::new(Ctx::new(ctx, local, remote))
-    } else {
-        return Err(anyhow!("Config invalid. All backends failed to load."));
-    };
-
-    Ok(ret)
-}
-
-impl<C: Context> CommandHandler for C {
-    fn handle(&mut self, cmd: Commands) -> anyhow::Result<()> {
-        match cmd {
-            Commands::Init { .. } => unimplemented!("Init command is handled separately elsewhere"),
-            Commands::RemoteLs(args) => ls::remote_ls(self, args),
-            Commands::Status(args) => status::local_status(self.get(), args),
-            Commands::RemoteStatus(args) => status::remote_status(self.get(), args),
-            Commands::Pull(args) => push_pull::pull(self.get(), args),
-            Commands::Push(args) => push_pull::push(self.get(), args)
-        }
     }
 }

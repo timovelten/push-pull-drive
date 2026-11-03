@@ -48,7 +48,7 @@ impl RPathBuf {
     }
 
     /// Note: All empty components will be ignored (silently)
-    pub fn from_components<'a, S: AsRef<str>, I: IntoIterator<Item = S>>(components: I) -> Self {
+    pub fn from_components<S: AsRef<str>, I: IntoIterator<Item = S>>(components: I) -> Self {
         let mut ret = Self::empty();
         for component in components {
             let component = component.as_ref();
@@ -174,12 +174,13 @@ impl RPath {
         RPath::from_parts(&[])
     }
 
-    /// The byte array here should satisfy the following requirements (everything else is considered
-    /// a logic error - we currently do not rely on these for saftey)
+    /// The byte array here should satisfy the following requirements
     /// - s consists of valid utf8 strings separated by [SEP]
     /// - s does not have a beginning or trailing separator
     /// - Each component is non empty. In other words: the encoded string does not contain two or more
-    ///     consecutive slashes
+    ///   consecutive slashes
+    /// 
+    /// Violating these will not lead to unsafety, but it is considered a logic error.
     const fn from_parts(s: &[u8]) -> &RPath {
         unsafe {
             // SAFTEY: RPath is repr(transparent)
@@ -309,7 +310,7 @@ impl RPath {
         let this = &self.inner;
         let other = &other.inner;
 
-        this.starts_with(&other) && (this.len() == other.len() || this[other.len()] == SEP)
+        this.starts_with(other) && (this.len() == other.len() || this[other.len()] == SEP)
     }
 
     /// Emit a slash separated string, where each component is encoded such that it contains
@@ -358,8 +359,8 @@ fn encode(s: &str) -> String {
 
     for &b in s.as_bytes() {
         match b {
-            b'/' => ret.extend_from_slice(&[b'\\', b'x', b'2', b'f']),
-            b'\\' => ret.extend_from_slice(&[b'\\', b'\\']),
+            b'/' => ret.extend_from_slice(b"\\#"),
+            b'\\' => ret.extend_from_slice(b"\\\\"),
             b => ret.push(b),
         }
     }
@@ -368,12 +369,12 @@ fn encode(s: &str) -> String {
 }
 
 fn decode(s: &str) -> String {
-    fn try_eat<const N: usize, I: Iterator<Item = u8>>(
+    fn try_eat<I: Iterator<Item = u8>>(
         src: &mut Peekable<I>,
-        bs: [u8; N],
+        bs: &[u8],
     ) -> Result<(), ()> {
         for b in bs {
-            if src.next_if_eq(&b).is_none() {
+            if src.next_if_eq(b).is_none() {
                 return Err(());
             }
         }
@@ -391,9 +392,9 @@ fn decode(s: &str) -> String {
         }
 
         // We have encountered the escape character. Expand it.
-        if try_eat(&mut chars, [b'\\']).is_ok() {
+        if try_eat(&mut chars, b"\\").is_ok() {
             ret.push(b'\\')
-        } else if try_eat(&mut chars, [b'x', b'2', b'f']).is_ok() {
+        } else if try_eat(&mut chars, b"#").is_ok() {
             ret.push(b'/')
         } else {
             panic!("only '/' and '\\' maye be escaped")
@@ -405,13 +406,13 @@ fn decode(s: &str) -> String {
 
 impl PartialOrd for RPathBuf {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(&other))
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for RPathBuf {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.as_rpath().cmp(&other)
+        self.as_rpath().cmp(other)
     }
 }
 
@@ -470,7 +471,7 @@ impl serde::Serialize for &RPath {
     where
         S: serde::Serializer,
     {
-        let serialized = RPath::serialize(&self);
+        let serialized = RPath::serialize(self);
         serialized.serialize(serializer)
     }
 }
@@ -479,15 +480,7 @@ impl serde::Serialize for &RPath {
 impl From<&'static str> for &'static RPath {
     /// This is useful in testing to materialze &'static RPaths "out of thin air"
     fn from(value: &'static str) -> Self {
-        use ahash::HashMap;
-        use std::sync::{LazyLock, Mutex};
-
-        static CACHE: LazyLock<Mutex<HashMap<&'static str, &'static RPath>>> =
-            LazyLock::new(Default::default);
-        let mut map = CACHE.lock().unwrap();
-
-        map.entry(value)
-            .or_insert_with(|| Box::leak(Box::new(RPathBuf::from(value))))
+        Box::leak(Box::new(RPathBuf::from(value)))
     }
 }
 
@@ -523,7 +516,7 @@ impl<'a, const N: usize> From<[&'a str; N]> for RPathBuf {
 
 #[cfg(test)]
 mod test {
-    use assert_matches::assert_matches;
+    use std::assert_matches;
     use rand::{distr::Uniform, prelude::*, Rng};
 
     use super::*;

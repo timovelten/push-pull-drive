@@ -49,8 +49,7 @@ impl<'a> Debug for DebugBytes<'a> {
             .0
             .iter()
             .copied()
-            .map(|c| core::ascii::escape_default(c))
-            .flatten();
+            .flat_map(core::ascii::escape_default);
 
         write!(f, "\"")?;
 
@@ -72,10 +71,6 @@ pub fn human_readable_bytes(bs: u64) -> (f64, &'static str) {
     let magnitude = 1 << (10 * i);
 
     (bs as f64 / magnitude as f64, UNITS[i])
-}
-
-pub fn hex_must_decode(s: impl AsRef<[u8]>) -> Vec<u8> {
-    hex::decode(s).expect("hex is valid")
 }
 
 #[track_caller]
