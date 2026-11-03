@@ -1,6 +1,6 @@
 use crate::{
     InspectAsyncReader, PathInfo, WithoutNewlines,
-    context::{Context, Ctx, ExecutionEnvironment},
+    context::{CONFIG_DIR, Context, Ctx, ExecutionEnvironment},
     file_repository::FileRepository,
     filetree::{self, FileTree, Node as _, Patch, PatchKind, file_tree_of_repository},
     paths::{RPath, RPathBuf},
@@ -216,11 +216,15 @@ where
             let patch = diff.get(path).expect("path is a node in the tree");
             debug_assert_eq!(patch.path, path);
 
+            if is_system_path(path) {
+                // Do not let anyone write to our directory...
+                continue;
+            }
+
             // TODO: Skip over the .push_pull_drive directory here, and also introduce a
             // way for the to repository to say that it wants to ignore that path
             // so that we do not wait for the operation to fail but explicitly ignore the path
             // here
-
             match patch.kind {
                 PatchKind::CreateFile => {
                     let from_info = self.from_files.get(path).unwrap().unwrap_fileinfo();
@@ -446,4 +450,9 @@ where
             .min(B::CONCURRENCY_LIMIT)
             .min(self.max_concurrent_transfers)
     }
+}
+
+fn is_system_path(path: &RPath) -> bool {
+    let config_dir: RPathBuf = RPathBuf::from_components([CONFIG_DIR]);
+    path.starts_with(&config_dir)
 }
