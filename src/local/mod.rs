@@ -44,11 +44,12 @@ pub struct Config {
 }
 
 impl Config {
-    fn get_local_path(&self, path: &RPath) -> PathBuf {
+    fn get_local_path(&self, path: &RPath) -> Result<PathBuf> {
         let slash_separated_path = path
             .with_separator('/')
-            .expect("directory and filenames should not contain slashes");
-        self.root_path.join(slash_separated_path)
+            .map_err(|_| Error::NotAllowed)?;
+
+        Ok(self.root_path.join(slash_separated_path))
     }
 
     fn is_ignored(&self, path: &RPath) -> bool {
@@ -108,7 +109,7 @@ impl LocalBackend {
         if self.config.is_ignored(&path) {
             bail!(Error::NotAllowed);
         }
-        let local_path = self.config.get_local_path(&path);
+        let local_path = self.config.get_local_path(&path)?;
 
         // Open it, to avoid the time-of-check-time-of-use race condition. Note that
         // one can actually open directories.
@@ -164,7 +165,7 @@ impl LocalBackend {
         };
 
         // Make sure the directories exist..
-        let local_path = self.config.get_local_path(path);
+        let local_path = self.config.get_local_path(path)?;
 
         // Create file if we need to
         let _ = tokio::fs::OpenOptions::new()
@@ -223,7 +224,7 @@ impl FileRepository for LocalBackend {
     }
 
     async fn mkdir(&self, path: &RPath) -> Result<()> {
-        let local_path = self.config.get_local_path(path);
+        let local_path = self.config.get_local_path(path)?;
         tokio::fs::create_dir(local_path)
             .await
             .map_err(map_io_error)?;
@@ -250,7 +251,7 @@ impl FileRepository for LocalBackend {
     }
 
     async fn delete(&self, path: &RPath) -> Result<()> {
-        let local_path = self.config.get_local_path(path);
+        let local_path = self.config.get_local_path(path)?;
         let f = tokio::fs::File::open(&local_path).await?;
         let meta = f.metadata().await?;
 
@@ -268,7 +269,7 @@ impl FileRepository for LocalBackend {
 
     async fn list_files(&self, path: &RPath, up_to_depth: usize) -> Result<Vec<PathInfo>> {
         let mut ret = Vec::new();
-        let local_path = &self.config.get_local_path(path);
+        let local_path = &self.config.get_local_path(path)?;
 
         let walker = WalkDir::new(local_path).max_depth(up_to_depth).into_iter();
 
@@ -320,7 +321,7 @@ impl FileRepository for LocalBackend {
     }
 
     async fn set_modified_time(&self, path: &RPath, time: time::OffsetDateTime) -> Result<()> {
-        let local_path = self.config.get_local_path(path);
+        let local_path = self.config.get_local_path(path)?;
 
         spawn_blocking(move || {
             let f = std::fs::OpenOptions::new()

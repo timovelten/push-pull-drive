@@ -1,15 +1,11 @@
 use crate::{
-    InspectAsyncReader, PathInfo, WithoutNewlines,
-    context::{CONFIG_DIR, Context, Ctx, ExecutionEnvironment},
-    file_repository::FileRepository,
-    filetree::{self, FileTree, Node as _, Patch, PatchKind, file_tree_of_repository},
-    paths::{RPath, RPathBuf},
+    FileInfo, InspectAsyncReader, PathInfo, WithoutNewlines, context::{CONFIG_DIR, Context, Ctx, ExecutionEnvironment}, file_repository::FileRepository, filetree::{self, FileTree, Node as _, Patch, PatchKind, file_tree_of_repository}, paths::{RPath, RPathBuf},
 };
 use anstyle::{AnsiColor, Reset, Style};
 use anyhow::{Error, bail};
 use progress::{ProgressId, ProgressSender};
 use std::{
-    cmp::Reverse, collections::VecDeque, fmt::Display, io::Write as _, sync::Arc, time::Duration,
+    cmp::Reverse, collections::VecDeque, fmt::Display, io::Write as _, sync::Arc,
 };
 use tokio::{sync::Semaphore, task::JoinSet};
 
@@ -24,10 +20,16 @@ pub struct PushPullArgs {
     /// Answer all prompts with yes
     #[arg(long, default_value = "false")]
     yes: bool,
+
     /// If constructive, we try to avoid deletions on the target side. Note that we still delete
     /// directories if they need to be replaced by a file.
     #[arg(long, default_value = "false")]
     constructive: bool,
+
+    /// If reset is active, newer files on the "from" side are overwritten by the
+    /// older files that are currently present in the "to" side.
+    #[arg(long, default_value = "false")]
+    reset: bool
 }
 
 fn get_path(path: Option<String>, wd: &RPath) -> RPathBuf {
@@ -49,6 +51,7 @@ pub async fn push(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> 
         path: get_path(args.path, &env.wd),
         max_concurrent_transfers: args.limit_concurrent_transfers,
 
+        reset: args.reset,
         constructive: args.constructive,
         yes: args.yes,
         from_files: FileTree::empty(),
@@ -69,6 +72,7 @@ pub async fn pull(ctx: &impl Context, args: PushPullArgs) -> anyhow::Result<()> 
         path: get_path(args.path, &env.wd),
         max_concurrent_transfers: args.limit_concurrent_transfers,
 
+        reset: args.reset,
         constructive: args.constructive,
         yes: args.yes,
         from_files: FileTree::empty(),
@@ -152,6 +156,7 @@ pub(super) struct PushPull<A, B> {
 
     yes: bool,
     constructive: bool,
+    reset: bool,
     from_files: FileTree<PathInfo>,
     to_files: FileTree<PathInfo>,
 }
@@ -247,11 +252,7 @@ where
                     let from_info = self.from_files.get(path).unwrap().unwrap_fileinfo();
                     let to_info = self.to_files.get(path).unwrap().unwrap_fileinfo();
 
-                    // Update a file (at least if it is changed)
-                    let unchanged = from_info.size == to_info.size
-                        && (from_info.modified - to_info.modified) < Duration::from_secs(1);
-
-                    if !unchanged {
+                    if self.should_update_file(from_info, to_info) {
                         ops.push(Operation::Transfer(Transfer {
                             path: path.to_owned(),
                             kind: TransferKind::Update,
@@ -293,13 +294,31 @@ where
         ops
     }
 
+    fn should_update_file(&self, from_info: &FileInfo, to_info: &FileInfo) -> bool {
+        if from_info.size != to_info.size {
+            return true;
+        }
+
+        let mod_delta = (from_info.modified - to_info.modified).as_seconds_f64();
+        if mod_delta >= 1.0 {
+            // The from file is more recent than the to file, so we overwrite it
+            return true;
+        } else if self.reset && mod_delta.abs() >= 1.0 {
+            // We are in reset mode and the mod times differ. "reset" the to_file
+            // to what the from repo has
+            return true;
+        }
+
+        false
+    }
+
     async fn transfer_files(
         self: Arc<Self>,
         sender: ProgressSender,
         mut files: Vec<(Transfer, ProgressId)>,
         mut poisened_paths: Vec<RPathBuf>,
     ) -> Vec<(Transfer, Error)> {
-        const LARGE_FILE_SIZE: u64 = 128 * 1024 * 1024;
+        const LARGE_FILE_SIZE: u64 = 24 * 1024 * 1024;
 
         poisened_paths.sort();
         let poisened_paths = Arc::new(poisened_paths);
