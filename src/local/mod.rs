@@ -9,6 +9,7 @@ use crate::file_repository::Error;
 use crate::file_repository::Result;
 use crate::paths::RPath;
 use crate::paths::RPathBuf;
+use crate::paths::TryFromStdPathError;
 use crate::{FileInfo, PathInfo, file_repository::FileRepository};
 use futures::AsyncRead;
 use std::path::Path as StdPath;
@@ -60,8 +61,12 @@ impl Config {
         false
     }
 
-    fn get_path(&self, local_path: impl AsRef<StdPath>) -> anyhow::Result<RPathBuf> {
-        RPathBuf::try_from_std_path(&self.root_path, local_path.as_ref())
+    fn get_path(&self, local_path: impl AsRef<StdPath>) -> anyhow::Result<Option<RPathBuf>> {
+        match RPathBuf::try_from_std_path(&self.root_path, local_path.as_ref()) {
+            Ok(res) => Ok(Some(res)),
+            Err(TryFromStdPathError::EncounteredInvalidUtf8) => Ok(None),
+            Err(err) => Err(anyhow!(err)),
+        }
     }
 }
 impl LocalBackend {
@@ -282,7 +287,10 @@ impl FileRepository for LocalBackend {
                 }
             };
 
-            let entry_path = self.config.get_path(entry.path())?;
+            let Some(entry_path) = self.config.get_path(entry.path())? else {
+                log::warn!("Ignoring non utf-8 path: {:?}", entry.path());
+                continue;
+            };
 
             if self.config.is_ignored(&entry_path) {
                 continue;
@@ -334,7 +342,10 @@ impl FileRepository for LocalBackend {
 mod tests {
     use super::*;
     use futures::io::Cursor;
-    use std::{any::Any, assert_matches, fs::OpenOptions, io::Write, path::Path, time::Duration};
+    use std::{
+        any::Any, assert_matches, ffi::OsStr, fs::OpenOptions, io::Write, path::Path,
+        time::Duration,
+    };
     use tempfile::TempDir;
     use time::OffsetDateTime;
 
@@ -611,5 +622,29 @@ mod tests {
         };
 
         assert!(info.modified + Duration::from_secs(295) < now);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn list_files_ignores_invalid_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let (b, files_should_be, _, _drop_later) = setup_read_dir_test();
+
+        // Write a non-utf8 file
+        let naughty: &OsStr = OsStr::from_bytes(b"naughty\xff!");
+        let non_utf8_path = b.config.root_path.join(naughty);
+        File::create(non_utf8_path).unwrap();
+
+        // Make sure that read_dir still returns the right number of files...
+        let mut retrieved_files = Vec::new();
+        for file in b.list_files(RPath::empty(), usize::MAX).await.unwrap() {
+            if let PathInfo::File(info) = file {
+                retrieved_files.push(info.path.with_separator('/').unwrap());
+            }
+        }
+
+        retrieved_files.sort();
+        assert_eq!(retrieved_files, files_should_be);
     }
 }

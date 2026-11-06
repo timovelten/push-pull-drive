@@ -72,12 +72,12 @@ impl RPathBuf {
     pub fn try_from_std_path<P: AsRef<StdPath>, Q: AsRef<StdPath>>(
         base_path: P,
         path: Q,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, TryFromStdPathError> {
         let base_path = base_path.as_ref();
         let path = path.as_ref();
 
         if !base_path.is_absolute() || !path.is_absolute() {
-            bail!("{path:?} is not absolute");
+            return Err(TryFromStdPathError::PathNotAbsolute);
         }
 
         let base_components = base_path
@@ -90,12 +90,16 @@ impl RPathBuf {
         for (a, b) in base_components.zip(components) {
             match a {
                 Some(a) if a != b => {
-                    bail!("The path {base_path:?} is not a subpath of {path:?}");
+                    return Err(TryFromStdPathError::PathNotAbsolute);
                 }
                 Some(_) => {}
                 None => {
                     // Base path is exhausted, this is the part we care about
-                    ret.push(b.as_os_str().to_str().unwrap())
+                    let Some(segment) = b.as_os_str().to_str() else {
+                        return Err(TryFromStdPathError::EncounteredInvalidUtf8);
+                    };
+
+                    ret.push(segment)
                 }
             }
         }
@@ -130,6 +134,19 @@ impl RPathBuf {
 
         Ok(ret)
     }
+}
+
+/// Error returned by [RPathBuf::try_from_std_path]
+#[derive(thiserror::Error, Debug)]
+pub enum TryFromStdPathError {
+    #[error("std path must not contain any invalid utf8")]
+    EncounteredInvalidUtf8,
+    #[error("both paths must be absolute paths")]
+    PathNotAbsolute,
+    #[error("path must be a subpath of base_path")]
+    PathIsNotASubpath,
+    #[error(transparent)]
+    Other(anyhow::Error),
 }
 
 impl Deref for RPathBuf {
@@ -179,7 +196,7 @@ impl RPath {
     /// - s does not have a beginning or trailing separator
     /// - Each component is non empty. In other words: the encoded string does not contain two or more
     ///   consecutive slashes
-    /// 
+    ///
     /// Violating these will not lead to unsafety, but it is considered a logic error.
     const fn from_parts(s: &[u8]) -> &RPath {
         unsafe {
@@ -295,11 +312,7 @@ impl RPath {
             ret.push_str(c);
         }
 
-        if failed {
-            Err(ret)
-        } else {
-            Ok(ret)
-        }
+        if failed { Err(ret) } else { Ok(ret) }
     }
 
     pub fn starts_with(&self, other: &Self) -> bool {
@@ -369,10 +382,7 @@ fn encode(s: &str) -> String {
 }
 
 fn decode(s: &str) -> String {
-    fn try_eat<I: Iterator<Item = u8>>(
-        src: &mut Peekable<I>,
-        bs: &[u8],
-    ) -> Result<(), ()> {
+    fn try_eat<I: Iterator<Item = u8>>(src: &mut Peekable<I>, bs: &[u8]) -> Result<(), ()> {
         for b in bs {
             if src.next_if_eq(b).is_none() {
                 return Err(());
@@ -516,8 +526,8 @@ impl<'a, const N: usize> From<[&'a str; N]> for RPathBuf {
 
 #[cfg(test)]
 mod test {
+    use rand::{Rng, distr::Uniform, prelude::*};
     use std::assert_matches;
-    use rand::{distr::Uniform, prelude::*, Rng};
 
     use super::*;
 
